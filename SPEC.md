@@ -93,12 +93,15 @@ BACKLOG.md itself. Files under `~/.claude/harvest/`, one writer each:
 Panel sections (from `harvest.py list`, refreshed every 30 s while the panel is
 open or a harvest runs, else every 2 min):
 
+- A task row: the action before the text (▶ run it now in the queue, ⊕ put it in the queue
+  for a proposal), then the title, the estimated cost, and the removal at the far end (⊖
+  out of the queue, the trash can for a proposal). Above the rows, a two-word header over
+  the cost column ("עלות משוערת" / "Est. cost"); each figure's tooltip has the tokens.
 - **בתור** — `open` tasks as one list in the order they run (`ordered_queue` in the
   engine, used by both `list` and `plan`): first those the owner placed by dragging, in
   their order (`queue-order.json`, `claude-harvest queue-order <key>…`, keys
   `<project>::<title>`), then the rest by priority and, within a priority, the bigger
-  estimate first. Rows have a ≡ grip, the project's name under the title when the queue
-  spans projects, and can be dragged (`.draggable` / `.dropDestination`, the target shown by
+  estimate first. Each row shows its project under the title and can be grabbed anywhere and dragged (`.draggable` / `.dropDestination`, the target shown by
   an accent line — `WidgetModel.queueDropTarget`) onto another row to land above it, or
   below the last to go last; the whole new order is sent at once. "↺ Back to the automatic
   order" (shown while any task is `placed`) runs `queue-order --reset`. Refused in

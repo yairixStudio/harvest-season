@@ -1305,8 +1305,6 @@ struct PanelView: View {
             EmptyLine(text: L("התור ריק — ⊕ ליד הצעה מכניס אותה לתור", "The queue is empty — ⊕ next to a proposal puts it in"))
         } else {
             PctCaption()
-            Text(L("למעלה רצה ראשונה · גרור כדי לשנות את הסדר", "Top runs first · drag to change the order"))
-                .font(.system(size: 10)).foregroundStyle(.tertiary)
             if m.listing.queue.count > 8 {
                 ScrollView { orderedQueue }.frame(height: 220)
             } else {
@@ -1321,18 +1319,13 @@ struct PanelView: View {
         }
     }
 
-    /// The queue as one list in the order it runs. Each row can be dragged (by the grip, or anywhere
-    /// on it) and dropped on another row to land above it, or below the last row to go last.
+    /// The queue as one list in the order it runs, each task with its project. A row can be grabbed
+    /// anywhere and dropped on another row to land above it, or below the last row to go last.
     var orderedQueue: some View {
-        let manyProjects = Set(m.listing.queue.map(\.project)).count > 1
-        return VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
             ForEach(m.listing.queue) { t in
-                HStack(spacing: 5) {
-                    Image(systemName: "line.3.horizontal").font(.system(size: 9)).foregroundStyle(.tertiary)
-                        .help(L("גרור כדי לשנות את סדר הביצוע", "Drag to change the order they run in"))
-                    TaskRow(task: t, queued: true, onRun: { m.actions?.runOne(t) },
-                            onToggle: { m.actions?.setQueued(t, $0) }, showProject: manyProjects)
-                }
+                TaskRow(task: t, queued: true, onRun: { m.actions?.runOne(t) },
+                        onToggle: { m.actions?.setQueued(t, $0) }, showProject: true)
                 .contentShape(Rectangle())
                 .overlay(alignment: .top) { dropLine(m.queueDropTarget == t.id) }
                 .draggable(t.id) {
@@ -1813,13 +1806,14 @@ struct HoverHighlight: ViewModifier {
 }
 
 /// What the percentage next to a task means, above the queue and the proposals.
+/// The header of the percentage column — two words; the tooltip on each figure says the rest.
 struct PctCaption: View {
     var body: some View {
-        Text(L("האחוז: עלות משוערת בטוקנים, מתוך המכסה השבועית",
-               "%: estimated token cost, of the weekly quota"))
-            .font(.system(size: 10.5)).foregroundStyle(.tertiary)
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(.bottom, 2)
+        HStack(spacing: 6) {
+            Spacer(minLength: 0)
+            Text(L("עלות משוערת", "Est. cost")).font(.system(size: 10)).foregroundStyle(.tertiary)
+            Color.clear.frame(width: TaskRow.iconColumn, height: 1)
+        }
     }
 }
 
@@ -1840,8 +1834,24 @@ struct TaskRow: View {
     /// The project's name under the title — the queue shows one list across projects.
     var showProject = false
 
+    /// Width of the icon columns at each end of a row — `PctCaption` lines up with them.
+    static let iconColumn: CGFloat = 14
+
     var body: some View {
         HStack(spacing: 6) {
+            // The row's action sits before the text — ▶ run it now (queue), ⊕ queue it (proposals);
+            // taking it away sits at the far end — ⊖ out of the queue, the trash can for a proposal.
+            if queued, let onRun = onRun {
+                Button(action: onRun) { Image(systemName: "play.fill").font(.system(size: 8)) }
+                    .buttonStyle(.plain).foregroundStyle(Color.accentColor)
+                    .frame(width: Self.iconColumn)
+                    .help(L("הרץ עכשיו רק את המשימה הזו", "Run just this task now"))
+            } else if !queued {
+                Button { onToggle(true) } label: { Image(systemName: "plus.circle").font(.system(size: 12)) }
+                    .buttonStyle(.plain).foregroundStyle(Color.accentColor)
+                    .frame(width: Self.iconColumn)
+                    .help(L("הכנס לתור — תרוץ בקציר הבא", "Put it in the queue — it runs in the next harvest"))
+            }
             VStack(alignment: .leading, spacing: 0) {
                 Text(task.title).lineLimit(2).truncationMode(.tail).fixedSize(horizontal: false, vertical: true)
                 if showProject {
@@ -1852,24 +1862,17 @@ struct TaskRow: View {
             Text(pctText(task.pct)).font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
                 .help(L("עלות משוערת: כ־\(task.tokens / 1000) אלף טוקנים, \(pctText(task.pct)) מהמכסה השבועית",
                         "Estimated cost: ~\(task.tokens / 1000)K tokens, \(pctText(task.pct)) of the weekly quota"))
-            if let onRun = onRun {
-                Button(action: onRun) { Image(systemName: "play.fill").font(.system(size: 8)) }
-                    .buttonStyle(.plain).foregroundStyle(Color.accentColor)
-                    .help(L("הרץ עכשיו רק את המשימה הזו", "Run just this task now"))
-            }
-            if let onRemove = onRemove {
+            if queued {
+                Button { onToggle(false) } label: { Image(systemName: "minus.circle").font(.system(size: 12)) }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                    .frame(width: Self.iconColumn)
+                    .help(L("הוצא מהתור — חוזרת להצעות", "Take it out of the queue — back to the proposals"))
+            } else if let onRemove = onRemove {
                 Button(action: onRemove) { Image(systemName: "trash").font(.system(size: 10)) }
                     .buttonStyle(.plain).foregroundStyle(.secondary)
+                    .frame(width: Self.iconColumn)
                     .help(L("מחק את ההצעה — היא לא תוצע שוב", "Delete this proposal — it won't be proposed again"))
             }
-            // Queue and unqueue with one icon each: ⊕ puts a proposal in the queue, ⊖ takes a task out.
-            Button { onToggle(!queued) } label: {
-                Image(systemName: queued ? "minus.circle" : "plus.circle").font(.system(size: 12))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(queued ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.accentColor))
-            .help(queued ? L("הוצא מהתור — חוזרת להצעות", "Take it out of the queue — back to the proposals")
-                  : L("הכנס לתור — תרוץ בקציר הבא", "Put it in the queue — it runs in the next harvest"))
         }
         .padding(.vertical, 3)
         .frame(minHeight: 24)
@@ -1957,7 +1960,7 @@ struct HelpView: View {
             "**▶** מריץ רק את המשימה הזאת, עכשיו. **⊖** מוציא אותה מהתור ומחזיר אותה להצעות — היא לא תרוץ עד שתכניס אותה שוב.",
             "בכותרת: כמה משימות, וכמה אחוזים כולן יחד.",
             "**הסדר ברשימה הוא סדר הביצוע** — העליונה רצה ראשונה. בלי התערבות שלך הסדר הוא לפי חשיבות, ובאותה חשיבות הגדולה קודם.",
-            "**גרירה:** תופסים משימה (או את הידית ≡ שלידה) ומשחררים על משימה אחרת — היא נוחתת מעליה; מתחת לאחרונה — היא עוברת לסוף. **\"חזרה לסדר האוטומטי\"** מבטל את מה שגררת.",
+            "**גרירה:** תופסים משימה ומשחררים על משימה אחרת — היא נוחתת מעליה; מתחת לאחרונה — היא עוברת לסוף. **\"חזרה לסדר האוטומטי\"** מבטל את מה שגררת.",
         ]),
         ("הצעות", [
             "משימות שעוד לא אישרת: רעיונות שסוכן רשם כשעבד לבד, או משימות שהשהית. הן לא ירוצו.",
@@ -2020,7 +2023,7 @@ struct HelpView: View {
             "**▶** runs just this task, now. **⊖** takes it out of the queue, back to the proposals — it won't run until you put it back.",
             "In the header: how many tasks, and how many percent they come to together.",
             "**The list's order is the order they run in** — the top one runs first. Left alone, it's by priority, and within a priority the bigger task first.",
-            "**Dragging:** grab a task (or the ≡ grip next to it) and drop it on another one — it lands above it; below the last one — it goes last. **\"Back to the automatic order\"** undoes what you dragged.",
+            "**Dragging:** grab a task and drop it on another one — it lands above it; below the last one — it goes last. **\"Back to the automatic order\"** undoes what you dragged.",
         ]),
         ("Proposals", [
             "Tasks you haven't approved yet: ideas an agent noted while working on its own, or tasks you paused. They don't run.",
