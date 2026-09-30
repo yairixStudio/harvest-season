@@ -511,6 +511,8 @@ struct HTask: Decodable, Identifiable, Equatable {
     let summary: String?
     let sessionId: String?
     let estimate: HEstimate?
+    /// In the queue: placed by the owner's drag rather than by the automatic order.
+    let placed: Bool?
     var id: String { project + "::" + title }
 }
 
@@ -1104,6 +1106,8 @@ protocol WidgetActions: AnyObject {
     func setProposals(project: String, name: String, on: Bool)
     func setLanguage(hebrew: Bool)
     func saveHarvestSettings(_ values: [String])
+    func moveQueued(_ id: String, before target: String?)
+    func resetQueueOrder()
 }
 
 final class WidgetModel: ObservableObject {
@@ -1117,6 +1121,8 @@ final class WidgetModel: ObservableObject {
     /// Whether the harvest engine is installed; until it is, the panel shows only the usage and
     /// an invitation to set it up. True until the first check, so nothing flashes at start.
     @Published var harvestInstalled = true
+    /// The queued task a dragged one would land above while it's held over it ("end" = the bottom).
+    @Published var queueDropTarget: String?
     @Published var listing = HListing() {
         didSet {
             if let dir = listing.settings?.workdir, !dir.isEmpty {
@@ -1299,11 +1305,62 @@ struct PanelView: View {
             EmptyLine(text: L("התור ריק — ⊕ ליד הצעה מכניס אותה לתור", "The queue is empty — ⊕ next to a proposal puts it in"))
         } else {
             PctCaption()
-            ByProject(tasks: m.listing.queue) { t in
-                TaskRow(task: t, queued: true, onRun: { m.actions?.runOne(t) },
-                        onToggle: { m.actions?.setQueued(t, $0) })
+            Text(L("למעלה רצה ראשונה · גרור כדי לשנות את הסדר", "Top runs first · drag to change the order"))
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
+            if m.listing.queue.count > 8 {
+                ScrollView { orderedQueue }.frame(height: 220)
+            } else {
+                orderedQueue
+            }
+            if m.listing.queue.contains(where: { $0.placed == true }) {
+                Button(L("↺ חזרה לסדר האוטומטי (חשיבות, ואז גודל)", "↺ Back to the automatic order (priority, then size)")) {
+                    m.actions?.resetQueueOrder()
+                }
+                .buttonStyle(.link).font(.system(size: 11)).padding(.top, 3)
             }
         }
+    }
+
+    /// The queue as one list in the order it runs. Each row can be dragged (by the grip, or anywhere
+    /// on it) and dropped on another row to land above it, or below the last row to go last.
+    var orderedQueue: some View {
+        let manyProjects = Set(m.listing.queue.map(\.project)).count > 1
+        return VStack(alignment: .leading, spacing: 0) {
+            ForEach(m.listing.queue) { t in
+                HStack(spacing: 5) {
+                    Image(systemName: "line.3.horizontal").font(.system(size: 9)).foregroundStyle(.tertiary)
+                        .help(L("גרור כדי לשנות את סדר הביצוע", "Drag to change the order they run in"))
+                    TaskRow(task: t, queued: true, onRun: { m.actions?.runOne(t) },
+                            onToggle: { m.actions?.setQueued(t, $0) }, showProject: manyProjects)
+                }
+                .contentShape(Rectangle())
+                .overlay(alignment: .top) { dropLine(m.queueDropTarget == t.id) }
+                .draggable(t.id) {
+                    Text(t.title).font(.system(size: 12)).padding(6)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .windowBackgroundColor)))
+                }
+                .dropDestination(for: String.self) { ids, _ in
+                    guard let id = ids.first, id != t.id else { return false }
+                    m.actions?.moveQueued(id, before: t.id)
+                    return true
+                } isTargeted: { over in
+                    if over { m.queueDropTarget = t.id } else if m.queueDropTarget == t.id { m.queueDropTarget = nil }
+                }
+            }
+            Color.clear.frame(height: 8).contentShape(Rectangle())
+                .overlay(alignment: .top) { dropLine(m.queueDropTarget == "end") }
+                .dropDestination(for: String.self) { ids, _ in
+                    guard let id = ids.first else { return false }
+                    m.actions?.moveQueued(id, before: nil)
+                    return true
+                } isTargeted: { over in
+                    if over { m.queueDropTarget = "end" } else if m.queueDropTarget == "end" { m.queueDropTarget = nil }
+                }
+        }
+    }
+
+    func dropLine(_ shown: Bool) -> some View {
+        Rectangle().fill(shown ? Color.accentColor : Color.clear).frame(height: 2)
     }
 
     @ViewBuilder var proposalList: some View {
@@ -1780,11 +1837,18 @@ struct TaskRow: View {
     let onRun: (() -> Void)?
     let onToggle: (Bool) -> Void
     var onRemove: (() -> Void)? = nil
+    /// The project's name under the title — the queue shows one list across projects.
+    var showProject = false
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(task.title).lineLimit(2).truncationMode(.tail).fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(task.title).lineLimit(2).truncationMode(.tail).fixedSize(horizontal: false, vertical: true)
+                if showProject {
+                    Text(task.projectName).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             Text(pctText(task.pct)).font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
                 .help(L("עלות משוערת: כ־\(task.tokens / 1000) אלף טוקנים, \(pctText(task.pct)) מהמכסה השבועית",
                         "Estimated cost: ~\(task.tokens / 1000)K tokens, \(pctText(task.pct)) of the weekly quota"))
@@ -1892,6 +1956,8 @@ struct HelpView: View {
             "ליד כל משימה: כמה אחוזים מהמכסה השבועית היא צפויה לעלות. זו הערכה, והיא משתפרת עם כל ריצה.",
             "**▶** מריץ רק את המשימה הזאת, עכשיו. **⊖** מוציא אותה מהתור ומחזיר אותה להצעות — היא לא תרוץ עד שתכניס אותה שוב.",
             "בכותרת: כמה משימות, וכמה אחוזים כולן יחד.",
+            "**הסדר ברשימה הוא סדר הביצוע** — העליונה רצה ראשונה. בלי התערבות שלך הסדר הוא לפי חשיבות, ובאותה חשיבות הגדולה קודם.",
+            "**גרירה:** תופסים משימה (או את הידית ≡ שלידה) ומשחררים על משימה אחרת — היא נוחתת מעליה; מתחת לאחרונה — היא עוברת לסוף. **\"חזרה לסדר האוטומטי\"** מבטל את מה שגררת.",
         ]),
         ("הצעות", [
             "משימות שעוד לא אישרת: רעיונות שסוכן רשם כשעבד לבד, או משימות שהשהית. הן לא ירוצו.",
@@ -1953,6 +2019,8 @@ struct HelpView: View {
             "Next to each task: what share of the weekly quota it's expected to cost. It's an estimate, and it gets better with every run.",
             "**▶** runs just this task, now. **⊖** takes it out of the queue, back to the proposals — it won't run until you put it back.",
             "In the header: how many tasks, and how many percent they come to together.",
+            "**The list's order is the order they run in** — the top one runs first. Left alone, it's by priority, and within a priority the bigger task first.",
+            "**Dragging:** grab a task (or the ≡ grip next to it) and drop it on another one — it lands above it; below the last one — it goes last. **\"Back to the automatic order\"** undoes what you dragged.",
         ]),
         ("Proposals", [
             "Tasks you haven't approved yet: ideas an agent noted while working on its own, or tasks you paused. They don't run.",
@@ -3520,6 +3588,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         model.objectWillChange.send()
         settingsWindow?.title = L("הגדרות — קציר מכסה", "Settings — Quota harvest")
         if model.harvestInstalled { saveHarvestSettings(["language=" + (hebrew ? "he" : "en")]) }
+    }
+
+    /// A dragged queued task lands above `target` (or last): the whole new order goes to the engine,
+    /// which then runs the queue in it. Shown at once; the next listing confirms it.
+    func moveQueued(_ id: String, before target: String?) {
+        model.queueDropTarget = nil
+        var queue = model.listing.queue
+        guard let from = queue.firstIndex(where: { $0.id == id }) else { return }
+        let task = queue.remove(at: from)
+        let to = target.flatMap { t in queue.firstIndex(where: { $0.id == t }) } ?? queue.count
+        queue.insert(task, at: to)
+        guard queue.map(\.id) != model.listing.queue.map(\.id) else { return }
+        var l = model.listing
+        l.queue = queue
+        model.listing = l
+        runEngine(["queue-order"] + queue.map(\.id)) { [weak self] _ in self?.refreshListing() }
+    }
+
+    func resetQueueOrder() {
+        runEngine(["queue-order", "--reset"]) { [weak self] _ in self?.refreshListing() }
     }
 
     /// A proposal's trash can: dropped at once (the engine keeps a note, so it isn't proposed again).

@@ -33,6 +33,8 @@ SKILL_REFS = os.path.expanduser(os.environ.get("HARVEST_SKILL_REFS", "~/.claude/
 WORKTREE_PREFIX = "harvest-"
 HISTORY = os.path.join(HOME, "history.jsonl")
 TALK = os.path.join(HOME, "talk.json")
+# The owner's own order for the queue (dragged in the widget): task keys "<project>::<title>", first to run first.
+QUEUE_ORDER = os.path.join(HOME, "queue-order.json")
 MERGED_RE = re.compile(r"merged (\d{4}-\d{2}-\d{2})")
 DONE_LIST_DAYS = 30
 DONE_LIST_MAX = 40
@@ -166,6 +168,23 @@ TEXT = {
 }
 # A failed task's result starts with this marker in either language; a second failure blocks it.
 FAILED_MARKERS = (" · נכשל", " · failed")
+
+
+def task_key(t):
+    return t["project"] + "::" + t["title"]
+
+
+def manual_order():
+    return [k for k in (read_json(QUEUE_ORDER, {}) or {}).get("keys", []) if isinstance(k, str)]
+
+
+def ordered_queue(tasks):
+    """The order queued tasks run in — and are shown in: first those the owner placed by hand, in their order;
+    then the rest by priority, the bigger task first within a priority (it fits best early, while the budget
+    is widest)."""
+    place = {k: i for i, k in enumerate(manual_order())}
+    return sorted(tasks, key=lambda t: (0, place[task_key(t)], 0) if task_key(t) in place
+                  else (1, t["priority"], -t["tokens"]))
 
 
 def proposals_off(repo):
@@ -683,10 +702,11 @@ def cmd_list(a):
             done.append(t)
     done.sort(key=lambda t: t.get("ageDays", 0))
     lk = read_lock()
+    placed = set(manual_order())
     emit({
         "now": iso(now()),
         "projects": infos,
-        "queue": sorted([t for t in tasks if t["status"] == "open"], key=by_priority),
+        "queue": [dict(t, placed=task_key(t) in placed) for t in ordered_queue([t for t in tasks if t["status"] == "open"])],
         "proposals": sorted([t for t in tasks if t["status"] == "proposed"], key=by_priority),
         "needsYou": [t for t in tasks if t["status"] == "blocked"
                      or (t["status"] == "done" and t.get("branchState") == "unmerged")],
@@ -748,6 +768,28 @@ def cmd_proposals(a):
     saved["noProposals"] = current
     write_json(SETTINGS, saved)
     emit({"ok": True, "project": repo, "proposals": a.state, "dropped": dropped})
+
+
+def cmd_queue_order(a):
+    """`queue-order <key>…`: the owner's order for the queue, first to run first — keys are "<project>::<title>"
+    of queued tasks (others are dropped). Queued tasks not named keep the automatic order after them.
+    `--reset` forgets the owner's order. Only the owner: never from an unattended run."""
+    if os.environ.get("HARVEST_UNATTENDED"):
+        fail("unattended runs cannot reorder the queue")
+    if a.reset:
+        if os.path.exists(QUEUE_ORDER):
+            os.remove(QUEUE_ORDER)
+    else:
+        tasks, _ = all_tasks(ratio())
+        queued = {task_key(t) for t in tasks if t["status"] == "open"}
+        keys = []
+        for k in a.keys:
+            if k in queued and k not in keys:
+                keys.append(k)
+        write_json(QUEUE_ORDER, {"keys": keys})
+    tasks, _ = all_tasks(ratio())
+    emit({"ok": True, "manual": bool(manual_order()),
+          "queue": [task_key(t) for t in ordered_queue([t for t in tasks if t["status"] == "open"])]})
 
 
 def cmd_set_status(a):
@@ -868,7 +910,7 @@ def cmd_plan(a):
     tasks, infos = all_tasks(r)
     only = set(a.only or [])
     candidates = [x for x in tasks if x["status"] == "open" and (not only or x["project"] + "::" + x["title"] in only)]
-    candidates.sort(key=lambda x: (x["priority"], -x["tokens"]))
+    candidates = ordered_queue(candidates)
     minutes_left = (reset - t).total_seconds() / 60
     deferred_budget = False
     for c in candidates:
@@ -1760,6 +1802,11 @@ def main():
     ap = argparse.ArgumentParser(prog="harvest.py", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list").set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("queue-order")
+    p.add_argument("keys", nargs="*", metavar="PROJECT::TITLE")
+    p.add_argument("--reset", action="store_true")
+    p.set_defaults(fn=cmd_queue_order)
 
     p = sub.add_parser("proposals")
     p.add_argument("project"); p.add_argument("state", choices=("on", "off"))

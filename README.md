@@ -42,7 +42,7 @@ Anything it replaces is backed up first. At the end it offers a short getting-st
 
 ## Using it
 
-- **Queue** — approved tasks, with each one's estimated share of your weekly quota. ▶ runs one now; ⊖ takes it out of the queue.
+- **Queue** — approved tasks, top first, with each one's estimated share of your weekly quota. They run by priority unless you drag them into your own order. ▶ runs one now; ⊖ takes it out of the queue.
 - **Proposals** — ⊕ to approve, the trash can to delete, ⋯ next to a project for "no proposals from this project".
 - **Waiting for you** — finished branches and questions; a click opens a Claude session that walks you through the change.
 - **Done** — the last 30 days; a click opens the session that did the task.

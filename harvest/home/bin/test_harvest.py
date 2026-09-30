@@ -115,6 +115,33 @@ class Harvest(unittest.TestCase):
         self.usage(reset_in_h=0.2)
         self.assertEqual(self.run_engine("plan")["reason"], "cutoff-near")
 
+    def test_the_owner_can_order_the_queue(self):
+        self.add("Urgent big", tokens=90000)
+        self.run_engine("set-status", self.repo, "Urgent big", "open")
+        self.add("Later small", tokens=60000)
+        beta = self.make_repo("beta")
+        self.run_engine("add", beta, "--title", "Other project", "--details", "d", "--complexity", "low", "--tokens", "70000")
+        # Automatic order: priority, then the bigger estimate first — and plan runs the list's first task.
+        queue = self.run_engine("list")["queue"]
+        auto = [t["title"] for t in queue]
+        self.assertEqual(sorted(queue, key=lambda t: (t["priority"], -t["tokens"])), queue)
+        self.usage()
+        self.assertEqual(self.run_engine("plan", "--mode", "manual")["next"]["title"], auto[0])
+        self.assertNotEqual(auto[0], "Later small", "the test needs the dragged task not to be first already")
+        # The owner drags "Later small" to the top; a key that isn't queued is ignored.
+        r = self.run_engine("queue-order", self.repo + "::Later small", "/nowhere::Ghost")
+        self.assertTrue(r["manual"])
+        listing = self.run_engine("list")
+        self.assertEqual([t["title"] for t in listing["queue"]], ["Later small", "Urgent big", "Other project"])
+        self.assertEqual([t["placed"] for t in listing["queue"]], [True, False, False])
+        self.assertEqual(self.run_engine("plan", "--mode", "manual")["next"]["title"], "Later small")
+        # A full order across projects.
+        self.run_engine("queue-order", beta + "::Other project", self.repo + "::Urgent big", self.repo + "::Later small")
+        self.assertEqual([t["title"] for t in self.run_engine("list")["queue"]], ["Other project", "Urgent big", "Later small"])
+        self.run_engine("queue-order", "--reset", env=dict(self.env, HARVEST_UNATTENDED="1"), code=2)
+        self.assertFalse(self.run_engine("queue-order", "--reset")["manual"])
+        self.assertEqual([t["title"] for t in self.run_engine("list")["queue"]], auto)
+
     def test_plan_five_hour_full_is_not_final(self):
         self.add("Big task here", complexity="high", tokens=400000)
         self.usage(five=84, weekly=40, reset_in_h=7, session_reset_in_h=2)
