@@ -1,0 +1,38 @@
+#!/bin/sh
+# Quota Harvest — run it straight from this folder, for development. The everyday way is
+# ./install (an app bundle under launchd, with clickable notifications).
+#
+#   ./start            rebuild if the source changed, then run
+#   ./start --rebuild  rebuild anyway, then run
+#   ./start --quit     stop a copy started this way
+set -eu
+cd "$(dirname "$0")"
+
+name=QuotaHarvest
+
+quit_running() {
+  if pkill -x "$name" 2>/dev/null; then
+    echo "stopped the running $name"
+    sleep 0.5   # let its window go before a new one shows up
+  fi
+}
+
+rebuild=0
+case "${1:-}" in
+  "") ;;
+  --rebuild|-r) rebuild=1 ;;
+  --quit|-q) quit_running; exit 0 ;;
+  *) echo "usage: ./start [--rebuild | --quit]" >&2; exit 2 ;;
+esac
+
+command -v swiftc >/dev/null 2>&1 || { echo "swiftc is missing — install the Command Line Tools: xcode-select --install" >&2; exit 1; }
+
+if [ "$rebuild" = 1 ] || [ ! -x "$name" ] || [ "$name.swift" -nt "$name" ]; then
+  echo "building $name…"
+  swiftc -O -o "$name.new" "$name.swift"
+  mv -f "$name.new" "$name"
+fi
+
+quit_running
+nohup "./$name" >/dev/null 2>&1 &
+echo "$name started (pid $!)"

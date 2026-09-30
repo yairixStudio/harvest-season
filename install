@@ -1,0 +1,102 @@
+#!/bin/sh
+# Quota Harvest — build the app from this folder, and run it the way it runs every day:
+# as a login item under launchd.
+#
+#   ./install
+#
+# It builds QuotaHarvest.app here (the harvest's installer rides inside it, for the setup
+# window), signs it for this Mac, upgrades a harvest that its installer put in place, and
+# (re)starts the launchd job. A copy that ran under an earlier name is stopped and its login
+# item removed. For a quick run from a terminal instead, see ./start.
+set -eu
+cd "$(dirname "$0")"
+
+name=QuotaHarvest
+app="$PWD/$name.app"
+exe="$app/Contents/MacOS/$name"
+label=dev.quota-harvest.widget
+domain="gui/$(id -u)"
+agent="$HOME/Library/LaunchAgents/$label.plist"
+
+command -v swiftc >/dev/null 2>&1 || { echo "swiftc is missing — install the Command Line Tools: xcode-select --install" >&2; exit 1; }
+
+# 1. Build. The new binary is linked next to the old one and moved over it, so a running
+#    copy never has its file rewritten underneath it.
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+swiftc -O -o "$exe.new" "$name.swift"
+mv -f "$exe.new" "$exe"
+cp Info.plist "$app/Contents/Info.plist"
+cp -R lproj/. "$app/Contents/Resources/"
+
+# 2. The harvest's own files, for the setup window (Resources/harvest/install.py).
+rm -rf "$app/Contents/Resources/harvest"
+mkdir -p "$app/Contents/Resources/harvest"
+cp -R harvest/install.py harvest/home harvest/skills harvest/instructions "$app/Contents/Resources/harvest/"
+find "$app/Contents/Resources/harvest" -name __pycache__ -prune -exec rm -rf {} +
+
+# 3. The icon, drawn by the app itself, then an ad hoc signature for this Mac.
+icons="$(mktemp -d)"
+"$exe" --write-iconset "$icons/AppIcon.iconset"
+iconutil -c icns -o "$app/Contents/Resources/AppIcon.icns" "$icons/AppIcon.iconset"
+rm -rf "$icons"
+codesign --force --sign - "$app"
+
+# 4. A harvest this installer put in place follows the code in this folder. One set up by hand
+#    is left to the setup window, which asks first; files edited by hand make it stop and say so.
+if python3 harvest/install.py status | grep -q '"installed": true'; then
+  report="$(mktemp)"
+  if python3 harvest/install.py install >"$report" 2>&1; then
+    echo "harvest upgraded ($(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["changed"]))' "$report") files changed)"
+  else
+    echo "harvest not upgraded — files were edited by hand; details: $report" >&2
+  fi
+fi
+
+# 5. The login item. The same app under its earlier name goes first.
+for old in com.empathy.claude-usage-widget; do
+  if [ -f "$HOME/Library/LaunchAgents/$old.plist" ]; then
+    launchctl bootout "$domain/$old" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/$old.plist"
+    echo "removed the login item of the earlier name ($old)"
+  fi
+done
+pkill -x ClaudeUsageWidget 2>/dev/null || true
+rm -rf ClaudeUsageWidget.app
+
+# launchd remembers the program a job was loaded with, so the job is rewritten and reloaded
+# whenever it points anywhere but this build.
+if ! grep -qF "<string>$exe</string>" "$agent" 2>/dev/null; then
+  mkdir -p "$(dirname "$agent")"
+  cat >"$agent" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$label</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$exe</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>
+PLIST
+  launchctl bootout "$domain/$label" 2>/dev/null || true
+  sleep 1
+fi
+launchctl print "$domain/$label" >/dev/null 2>&1 || launchctl bootstrap "$domain" "$agent"
+
+# 6. Start it. The first launchd start of a binary macOS hasn't seen can be refused ("Launch
+#    Constraint Violation") and the next one allowed — so it tries a few times.
+for try in 1 2 3; do
+  launchctl kickstart -k "$domain/$label" 2>/dev/null || true
+  sleep 4
+  if pgrep -x "$name" >/dev/null; then
+    echo "Quota Harvest is running (try $try)"
+    exit 0
+  fi
+done
+echo "Quota Harvest did not start — see: launchctl print $domain/$label" >&2
+exit 1

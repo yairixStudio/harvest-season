@@ -1,0 +1,8 @@
+# Build output
+QuotaHarvest
+QuotaHarvest.new
+QuotaHarvest.app/
+
+# Python and macOS clutter
+__pycache__/
+.DS_Store
