@@ -297,6 +297,23 @@ class Harvest(unittest.TestCase):
         self.assertEqual((out["was"], out["archivedBranch"]), ("blocked", None))
         self.assertEqual(self.run_engine("list")["needsYou"], [])
 
+    def test_rejecting_everything_that_waits(self):
+        first = self.finished_branch("First change", name="a.txt")
+        self.finished_branch("Second change", name="b.txt")
+        self.add("A question")
+        self.run_engine("set-status", self.repo, "A question", "blocked", "--result", "2026-10-01 · which one?")
+        self.assertEqual(len(self.run_engine("list")["needsYou"]), 3)
+        subprocess.run(["git", "-C", self.repo, "checkout", "-q", first], check=True)
+        # One refusal doesn't stop the rest, and it says which and why.
+        out = self.run_engine("reject", "--all", "--reason", "לא נחוץ", code=2)
+        self.assertEqual(sorted(x["title"] for x in out["rejected"]), ["A question", "Second change"])
+        self.assertEqual([(x["title"], x["inTheWay"]) for x in out["refused"]], [("First change", "checkout-branch")])
+        subprocess.run(["git", "-C", self.repo, "checkout", "-q", "main"], check=True)
+        out = self.run_engine("reject", "--all")
+        self.assertEqual(([x["title"] for x in out["rejected"]], out["refused"]), (["First change"], []))
+        self.assertEqual(self.run_engine("list")["needsYou"], [])
+        self.run_engine("reject", "--all", self.repo, "First change", code=2)
+
     def test_brief_and_merge(self):
         branch = self.finished_branch("Add a file")
         # BACKLOG.md tracked and edited by the engine is not the owner's work in the way.

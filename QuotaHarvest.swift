@@ -1185,7 +1185,8 @@ protocol WidgetActions: AnyObject {
     func stopHarvest()
     func setQueued(_ task: HTask, _ queued: Bool)
     func openNeed(_ task: HTask)
-    func rejectWaiting(_ task: HTask)
+    func rejectWaiting(_ task: HTask, reason: String)
+    func rejectAllWaiting(reason: String)
     func setConfig(_ config: HarvestConfig)
     func toggleStartAtLogin(_ on: Bool)
     func setMenuBar(_ on: Bool)
@@ -1270,6 +1271,13 @@ final class WidgetModel: ObservableObject {
     @Published var needsOpen = false
     @Published var scheduleOpen = false
     @Published var doneOpen = false
+    /// The reject form open under a waiting row (its task id), or under the list for everything ("all").
+    @Published var rejecting: String?
+    /// "נקה הכל" under the done list, asking before it clears.
+    @Published var confirmingClear = false
+    /// Why the last reject didn't go through, shown under the waiting list (and in the all-tasks window)
+    /// until the next try or a dismiss.
+    @Published var rejectProblem: String?
     weak var actions: WidgetActions?
 
     func collapseAll() {
@@ -1277,6 +1285,8 @@ final class WidgetModel: ObservableObject {
         where self[keyPath: open] {
             self[keyPath: open] = false
         }
+        if rejecting != nil { rejecting = nil }
+        if confirmingClear { confirmingClear = false }
     }
 
     var harvestActive: Bool { running || detachedRun || externalRun }
@@ -1516,13 +1526,25 @@ struct PanelView: View {
             ByDay(tasks: m.listing.done) { t in
                 DoneRow(task: t, onOpen: { m.actions?.openDone(t) }, onClear: { m.actions?.clearDone(t) })
             }
-            HStack(spacing: 14) {
-                Button(L("נקה הכל", "Clear all")) { m.actions?.clearAllDone() }
-                    .help(L("מוריד את כולן מהרשימה; הענפים והרישום ב-BACKLOG.md נשארים",
-                            "Takes them all off the list; branches and the BACKLOG.md entries stay"))
-                Button(L("כל המשימות בטבלה ←", "All tasks in a table →")) { m.actions?.showAllTasks() }
+            if m.confirmingClear {
+                HStack(spacing: 8) {
+                    Text(L("לנקות את \(m.listing.done.count) מהרשימה? הענפים נשארים.",
+                           "Clear all \(m.listing.done.count) from the list? Branches stay."))
+                        .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Button(L("נקה", "Clear")) { m.actions?.clearAllDone() }.controlSize(.small)
+                    Button(L("ביטול", "Cancel")) { m.confirmingClear = false }.controlSize(.small)
+                }
+                .padding(.top, 4)
+            } else {
+                HStack(spacing: 14) {
+                    Button(L("נקה הכל", "Clear all")) { m.confirmingClear = true }
+                        .help(L("מוריד את כולן מהרשימה; הענפים והרישום ב-BACKLOG.md נשארים",
+                                "Takes them all off the list; branches and the BACKLOG.md entries stay"))
+                    Button(L("כל המשימות בטבלה ←", "All tasks in a table →")) { m.actions?.showAllTasks() }
+                }
+                .buttonStyle(.link).font(.system(size: 11)).padding(.top, 4)
             }
-            .buttonStyle(.link).font(.system(size: 11)).padding(.top, 4)
         }
     }
 
@@ -1531,13 +1553,36 @@ struct PanelView: View {
             EmptyLine(text: L("אין מה לבדוק", "Nothing to review"))
         } else {
             ByProject(tasks: m.listing.needsYou) { t in
-                NeedRow(task: t, onOpen: { m.actions?.openNeed(t) }, onReject: { m.actions?.rejectWaiting(t) })
+                VStack(alignment: .leading, spacing: 0) {
+                    NeedRow(task: t, onOpen: { m.actions?.openNeed(t) }, onReject: {
+                        withAnimation(.easeOut(duration: 0.12)) { m.rejecting = m.rejecting == t.id ? nil : t.id }
+                    })
+                    if m.rejecting == t.id {
+                        RejectForm(blocked: t.status == "blocked", count: nil,
+                                   onReject: { m.actions?.rejectWaiting(t, reason: $0) },
+                                   onCancel: { m.rejecting = nil })
+                            .padding(.bottom, 6)
+                    }
+                }
             }
-            Button(L("לשיחה עם קלוד על כל אלה ←", "Talk these over with Claude →")) { m.actions?.talk() }
+            if m.rejecting == "all" {
+                RejectForm(blocked: false, count: m.listing.needsYou.count,
+                           onReject: { m.actions?.rejectAllWaiting(reason: $0) },
+                           onCancel: { m.rejecting = nil })
+                    .padding(.top, 4)
+            } else {
+                HStack(spacing: 14) {
+                    Button(L("לשיחה עם קלוד על כל אלה ←", "Talk these over with Claude →")) { m.actions?.talk() }
+                        .help(L("קלוד מסביר מה מחכה לך ומה הוא ממליץ, וממזג רק באישורך",
+                                "Claude explains what's waiting for you and what it recommends, and merges only with your approval"))
+                    Button(L("דחה הכל", "Reject all")) { withAnimation(.easeOut(duration: 0.12)) { m.rejecting = "all" } }
+                        .help(L("שום דבר לא ימוזג: כל המשימות עוברות ל\"הוסרו\", והענפים נשמרים בארכיון",
+                                "Nothing gets merged: every task moves to Removed, and the branches are kept in the archive"))
+                }
                 .buttonStyle(.link).font(.system(size: 11)).padding(.top, 4)
-                .help(L("קלוד מסביר מה מחכה לך ומה הוא ממליץ, וממזג רק באישורך",
-                        "Claude explains what's waiting for you and what it recommends, and merges only with your approval"))
+            }
         }
+        if let problem = m.rejectProblem { ProblemLine(text: problem) { m.rejectProblem = nil } }
     }
 
     /// Claude Code missing or signed out: what that stops, and the way back in.
@@ -2097,6 +2142,117 @@ struct TaskRow: View {
     }
 }
 
+/// Lays its children out in rows, wrapping to a new row when one is full — the reject form's reasons.
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 5
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, row: CGFloat = 0, widest: CGFloat = 0
+        for v in subviews {
+            let size = v.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > width { y += row + spacing; x = 0; row = 0 }
+            x += size.width + spacing
+            row = max(row, size.height)
+            widest = max(widest, x - spacing)
+        }
+        return CGSize(width: proposal.width ?? widest, height: y + row)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX, y = bounds.minY, row: CGFloat = 0
+        for v in subviews {
+            let size = v.sizeThatFits(.unspecified)
+            if x > bounds.minX && x + size.width > bounds.maxX { y += row + spacing; x = bounds.minX; row = 0 }
+            v.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            row = max(row, size.height)
+        }
+    }
+}
+
+/// The owner's "no" to what waits for them, inline — under the row in the panel, in the details of the
+/// all-tasks window — never a modal alert: ready reasons to tick (any number), a few words of their own,
+/// and the button. The reasons and the words go to `reject --reason`, joined.
+struct RejectForm: View {
+    let blocked: Bool
+    /// nil for one task; the number of tasks for "reject all".
+    let count: Int?
+    let onReject: (String) -> Void
+    let onCancel: () -> Void
+    @State private var picked: [String] = []
+    @State private var note = ""
+
+    static var reasons: [String] {
+        [L("לא נחוץ", "Not needed"), L("כבר לא רלוונטי", "No longer relevant"), L("לא טוב מספיק", "Not good enough"),
+         L("כיוון לא נכון", "Wrong direction"), L("שובר משהו", "Breaks something"), L("כבר טופל", "Already handled"),
+         L("אעשה בעצמי", "I'll do it myself")]
+    }
+
+    var question: String {
+        if let n = count {
+            return L("לדחות את כל ה־\(n)? שום דבר לא ימוזג, והענפים יישמרו בארכיון. למה?",
+                     "Reject all \(n)? Nothing is merged, and the branches are kept in the archive. Why?")
+        }
+        return blocked ? L("לוותר על המשימה? למה?", "Give up on this task? Why?")
+            : L("לא למזג? הענף יישמר בארכיון ולא יימחק. למה?", "Don't merge it? The branch is kept in the archive, not deleted. Why?")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(question).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            FlowLayout(spacing: 5) {
+                ForEach(Self.reasons, id: \.self) { reason in
+                    let on = picked.contains(reason)
+                    Button {
+                        if on { picked.removeAll { $0 == reason } } else { picked.append(reason) }
+                    } label: {
+                        Text(reason).font(.system(size: 11))
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .foregroundStyle(on ? Color.white : Color.primary)
+                            .background(Capsule().fill(on ? Color.accentColor : Color.primary.opacity(0.08)))
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            TextField(L("משהו להוסיף? (לא חובה)", "Anything to add? (optional)"), text: $note)
+                .textFieldStyle(.roundedBorder).font(.system(size: 11)).onSubmit(submit)
+            HStack(spacing: 8) {
+                Button(count == nil ? L("דחה", "Reject") : L("דחה את כולן", "Reject them all"), action: submit)
+                    .buttonStyle(.borderedProminent).tint(.red).controlSize(.small)
+                Button(L("ביטול", "Cancel"), action: onCancel).controlSize(.small)
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.05)))
+    }
+
+    func submit() {
+        let words = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        onReject((picked + (words.isEmpty ? [] : [words])).joined(separator: ", "))
+    }
+}
+
+/// Why something the owner asked for didn't happen — stays until dismissed or the next try.
+struct ProblemLine: View {
+    let text: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.system(size: 10))
+            Text(text).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: onDismiss) { Image(systemName: "xmark").font(.system(size: 9)) }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+        }
+        .padding(.top, 5)
+    }
+}
+
 /// Something that waits for the owner: a click opens the review (or the question) in the Claude app;
 /// ✕ at the far end is the owner's "no" — not merged, the task dropped, its branch archived.
 struct NeedRow: View {
@@ -2221,7 +2377,11 @@ final class AllTasksModel: ObservableObject {
     }
     @Published var search = ""
     @Published var showCleared = false
-    @Published var selection: String?
+    @Published var selection: String? {
+        didSet { if rejecting != nil && rejecting != selection { rejecting = nil } }
+    }
+    /// The reject form in the details: a row's key, or "all" for everything that waits.
+    @Published var rejecting: String?
     @Published var sortOrder = [KeyPathComparator(\TaskLine.stage), KeyPathComparator(\TaskLine.runOrder),
                                 KeyPathComparator(\TaskLine.age)]
     /// Off for snapshots, so rendering a preview never changes the owner's choice of tab.
@@ -2261,7 +2421,7 @@ struct TaskAction: Identifiable {
     var id: String { title }
 }
 
-func taskActions(_ t: HTask, _ actions: WidgetActions?) -> [TaskAction] {
+func taskActions(_ t: HTask, _ actions: WidgetActions?, reject: @escaping () -> Void) -> [TaskAction] {
     var out: [TaskAction] = []
     switch t.status {
     case "open":
@@ -2271,11 +2431,11 @@ func taskActions(_ t: HTask, _ actions: WidgetActions?) -> [TaskAction] {
         out.append(TaskAction(title: L("מחק את ההצעה", "Delete the proposal"), icon: "trash") { actions?.removeProposal(t) })
     case "blocked":
         out.append(TaskAction(title: L("לענות על השאלה", "Answer the question"), icon: "questionmark.bubble") { actions?.openNeed(t) })
-        out.append(TaskAction(title: L("דחה את המשימה", "Reject the task"), icon: "xmark.circle") { actions?.rejectWaiting(t) })
+        out.append(TaskAction(title: L("דחה את המשימה", "Reject the task"), icon: "xmark.circle", run: reject))
     case "done":
         if t.branchState == "unmerged" {
             out.append(TaskAction(title: L("לבדיקה ולמיזוג", "Review and merge"), icon: "arrow.triangle.branch") { actions?.openNeed(t) })
-            out.append(TaskAction(title: L("דחה — לא למזג", "Reject — don't merge"), icon: "xmark.circle") { actions?.rejectWaiting(t) })
+            out.append(TaskAction(title: L("דחה — לא למזג", "Reject — don't merge"), icon: "xmark.circle", run: reject))
         }
         if t.sessionId != nil {
             out.append(TaskAction(title: L("פתח את הסשן שביצע", "Open the session that did it"), icon: "arrow.up.forward.app") { actions?.openDone(t) })
@@ -2337,7 +2497,7 @@ struct AllTasksView: View {
             toolbar.padding(EdgeInsets(top: 12, leading: 14, bottom: 10, trailing: 14))
             table
             Divider()
-            details.frame(height: 150, alignment: .top)
+            details.frame(height: 172, alignment: .top)
         }
         .font(.system(size: 12))
         .environment(\.layoutDirection, hebrew ? .rightToLeft : .leftToRight)
@@ -2349,6 +2509,12 @@ struct AllTasksView: View {
                 ForEach(TaskFilter.allCases) { f in Text("\(f.title) \(t.count(f))").tag(f) }
             }
             .pickerStyle(.segmented).labelsHidden().fixedSize()
+            if t.filter == .waiting && !m.listing.needsYou.isEmpty {
+                Button(L("דחה את כולן", "Reject them all")) { t.selection = nil; t.rejecting = "all" }
+                    .controlSize(.small)
+                    .help(L("שום דבר לא ימוזג: כל המשימות עוברות ל\"הוסרו\", והענפים נשמרים בארכיון",
+                            "Nothing gets merged: every task moves to Removed, and the branches are kept in the archive"))
+            }
             Spacer(minLength: 8)
             Toggle(L("גם מה שנוקה", "Show cleared"), isOn: $t.showCleared).toggleStyle(.checkbox).fixedSize()
                 .help(L("משימות שבוצעו וניקית מרשימת \"בוצעו\" בווידג'ט", "Done tasks you cleared from the widget's Done list"))
@@ -2418,7 +2584,7 @@ struct AllTasksView: View {
         }
         .contextMenu(forSelectionType: String.self) { ids in
             if let id = ids.first, let task = t.tasks.first(where: { TaskLine.key($0) == id }) {
-                ForEach(taskActions(task, m.actions)) { a in
+                ForEach(taskActions(task, m.actions, reject: { startReject(task) })) { a in
                     Button { a.run() } label: { Label(a.title, systemImage: a.icon) }
                 }
             }
@@ -2439,15 +2605,52 @@ struct AllTasksView: View {
         }
     }
 
+    func startReject(_ task: HTask) {
+        t.selection = TaskLine.key(task)
+        t.rejecting = TaskLine.key(task)
+    }
+
     @ViewBuilder var details: some View {
-        if let task = t.selected {
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    StageBadge(task: task, place: task.status == "open" ? t.runOrder[task.id].map { $0 + 1 } : nil).font(.system(size: 11))
-                    Text(task.title).font(.system(size: 13, weight: .semibold)).lineLimit(2).textSelection(.enabled)
-                    Spacer(minLength: 8)
-                    Text(task.projectName).foregroundStyle(.secondary).help(task.project)
+        VStack(alignment: .leading, spacing: 0) {
+            if let problem = m.rejectProblem {
+                ProblemLine(text: problem) { m.rejectProblem = nil }
+                    .padding(EdgeInsets(top: 4, leading: 14, bottom: 0, trailing: 14))
+            }
+            if t.rejecting == "all" {
+                RejectForm(blocked: false, count: m.listing.needsYou.count,
+                           onReject: { m.actions?.rejectAllWaiting(reason: $0) },
+                           onCancel: { t.rejecting = nil })
+                    .padding(EdgeInsets(top: 10, leading: 14, bottom: 10, trailing: 14))
+            } else if let task = t.selected {
+                selectedTask(task)
+            } else {
+                VStack(spacing: 4) {
+                    Text(L("בחר שורה — כאן יופיעו הפרטים והפעולות", "Select a row — its details and actions show here"))
+                        .foregroundStyle(.tertiary)
+                    if let u = t.updated {
+                        Text(L("\(t.tasks.count) משימות בכל הפרויקטים · עודכן ", "\(t.tasks.count) tasks across your projects · updated ")
+                             + formatTime(u, "HH:mm"))
+                            .font(.system(size: 11)).foregroundStyle(.tertiary)
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    func selectedTask(_ task: HTask) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                StageBadge(task: task, place: task.status == "open" ? t.runOrder[task.id].map { $0 + 1 } : nil).font(.system(size: 11))
+                Text(task.title).font(.system(size: 13, weight: .semibold)).lineLimit(2).textSelection(.enabled)
+                Spacer(minLength: 8)
+                Text(task.projectName).foregroundStyle(.secondary).help(task.project)
+            }
+            if t.rejecting == TaskLine.key(task) {
+                RejectForm(blocked: task.status == "blocked", count: nil,
+                           onReject: { m.actions?.rejectWaiting(task, reason: $0) },
+                           onCancel: { t.rejecting = nil })
+            } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 5) {
                         if let d = task.details, !d.isEmpty { field(L("מה לעשות", "What to do"), d) }
@@ -2462,25 +2665,14 @@ struct AllTasksView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 HStack(spacing: 8) {
-                    ForEach(taskActions(task, m.actions)) { a in
+                    ForEach(taskActions(task, m.actions, reject: { startReject(task) })) { a in
                         Button { a.run() } label: { Label(a.title, systemImage: a.icon) }.controlSize(.small)
                     }
                     Spacer()
                 }
             }
-            .padding(EdgeInsets(top: 10, leading: 14, bottom: 10, trailing: 14))
-        } else {
-            VStack(spacing: 4) {
-                Text(L("בחר שורה — כאן יופיעו הפרטים והפעולות", "Select a row — its details and actions show here"))
-                    .foregroundStyle(.tertiary)
-                if let u = t.updated {
-                    Text(L("\(t.tasks.count) משימות בכל הפרויקטים · עודכן ", "\(t.tasks.count) tasks across your projects · updated ")
-                         + formatTime(u, "HH:mm"))
-                        .font(.system(size: 11)).foregroundStyle(.tertiary)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .padding(EdgeInsets(top: 10, leading: 14, bottom: 10, trailing: 14))
     }
 
     func field(_ label: String, _ text: String) -> some View {
@@ -2561,7 +2753,8 @@ struct HelpView: View {
             "עבודה שהקציר גמר ומחכה לך: ענף עם שינויים שעוד לא מוזג, או שאלה שהסוכן נתקע עליה. ליד כל שורה — כמה זמן היא מחכה (כתום אחרי 14 יום).",
             "הסמלים: **ענף** — שינוי גמור שעוד לא מוזג. **סימן שאלה** — שאלה שהסוכן נתקע עליה. **חץ יוצא מריבוע** — נפתח באפליקציית Claude.",
             "**לחיצה על שורה** פותחת סשן באפליקציית Claude שמראה מה השתנה, וממזג רק אם תאשר. בשאלה — עונים לו שם.",
-            "**✕** בסוף שורה = **דחייה**: השינוי לא ימוזג (או שהמשימה החסומה לא תתבצע). אחרי אישור — ואפשר לכתוב למה — המשימה עוברת ל\"הוסרו\", והענף נשמר בארכיון ולא נמחק.",
+            "**✕** בסוף שורה = **דחייה**: השינוי לא ימוזג (או שהמשימה החסומה לא תתבצע). מתחת לשורה נפתח טופס קצר: מסמנים סיבות מוכנות (כמה שרוצים), אפשר להוסיף מילים, ו\"**דחה**\". המשימה עוברת ל\"הוסרו\" עם הסיבה, והענף נשמר בארכיון ולא נמחק.",
+            "**\"דחה הכל\"** בתחתית — אותו טופס, לכל מה שמחכה בבת אחת. מה שלא נדחה (למשל ענף שפתוח עכשיו בפרויקט) מופיע מתחת עם הסיבה.",
             "**\"לשיחה עם קלוד על כל אלה\"** בתחתית — שיחה אחת שעוברת על הכול וממליצה על כל פריט.",
             "כשמשהו מחכה יומיים ויותר מגיעה תזכורת (בין 10:00 ל-21:00). \"מחר\" דוחה אותה ביום. ענף שלא נגעת בו 35 יום עובר לארכיון — לא נמחק.",
         ]),
@@ -2575,7 +2768,7 @@ struct HelpView: View {
             "**כפתור הטבלה** בראש הווידג'ט (או **כל המשימות…** בתפריט ⋯, או \"כל המשימות בטבלה\" מתחת ל\"בוצעו\") פותח חלון עם כל המשימות מכל הפרויקטים, בטבלה אחת.",
             "למעלה: לשוניות עם מספרים — הכל, בתור, הצעות, מחכה לך, בוצעו, הוסרו (\"הכל\" הוא כל מה שלא הוסר) — חיפוש, ו\"**גם מה שנוקה**\" שמראה גם משימות שניקית מ\"בוצעו\".",
             "העמודות: מצב (במשימה שבתור — גם המקום שלה בתור), משימה, פרויקט, עדיפות, מורכבות, עלות משוערת, מתי נוספה, עדכון אחרון וענף. לחיצה על כותרת עמודה ממיינת לפיה.",
-            "**בחירת שורה** מראה למטה את הפרטים ואת מה שאפשר לעשות: להכניס לתור או להוציא, למחוק הצעה, לבדיקה ולמיזוג או לדחות, לפתוח את הסשן שביצע, לנקות או להחזיר ל\"בוצעו\", ולפתוח את BACKLOG.md. אותן פעולות בלחיצה ימנית; לחיצה כפולה פותחת את הבדיקה או את הסשן. להריץ — רק מהווידג'ט.",
+            "**בחירת שורה** מראה למטה את הפרטים ואת מה שאפשר לעשות: להכניס לתור או להוציא, למחוק הצעה, לבדיקה ולמיזוג או לדחות, לפתוח את הסשן שביצע, לנקות או להחזיר ל\"בוצעו\", ולפתוח את BACKLOG.md. אותן פעולות בלחיצה ימנית; לחיצה כפולה פותחת את הבדיקה או את הסשן. דחייה פותחת את אותו טופס סיבות כמו בווידג'ט, ובלשונית \"מחכה לך\" יש גם \"דחה את כולן\". להריץ — רק מהווידג'ט.",
         ]),
         ("קציר (בתחתית)", [
             "ספירה לאחור עד שהקציר האוטומטי מתחיל — רק כשהמתג \"אוטומטי\" דלוק. הוא רץ ב**פעימות**: כל פעימה היא חלון של 5 שעות, והאחרונה נגמרת לפני האיפוס השבועי. כמה פעימות — בוחרים בשורה (1–6), או \"אוטומטי\": כמה שצריך כדי לנצל את מה שנשאר מהשבוע על מה שבתור.",
@@ -2640,7 +2833,8 @@ struct HelpView: View {
             "Work the harvest finished that is waiting for you: a branch with changes not merged yet, or a question the agent got stuck on. Next to each row — how long it has waited (orange after 14 days).",
             "The icons: **a branch** — finished changes not merged yet. **A question mark** — a question the agent got stuck on. **An arrow out of a square** — opens in the Claude app.",
             "**Clicking a row** opens a session in the Claude app that shows what changed, and merges only if you approve. For a question — you answer it there.",
-            "**✕** at the end of a row = **rejecting** it: the change won't be merged (or the blocked task won't be done). After you confirm — you can say why — the task moves to Removed, and its branch is kept in the archive, not deleted.",
+            "**✕** at the end of a row = **rejecting** it: the change won't be merged (or the blocked task won't be done). A short form opens under the row: tick ready reasons (as many as you like), add words if you want, and \"**Reject**\". The task moves to Removed with the reason, and its branch is kept in the archive, not deleted.",
+            "**\"Reject all\"** at the bottom — the same form, for everything that waits at once. Whatever wasn't rejected (a branch checked out in the project, say) shows underneath with the reason.",
             "**\"Talk these over with Claude\"** at the bottom — one conversation that goes through everything and recommends what to do with each item.",
             "When something has waited two days or more, a reminder comes (between 10:00 and 21:00). \"Tomorrow\" puts it off by a day. A branch you haven't touched for 35 days is archived — not deleted.",
         ]),
@@ -2654,7 +2848,7 @@ struct HelpView: View {
             "**The table button** at the top of the widget (or **All tasks…** in the ⋯ menu, or \"All tasks in a table\" under Done) opens a window with every task of every project in one table.",
             "At the top: tabs with counts — All, Queue, Proposals, Waiting, Done, Removed (\"All\" is everything not removed) — a search, and **\"Show cleared\"**, which also shows the tasks you cleared from Done.",
             "The columns: status (for a queued task, also its place in the queue), task, project, priority, complexity, estimated cost, when it was added, the last update and the branch. Clicking a column's title sorts by it.",
-            "**Selecting a row** shows its details below, with what can be done: put it in the queue or take it out, delete a proposal, review and merge or reject, open the session that did it, clear it from Done or bring it back, and open BACKLOG.md. The same actions are on a right-click; a double-click opens the review or the session. Running happens only from the widget.",
+            "**Selecting a row** shows its details below, with what can be done: put it in the queue or take it out, delete a proposal, review and merge or reject, open the session that did it, clear it from Done or bring it back, and open BACKLOG.md. The same actions are on a right-click; a double-click opens the review or the session. Rejecting opens the same reasons form as in the widget, and the Waiting tab also has \"Reject them all\". Running happens only from the widget.",
         ]),
         ("Harvest (at the bottom)", [
             "A countdown to the start of the automatic harvest — only while the \"automatic\" switch is on. It runs in **pulses**: each pulse is one 5-hour window, and the last one ends before the weekly reset. How many — you choose in the row (1–6), or \"Auto\": as many as it takes to spend what's left of the week on what's queued.",
@@ -4830,61 +5024,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         runEngine(["clear-done", task.project, task.title, "--undo"]) { [weak self] _ in self?.refreshListing() }
     }
 
-    /// ✕ on something waiting for the owner (and "דחה" in the all-tasks window): after a confirmation with an
-    /// optional reason, `reject` — the task is dropped and an unmerged branch archived, never merged.
-    func rejectWaiting(_ task: HTask) {
-        let blocked = task.status == "blocked"
-        let alert = NSAlert()
-        alert.messageText = blocked ? L("לוותר על \"\(task.title)\"?", "Give up on \"\(task.title)\"?")
-            : L("לא למזג את \"\(task.title)\"?", "Don't merge \"\(task.title)\"?")
-        alert.informativeText = blocked
-            ? L("המשימה לא תתבצע ועוברת ל\"הוסרו\" ב\"כל המשימות\".", "The task won't be done; it moves to Removed in \"All tasks\".")
-            : L("השינוי לא ימוזג. הענף נשמר בארכיון (backlog-archive/…) ולא נמחק, והמשימה עוברת ל\"הוסרו\".",
-                "The change won't be merged. Its branch is kept in the archive (backlog-archive/…), not deleted, and the task moves to Removed.")
-        let reason = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 22))
-        reason.placeholderString = L("למה? (לא חובה — נשמר במשימה)", "Why? (optional — kept with the task)")
-        alert.accessoryView = reason
-        alert.addButton(withTitle: L("דחה", "Reject"))
-        alert.addButton(withTitle: L("ביטול", "Cancel"))
-        alert.window.initialFirstResponder = reason
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { model.objectWillChange.send(); return }
+    /// The reject form's button (under a waiting row, or in the all-tasks window): `reject`, at once — the
+    /// task leaves the lists while the engine works, and comes back with the reason shown if it refuses.
+    func rejectWaiting(_ task: HTask, reason: String) {
+        model.rejecting = nil
+        allTasksModel.rejecting = nil
+        model.rejectProblem = nil
         var l = model.listing
-        l.needsYou.removeAll { $0 == task }
+        l.needsYou.removeAll { $0.id == task.id }
         l.done.removeAll { $0.id == task.id && $0.branchState == "unmerged" }
         model.listing = l
         var args = ["reject", task.project, task.title]
-        let why = reason.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !why.isEmpty { args += ["--reason", why] }
+        if !reason.isEmpty { args += ["--reason", reason] }
+        runEngine(args) { [weak self] data in
+            guard let self else { return }
+            let reply = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            if reply?["ok"] as? Bool != true { self.model.rejectProblem = self.notRejected(task.title, reply) }
+            self.refreshListing()
+        }
+    }
+
+    /// "דחה הכל": everything that waits, each on its own — what the engine refused is listed with its reason.
+    func rejectAllWaiting(reason: String) {
+        model.rejecting = nil
+        allTasksModel.rejecting = nil
+        model.rejectProblem = nil
+        var l = model.listing
+        l.needsYou = []
+        l.done.removeAll { $0.branchState == "unmerged" }
+        model.listing = l
+        var args = ["reject", "--all"]
+        if !reason.isEmpty { args += ["--reason", reason] }
         runEngine(args) { [weak self] data in
             guard let self else { return }
             let reply = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             if reply?["ok"] as? Bool != true {
-                // Said in a window of its own: the reject may have come from the all-tasks window, with the panel closed.
-                let failed = NSAlert()
-                failed.messageText = L("\"\(task.title)\" לא נדחתה", "\"\(task.title)\" wasn't rejected")
-                failed.informativeText = reply?["inTheWay"] as? String == "checkout-branch"
-                    ? L("הענף שלה פתוח עכשיו בפרויקט. חזור לענף הראשי ונסה שוב.", "Its branch is checked out in the project. Switch back to the main branch and try again.")
-                    : (reply?["error"] as? String) ?? L("המנוע לא ענה.", "The engine didn't answer.")
-                NSApp.activate(ignoringOtherApps: true)
-                failed.runModal()
+                let refused = reply?["refused"] as? [[String: Any]] ?? []
+                self.model.rejectProblem = refused.isEmpty ? self.notRejected(nil, reply)
+                    : refused.map { self.notRejected($0["title"] as? String, $0) }.joined(separator: "\n")
             }
             self.refreshListing()
         }
     }
 
-    /// "נקה הכל" under the done list, after a confirmation that says nothing but the list changes.
+    func notRejected(_ title: String?, _ reply: [String: Any]?) -> String {
+        let what = title.map { L("\"\($0)\" לא נדחתה: ", "\"\($0)\" wasn't rejected: ") } ?? L("הדחייה לא עברה: ", "Rejecting didn't go through: ")
+        if reply?["inTheWay"] as? String == "checkout-branch" {
+            return what + L("הענף שלה פתוח עכשיו בפרויקט — חזור לענף הראשי ונסה שוב.",
+                            "its branch is checked out in the project — switch back to the main branch and try again.")
+        }
+        return what + ((reply?["error"] as? String) ?? L("המנוע לא ענה.", "the engine didn't answer."))
+    }
+
+    /// "נקה הכל" under the done list, once its inline question is answered.
     func clearAllDone() {
-        let count = model.listing.done.count
-        guard count > 0 else { return }
-        let alert = NSAlert()
-        alert.messageText = L("לנקות את \(count) המשימות מ\"בוצעו\"?", "Clear the \(count) tasks from Done?")
-        alert.informativeText = L("הן יורדות רק מהרשימה: הענפים, \"מחכה לך\" והרישום ב-BACKLOG.md נשארים. אפשר להחזיר כל אחת מ\"כל המשימות\".",
-                                  "They only leave the list: branches, \"Waiting for you\" and the BACKLOG.md entries stay. \"All tasks\" can bring any of them back.")
-        alert.addButton(withTitle: L("נקה", "Clear"))
-        alert.addButton(withTitle: L("ביטול", "Cancel"))
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { model.objectWillChange.send(); return }
+        model.confirmingClear = false
+        guard !model.listing.done.isEmpty else { return }
         var l = model.listing
         l.done = []
         model.listing = l
@@ -5362,6 +5557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
                 let rows = self.allTasksModel.rows
                 if rows.indices.contains(n) { self.allTasksModel.selection = rows[n].id }
             }
+            self.snapshotForms()
             self.renderSnapshot(NSHostingView(rootView: AllTasksView(m: self.model, t: self.allTasksModel)
                 .frame(width: AllTasksView.width, height: 640)
                 .background(Color(nsColor: .windowBackgroundColor))), width: AllTasksView.width, to: path)
@@ -5449,8 +5645,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         }
     }
 
+    /// `--rejecting [all]` on the snapshots: the reject form open — under the first waiting row, or for all.
+    func snapshotForms() {
+        let args = CommandLine.arguments
+        guard let i = args.firstIndex(of: "--rejecting") else { return }
+        let all = i + 1 < args.count && args[i + 1] == "all"
+        model.rejecting = all ? "all" : model.listing.needsYou.first?.id
+        if all { allTasksModel.rejecting = "all" } else if let key = allTasksModel.selection { allTasksModel.rejecting = key }
+    }
+
     func renderPanelSnapshot(to path: String) {
         self.updateAutoPlan()
+        snapshotForms()
         // cacheDisplay skips the window background, so the view paints its own.
         let host = NSHostingView(rootView: PanelView(m: self.model)
             .background(Color(nsColor: .windowBackgroundColor)))

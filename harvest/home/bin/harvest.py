@@ -1831,48 +1831,78 @@ def cmd_merge(a):
     emit({"ok": True, "project": repo, "title": v["title"], "branch": branch, "base": base, "head": head})
 
 
-def waiting_task(repo, title):
+class Refused(Exception):
+    """A step the engine won't take, with the details the caller needs to say why."""
+    def __init__(self, msg, **extra):
+        Exception.__init__(self, msg)
+        self.extra = extra
+
+
+def waiting_task(repo, title, r=None):
     """The task under this title that waits for the owner: done with an unmerged harvest branch, or blocked.
     A title can come back as a new task once the old one is done, so it's the section in that state."""
     lines, tasks = parse_backlog(repo)
     if lines is None:
-        fail("no BACKLOG.md in " + repo)
-    r = ratio()
+        raise Refused("no BACKLOG.md in " + repo)
+    r = r or ratio()
     for t in reversed(tasks):
         if t["title"] == title.strip():
             v = task_view(repo, t, r)
             if v["status"] == "blocked" or (v["status"] == "done" and v.get("branchState") == "unmerged"):
                 return lines, t, v
-    fail("nothing waits for the owner under this title: " + title, project=repo)
+    raise Refused("nothing waits for the owner under this title: " + title, project=repo)
 
 
-def cmd_reject(a):
-    """The owner's "no" to what waits for them: a finished branch they won't merge, or a blocked task they won't
-    pursue. The task becomes dropped, its result keeping what was done (so it isn't proposed again), and an
-    unmerged harvest branch moves to backlog-archive/ — kept, not merged, not deleted. Refuses while that branch
-    is checked out. Only the owner decides: never from an unattended run."""
-    if os.environ.get("HARVEST_UNATTENDED"):
-        fail("only the owner rejects work")
-    repo = os.path.abspath(a.project)
-    lines, t, v = waiting_task(repo, a.title)
+def reject_task(repo, title, reason, r=None):
+    lines, t, v = waiting_task(repo, title, r)
     result = v.get("result", "")
     found = BRANCH_RE.search(result)
     branch = v.get("branch") or (found.group(1) if found else None)
     archived = None
     if branch and branch.startswith("backlog/") and branch_exists(repo, branch):
         if git(repo, "branch", "--show-current").stdout.strip() == branch:
-            fail("the branch is checked out in the project — switch back to %s first" % base_branch(repo),
-                 branch=branch, inTheWay="checkout-branch")
+            raise Refused("the branch is checked out in the project — switch back to %s first" % base_branch(repo),
+                          branch=branch, inTheWay="checkout-branch")
         archived = branch.replace("backlog/", "backlog-archive/", 1)
         if branch_exists(repo, archived):
             archived += "-" + today()
         mv = git(repo, "branch", "-m", branch, archived)
         if mv.returncode != 0:
-            fail("could not archive the branch: " + (mv.stderr or mv.stdout).strip()[:300], branch=branch)
+            raise Refused("could not archive the branch: " + (mv.stderr or mv.stdout).strip()[:300], branch=branch)
         result = result.replace(branch, archived)
-    note = tr("rejected", today()) + (" · " + " ".join(a.reason.split()) if a.reason else "")
+    note = tr("rejected", today()) + (" · " + " ".join(reason.split()) if reason else "")
     write_fields(repo, lines, t, {"status": "dropped", "result": note + (" · " + result if result else "")})
-    emit({"ok": True, "project": repo, "title": v["title"], "was": v["status"], "archivedBranch": archived})
+    return {"project": repo, "title": v["title"], "was": v["status"], "archivedBranch": archived}
+
+
+def cmd_reject(a):
+    """The owner's "no" to what waits for them: a finished branch they won't merge, or a blocked task they won't
+    pursue. The task becomes dropped, its result keeping the reason and what was done (so it isn't proposed
+    again), and an unmerged harvest branch moves to backlog-archive/ — kept, not merged, not deleted. Refuses
+    while that branch is checked out. --all: everything that waits, each on its own (one refusal doesn't stop
+    the rest; they are listed). Only the owner decides: never from an unattended run."""
+    if os.environ.get("HARVEST_UNATTENDED"):
+        fail("only the owner rejects work")
+    if a.all:
+        if a.project or a.title:
+            fail("--all takes no project or title")
+        r = ratio()
+        waiting = [t for t in all_tasks(r)[0]
+                   if t["status"] == "blocked" or (t["status"] == "done" and t.get("branchState") == "unmerged")]
+        rejected, refused = [], []
+        for t in waiting:
+            try:
+                rejected.append(reject_task(t["project"], t["title"], a.reason, r))
+            except Refused as e:
+                refused.append(dict(e.extra, project=t["project"], title=t["title"], error=str(e)))
+        emit({"ok": not refused, "rejected": rejected, "refused": refused}, 0 if not refused else 2)
+    if not (a.project and a.title):
+        fail("give a project and a title, or --all")
+    try:
+        out = reject_task(os.path.abspath(a.project), a.title, a.reason)
+    except Refused as e:
+        fail(str(e), **e.extra)
+    emit(dict(out, ok=True))
 
 
 TALK_TOPICS = {"waiting": ("talk_name", "talk-prompt.md"), "onboard": ("onboard_name", "onboard-prompt.md")}
@@ -2350,7 +2380,8 @@ def main():
     p.set_defaults(fn=cmd_merge)
 
     p = sub.add_parser("reject")
-    p.add_argument("project"); p.add_argument("title")
+    p.add_argument("project", nargs="?"); p.add_argument("title", nargs="?")
+    p.add_argument("--all", action="store_true", help="everything that waits for the owner")
     p.add_argument("--reason", help="why, in the owner's words — kept in the task's result")
     p.set_defaults(fn=cmd_reject)
 

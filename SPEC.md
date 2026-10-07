@@ -91,9 +91,10 @@ frame saved as `QuotaHarvestAllTasks`; the drop-down panel hides first in menu b
 - Under the table, the selected task: status, title, project, its details, then the question (blocked),
   what was done (done) or the last note, and its actions — take out of the queue / put in the queue,
   delete a proposal, review and merge or answer the question (`openNeed`), reject (blocked, and done
-  with an unmerged branch — `rejectWaiting`, as the panel's ✕), open the session that did it,
+  with an unmerged branch — the same `RejectForm`, in place of the details), open the session that did it,
   clear from or back to the Done list, open BACKLOG.md. The same actions on a right-click; a double-click
   opens the review (or answer) or the session. No run controls: running stays in the panel.
+- On the מחכה לך tab, "דחה את כולן" beside the tabs opens the form for everything that waits.
 - `--snapshot-tasks <png> [--filter <tab>] [--select <row>] [--cleared] [--demo] [--light] [--he|--en]`
   renders it at its opening size (1100 × 640) and exits.
 
@@ -154,13 +155,19 @@ open or a harvest runs, else every 2 min):
   merged into the project's main branch, with their age (orange at 14+ days).
   Clicking opens `claude://code/new?folder=<project>&q=<prompt>`: a new desktop
   session that reviews and, on approval, merges the branch (or resolves the
-  blocking question). ✕ at the far end of a row (beside the row's button) is the owner's "no": a
-  confirmation with an optional reason (`NSAlert` with a text field), then `reject <project> <title>
-  [--reason …]` — the task becomes `dropped` (result: "<date> · rejected by the owner · reason · the old
-  result"), an unmerged `backlog/*` branch is renamed to `backlog-archive/*` (kept, never merged, never
-  deleted). The engine refuses while that branch is checked out (`inTheWay: checkout-branch`) and in
-  unattended runs; a refusal is said in an alert of its own, since the reject may come from the all-tasks
-  window. The talk session's prompt uses the same command for "don't merge".
+  blocking question). ✕ at the far end of a row (beside the row's button) is the owner's "no": it opens
+  `RejectForm` inline under the row — never a modal alert (an accessory app's `NSAlert` was slow to come up
+  and a reinstall could cut it off): the question, ready reasons as chips in a `FlowLayout` (any number:
+  לא נחוץ · כבר לא רלוונטי · לא טוב מספיק · כיוון לא נכון · שובר משהו · כבר טופל · אעשה בעצמי), a text
+  field, "דחה" (red) and "ביטול". "דחה" sends `reject <project> <title> [--reason "<chips, words>"]` at
+  once and takes the task off the lists — it becomes `dropped` (result: "<date> · rejected by the owner ·
+  reason · the old result"), an unmerged `backlog/*` branch is renamed to `backlog-archive/*` (kept, never
+  merged, never deleted). Under the list, beside "לשיחה עם קלוד", "דחה הכל" opens the same form for every
+  waiting task (`reject --all`, each on its own: one refusal doesn't stop the rest). The engine refuses
+  while a branch is checked out (`inTheWay: checkout-branch`) and in unattended runs; a refusal shows as a
+  line under the list (and in the all-tasks window's details) with the reason, until dismissed or the next
+  try, and the task comes back. One form open at a time (`WidgetModel.rejecting`: a task id or "all");
+  opening the panel closes it. The talk session's prompt uses the same command for "don't merge".
 - **בוצעו** — `done` tasks of the last 30 days (at most 40), newest first under
   היום / אתמול / השבוע / קודם: title, project, and an icon for the branch (blue
   branch = waiting for review, green check = merged, archive box = archived,
@@ -177,8 +184,8 @@ open or a harvest runs, else every 2 min):
   Each row has a trash can at the far end (beside the row's own button, never inside it):
   `clear-done <project> <title>` — off the list at once; the engine writes `- cleared: <date>` on the
   task's done section in BACKLOG.md, and leaves the branch, history and מחכה לך alone. Under the list,
-  "נקה הכל" (a confirmation with the count, then `clear-done --all`, which clears exactly what the done
-  list shows) and "כל המשימות בטבלה ←", which opens the all-tasks window. `--undo` (from that
+  "נקה הכל" (an inline question with the count in place of the links — "נקה" / "ביטול" — then
+  `clear-done --all`, which clears exactly what the done list shows) and "כל המשימות בטבלה ←", which opens the all-tasks window. `--undo` (from that
   window) brings one back. Refused in unattended runs: only the owner tidies the list.
 - Rows give titles up to two lines. Projects are grouped by name, in a fixed order, so a group never moves
   when one of its tasks leaves the list; the proposals' ⋯ sits right after the project's name. Above the
