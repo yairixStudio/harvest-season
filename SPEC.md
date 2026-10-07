@@ -170,7 +170,10 @@ process group, PATH extended with `~/.local/bin` and Homebrew, output to
 exactly as long as the run lives. The engine's launcher starts an interactive
 `claude` (fixed `--session-id`, `--name "קציר מכסה · <dd.mm HH:mm> · <mode>"`,
 `--permission-mode auto --model opus --effort medium --remote-control`) in a
-hidden pseudo-terminal in `~/Programs/quota-harvest`, with every inherited
+hidden pseudo-terminal in the harvest folder (`workdir` in `settings.json`,
+default `~/claude-harvest`; it must not sit inside a repository — the session
+would load that repository's `CLAUDE.md`, and `discover` leaves out any
+repository under it), with every inherited
 `CLAUDE*`/`MCP_*` marker removed and `HARVEST_UNATTENDED=1` (the engine then
 refuses to queue tasks). Interactive + Remote Control is what makes the run
 visible: the Claude desktop app and the phone app list it live and let the owner
