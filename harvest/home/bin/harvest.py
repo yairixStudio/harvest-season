@@ -48,10 +48,18 @@ DEFAULT_CONFIG = {"auto": True, "leadHours": 8}
 # names, notifications), the digest email, the folder the coordinator runs in, the models.
 SETTINGS = os.path.join(HOME, "settings.json")
 LANGUAGES = ("he", "en")
+# A model with a weekly quota of its own (Fable) gives way to another once that quota reaches atPct:
+# before a task starts, and — with switchMidTask — in the middle of one, the session going on with its
+# conversation intact. An empty "to" means: no fallback, such tasks wait for the quota to reset.
+DEFAULT_FALLBACK = {"fable": {"to": "opus", "atPct": 85}}
 DEFAULT_SETTINGS = {"ownerName": "", "language": "en", "email": "", "emailDigest": False,
                     "workdir": "~/claude-harvest", "models": dict(MODEL_BY_COMPLEXITY),
                     # Projects the owner wants no proposals for: never scanned, and agents can't propose there.
-                    "noProposals": []}
+                    "noProposals": [],
+                    "fallback": DEFAULT_FALLBACK, "switchMidTask": True,
+                    # Points the harvest leaves unused: in the 5-hour window, so the owner can keep working,
+                    # and in the week (anything more than a little would vanish at the reset anyway).
+                    "fiveReserve": 15, "weeklyReserve": 2}
 
 SEED_TOKENS_PER_WEEKLY_PCT = 120000
 SEED_TOKENS_PER_FIVE_PCT = 30000
@@ -59,9 +67,7 @@ SEED_TOKENS_PER_FIVE_PCT = 30000
 WEEKLY_PER_FIVE = 3.8
 MIN_CALIBRATION_POINTS = 3
 
-FIVE_MARGIN = 15      # points left free in the 5-hour window, so the owner can keep working
-WEEKLY_MARGIN = 2     # weekly points left before the reset; anything more would vanish anyway
-FIT_FACTOR = 1.5      # a task starts only if 1.5x its estimate fits the budget
+FIT_FACTOR = 1.5     # a task starts only if 1.5x its estimate fits the budget
 CUTOFF_GUARD_MIN = 20
 TOKENS_PER_MINUTE = 8000
 USAGE_MAX_AGE_S = 15 * 60
@@ -134,11 +140,12 @@ def read_json(path, default=None):
 
 
 def settings():
-    s = dict(DEFAULT_SETTINGS, models=dict(MODEL_BY_COMPLEXITY), noProposals=[])
+    s = dict(DEFAULT_SETTINGS, models=dict(MODEL_BY_COMPLEXITY), noProposals=[],
+             fallback={k: dict(v) for k, v in DEFAULT_FALLBACK.items()})
     saved = read_json(SETTINGS, {}) or {}
     for k in DEFAULT_SETTINGS:
         if k in saved and saved[k] is not None:
-            s[k] = dict(s["models"], **saved[k]) if k == "models" and isinstance(saved[k], dict) else saved[k]
+            s[k] = dict(s[k], **saved[k]) if k in ("models", "fallback") and isinstance(saved[k], dict) else saved[k]
     if s["language"] not in LANGUAGES:
         s["language"] = "en"
     return s
@@ -152,6 +159,12 @@ TEXT = {
     "needs_decision": {"he": "צריך החלטה", "en": "needs a decision"},
     "failed_twice": {"he": "%s · נכשל פעמיים: %s", "en": "%s · failed twice: %s"},
     "failed": {"he": "%s · נכשל: %s", "en": "%s · failed: %s"},
+    "paused": {"he": "%s · נעצר ב%s · ממשיך מ-%s", "en": "%s · paused at %s · continues from %s"},
+    "paused_empty": {"he": "%s · נעצר ב%s · יתחיל מחדש", "en": "%s · paused at %s · starts over"},
+    "limit_five": {"he": "מגבלת 5 השעות", "en": "the 5-hour limit"},
+    "limit_weekly": {"he": "המגבלה השבועית", "en": "the weekly limit"},
+    "limit_model": {"he": "מגבלת %s", "en": "the %s limit"},
+    "limit_auth": {"he": "ניתוק מהחשבון", "en": "a sign-out"},
     "talk_name": {"he": "קציר · מה מחכה לך · %s", "en": "Harvest · what waits for you · %s"},
     "onboard_name": {"he": "קציר · היכרות · %s", "en": "Harvest · getting started · %s"},
     "mode_auto": {"he": "אוטומטי", "en": "automatic"},
@@ -168,6 +181,8 @@ TEXT = {
 }
 # A failed task's result starts with this marker in either language; a second failure blocks it.
 FAILED_MARKERS = (" · נכשל", " · failed")
+# A task a usage limit stopped: not a failure, and its next attempt goes on from the branch in the result.
+PAUSED_MARKERS = (" · נעצר ב", " · paused at ")
 
 
 def task_key(t):
@@ -354,6 +369,65 @@ def lock_is_live(lk):
     if at and (now() - at).total_seconds() > LOCK_MAX_AGE_S:
         return False
     return alive(lk.get("pid")) if lk.get("pid") else bool(at)
+
+
+# ---------- usage limits a session ran into ----------
+
+LIMIT_MODEL_RE = re.compile(r"\b(fable|opus|sonnet|haiku)\b[^.·\n]{0,20}\blimit\b")
+
+
+def classify_limit(text):
+    """Which limit a Claude Code rate-limit message is about: the 5-hour window ("session limit"), the
+    all-models week ("weekly limit"), or one model's own quota ("Fable limit") — only the last leaves
+    another model to go on with. Anything unknown counts as the 5-hour window: stop now, retry after it."""
+    t = (text or "").lower()
+    if "session limit" in t:
+        return {"kind": "five"}
+    if "weekly limit" in t:
+        return {"kind": "weekly"}
+    m = LIMIT_MODEL_RE.search(t)
+    if m:
+        return {"kind": "model", "model": m.group(1)}
+    return {"kind": "five"}
+
+
+def limit_key(hit):
+    return "model:" + hit["model"] if hit["kind"] == "model" else hit["kind"]
+
+
+def limit_until(hit, usage):
+    """When the limit a session hit lifts, from usage.json's reset times (never from the message's wording);
+    without one, a safe guess: 5 hours, or a week."""
+    at = parse_iso(hit.get("at")) or now()
+    u = usage or {}
+    if hit["kind"] == "five":
+        r = parse_iso((u.get("session") or {}).get("resetsAt"))
+        return r if r and r > at else at + timedelta(hours=5)
+    if hit["kind"] == "model":
+        scoped = u.get("scoped") or {}
+        r = parse_iso(scoped.get("resetsAt"))
+        if str(scoped.get("label", "")).lower().startswith(hit["model"]) and r and r > at:
+            return r
+    r = parse_iso((u.get("weekly") or {}).get("resetsAt"))
+    return r if r and r > at else at + timedelta(days=7)
+
+
+def record_limit(hit, usage):
+    st = status()
+    st.setdefault("limits", {})[limit_key(hit)] = {"at": hit.get("at") or iso(now()),
+                                                   "until": iso(limit_until(hit, usage)), "text": hit.get("text")}
+    save_status(st)
+
+
+def limit_active(st, key):
+    lim = (st.get("limits") or {}).get(key)
+    return bool(lim) and (parse_iso(lim.get("until")) or now()) > now()
+
+
+def limit_label(hit):
+    if hit["kind"] == "model":
+        return tr("limit_model", hit["model"].capitalize())
+    return tr("limit_" + hit["kind"])
 
 
 # ---------- usage and calibration ----------
@@ -739,7 +813,23 @@ def cmd_settings(a):
                     fail('models takes JSON, e.g. {"high": "opus"}')
                 if not isinstance(v, dict) or set(v) - set(MODEL_BY_COMPLEXITY):
                     fail("models maps " + ", ".join(MODEL_BY_COMPLEXITY) + " to model names")
-            elif k == "emailDigest":
+            elif k == "fallback":
+                try:
+                    v = json.loads(v)
+                except ValueError:
+                    fail('fallback takes JSON, e.g. {"fable": {"to": "opus", "atPct": 85}}')
+                ok = isinstance(v, dict) and all(
+                    isinstance(e, dict) and isinstance(e.get("to", ""), str)
+                    and isinstance(e.get("atPct", 100), (int, float)) and 1 <= e.get("atPct", 100) <= 100
+                    for e in v.values())
+                if not ok:
+                    fail('fallback maps a model to {"to": <model or "">, "atPct": 1–100}')
+                v = {m.lower(): {"to": e.get("to", "").lower(), "atPct": e.get("atPct", 100)} for m, e in v.items()}
+            elif k in ("fiveReserve", "weeklyReserve"):
+                if not v.strip().isdigit() or not 0 <= int(v) <= 60:
+                    fail(k + " takes a whole number of points, 0–60")
+                v = int(v)
+            elif k in ("emailDigest", "switchMidTask"):
                 v = v.strip().lower() in ("1", "true", "yes", "on")
             elif k == "language" and v not in LANGUAGES:
                 fail("language is one of " + ", ".join(LANGUAGES))
@@ -869,12 +959,48 @@ def cmd_add(a):
           "downgradedToProposed": downgraded, "registered": registered})
 
 
-def pick_model(complexity, usage):
-    model = settings()["models"].get(complexity) or MODEL_BY_COMPLEXITY.get(complexity, "opus")
-    scoped = usage.get("scoped") or {}
-    if model == "fable" and scoped.get("label", "").lower().startswith("fable") and scoped.get("pct", 0) > 85:
-        model = "opus"
+def model_full(model, usage, st, s):
+    """Whether `model` should give way: its own weekly quota (usage `scoped`, e.g. Fable) reached the owner's
+    point for it, or a session hit that model's limit this week (usage.json can be minutes behind)."""
+    lim = (st.get("limits") or {}).get("model:" + model)
+    if lim and (parse_iso(lim.get("until")) or now()) > now():
+        return True
+    scoped = (usage or {}).get("scoped") or {}
+    if str(scoped.get("label", "")).lower().startswith(model):
+        at = (s["fallback"].get(model) or {}).get("atPct", 100)
+        return float(scoped.get("pct") or 0) >= float(at)
+    return False
+
+
+def fallback_model(model, usage, st=None, s=None):
+    """`model`, or the first model down its fallback chain that isn't full; None when the chain runs out."""
+    s, st = s or settings(), st if st is not None else status()
+    seen = set()
+    while model and model_full(model, usage, st, s):
+        seen.add(model)
+        model = (s["fallback"].get(model) or {}).get("to") or None
+        if model in seen:
+            return None
     return model
+
+
+def pick_model(complexity, usage, st=None):
+    s = settings()
+    return fallback_model(s["models"].get(complexity) or MODEL_BY_COMPLEXITY.get(complexity, "opus"), usage, st, s)
+
+
+def limit_fallback(hit, model):
+    """After a session ran into a usage limit: the model it goes on with, or None to stop it. Only a model's
+    own quota leaves another model (and only with switchMidTask); the 5-hour window and the week are shared.
+    The limit is recorded either way, so plan and pick_model keep to it until it resets."""
+    if hit["kind"] == "auth":
+        return None
+    u, _ = load_usage()
+    record_limit(hit, u)
+    s = settings()
+    if hit["kind"] != "model" or not s["switchMidTask"]:
+        return None
+    return fallback_model(hit.get("model") or model, u or {}, status(), s)
 
 
 def cmd_plan(a):
@@ -899,8 +1025,14 @@ def cmd_plan(a):
         res["reason"] = "cutoff-near"
         emit(res)
 
-    weekly_room = 100 - float(u["weekly"]["pct"]) - WEEKLY_MARGIN
-    five_room = 100 - float(u["session"]["pct"]) - FIVE_MARGIN
+    s = settings()
+    weekly_room = 100 - float(u["weekly"]["pct"]) - float(s["weeklyReserve"])
+    five_room = 100 - float(u["session"]["pct"]) - float(s["fiveReserve"])
+    # A limit a session ran into counts as full until it resets, whatever a few-minutes-old usage.json says.
+    if limit_active(st, "weekly"):
+        weekly_room = min(weekly_room, 0)
+    if limit_active(st, "five"):
+        five_room = min(five_room, 0)
     weekly_budget = max(0, weekly_room) * r["weekly"]
     five_budget = max(0, five_room) * r["five"]
     budget = min(weekly_budget, five_budget)
@@ -923,11 +1055,14 @@ def cmd_plan(a):
             res["deferred"].append({"project": c["project"], "title": c["title"], "why": "budget"})
             deferred_budget = True
             continue
+        model = pick_model(c["complexity"], u, st)
+        if not model:
+            res["deferred"].append({"project": c["project"], "title": c["title"], "why": "model-full"})
+            continue
         if res["next"] is None:
             res["next"] = {"kind": "task", "project": c["project"], "projectName": c["projectName"],
                            "title": c["title"], "details": c["details"], "priority": c["priority"],
-                           "complexity": c["complexity"], "tokens": c["tokens"],
-                           "model": pick_model(c["complexity"], u)}
+                           "complexity": c["complexity"], "tokens": c["tokens"], "model": model}
     if res["next"] is None and a.mode == "auto" and not only and st.get("scansThisRun", 0) < MAX_SCANS_PER_RUN:
         open_or_proposed = {x["project"] for x in tasks if x["status"] in ("open", "proposed")}
         scanned = set(st.get("scannedThisRun", []))
@@ -946,9 +1081,13 @@ def cmd_plan(a):
         res["reason"] = "queue-empty"
     elif deferred_budget:
         res["reason"] = "5h-full" if five_budget < weekly_budget else "weekly-full"
+    elif any(d["why"] == "model-full" for d in res["deferred"]):
+        res["reason"] = "model-full"
     else:
         res["reason"] = "cutoff-near"
     session_reset = parse_iso(u["session"].get("resetsAt"))
+    if limit_active(st, "five"):
+        session_reset = parse_iso(st["limits"]["five"].get("until"))
     if res["reason"] == "5h-full" and session_reset and session_reset + timedelta(minutes=30) < reset:
         res["final"] = False
     emit(res)
@@ -997,14 +1136,23 @@ def start_task(repo, title, model, usage_json):
     if not is_git(repo):
         fail("not a git repository: " + repo)
     base = base_branch(repo)
-    stem = slugify(title, repo)
-    slug, n = stem, 2
-    while branch_exists(repo, "backlog/" + slug) or os.path.exists(worktree_dir(repo, slug)):
-        slug, n = "%s-%d" % (stem, n), n + 1
-    path, branch = worktree_dir(repo, slug), "backlog/" + slug
     ensure_worktrees_ignored(repo)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    r = git(repo, "worktree", "add", "-b", branch, path, base)
+    # A task a usage limit stopped goes on from its branch; anything else starts a fresh one.
+    resumed = paused_branch(t["fields"].get("result", ""))
+    if resumed and branch_exists(repo, resumed) and not os.path.exists(worktree_dir(repo, resumed[len("backlog/"):])):
+        slug, branch = resumed[len("backlog/"):], resumed
+        path = worktree_dir(repo, slug)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        r = git(repo, "worktree", "add", path, branch)
+    else:
+        resumed = None
+        stem = slugify(title, repo)
+        slug, n = stem, 2
+        while branch_exists(repo, "backlog/" + slug) or os.path.exists(worktree_dir(repo, slug)):
+            slug, n = "%s-%d" % (stem, n), n + 1
+        path, branch = worktree_dir(repo, slug), "backlog/" + slug
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        r = git(repo, "worktree", "add", "-b", branch, path, base)
     if r.returncode:
         fail("git worktree add failed: " + r.stderr.strip())
     u, _ = load_usage(usage_json)
@@ -1013,7 +1161,7 @@ def start_task(repo, title, model, usage_json):
                "tokens": tokens_of(t["fields"].get("tokens"), t["fields"].get("complexity")),
                "details": t["fields"].get("details", ""), "priority": int_or(t["fields"].get("priority"), 2),
                "complexity": t["fields"].get("complexity") or "medium",
-               "startedAt": iso(now()), "usageBefore": u}
+               "startedAt": iso(now()), "usageBefore": u, "resumed": bool(resumed)}
     st = status()
     st["current"] = current
     save_status(st)
@@ -1023,6 +1171,26 @@ def start_task(repo, title, model, usage_json):
 def cmd_worktree(a):
     cur = start_task(os.path.abspath(a.project), a.title, a.model, a.usage_json)
     emit({"ok": True, "path": cur["worktree"], "branch": cur["branch"], "base": cur["base"], "slug": cur["slug"]})
+
+
+def paused_branch(result):
+    """The branch a task a usage limit stopped goes on from (its result says so), else None."""
+    if not any(m in (result or "") for m in PAUSED_MARKERS):
+        return None
+    b = BRANCH_RE.search(result)
+    return b.group(1) if b and b.group(1).startswith("backlog/") else None
+
+
+def snapshot_worktree(path):
+    """Commits what a session left uncommitted when a usage limit stopped it, so the next attempt goes on
+    from it — removing the worktree would lose it. A local branch, never pushed: hooks are skipped."""
+    if not os.path.isdir(path) or not git(path, "status", "--porcelain").stdout.strip():
+        return False
+    git(path, "add", "-A")
+    who = [] if git(path, "config", "user.email").stdout.strip() else [
+        "-c", "user.name=Quota Harvest", "-c", "user.email=quota-harvest@localhost"]
+    return git(path, *(who + ["commit", "-q", "--no-verify", "-m",
+                              "WIP: stopped at a usage limit (quota harvest)"])).returncode == 0
 
 
 def remove_worktree(repo, path):
@@ -1039,6 +1207,8 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
     if cur.get("project") != repo or cur.get("title") != title:
         fail("finish-task does not match the task that was started", current=cur)
     branch, base = cur["branch"], cur["base"]
+    if outcome == "paused":
+        snapshot_worktree(cur["worktree"])
     commits = commits_ahead(repo, base, branch)
     summary = (summary or "").strip().replace("\n", " ")
     if outcome == "done" and commits == 0:
@@ -1047,7 +1217,14 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
     _, t = find_task(repo, title)
     previous = t["fields"].get("result", "")
     k = "%dk" % round((tokens or 0) / 1000.0)
-    if outcome == "done":
+    if outcome == "paused":
+        # Not a failure: the quota ran out, not the task. It goes back to the queue, on from its branch.
+        if commits:
+            updates = {"status": "open", "result": tr("paused", today(), summary, branch)}
+        else:
+            git(repo, "branch", "-D", branch)
+            updates = {"status": "open", "result": tr("paused_empty", today(), summary)}
+    elif outcome == "done":
         updates = {"status": "done", "result": "%s · %s · %s · %s" % (today(), branch, summary, k)}
     elif outcome == "blocked":
         question = (question or summary or tr("needs_decision")).replace("\n", " ")
@@ -1070,14 +1247,14 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
     append_calibration(repo, cur["slug"], cur.get("model") or "", cur.get("tokens") or "",
                        tokens or 0, cur.get("usageBefore"), after)
     record = {"project": repo, "projectName": display_name(repo), "title": title,
-              "outcome": updates["status"] if outcome != "done" else "done",
+              "outcome": outcome if outcome in ("done", "paused") else updates["status"],
               "branch": branch if outcome == "done" or (outcome == "blocked" and commits) else None,
               "summary": summary, "tokens": tokens or 0}
     append_history(dict(record, sessionId=session_id, tests=tests))
     st = status()
     st["doneThisRun"] = st.get("doneThisRun", []) + [record]
     if st.get("cycle"):
-        key = {"done": "done", "blocked": "blocked"}.get(record["outcome"], "failed")
+        key = {"done": "done", "blocked": "blocked", "paused": "paused"}.get(record["outcome"], "failed")
         st["cycle"].setdefault(key, []).append(record)
     st["current"] = None
     save_status(st)
@@ -1102,24 +1279,31 @@ def cmd_finish_scan(a):
     emit({"ok": True, "scans": st["scansThisRun"]})
 
 
-def cmd_end(a):
+def end_run(reason, final, emailed, report=None):
+    """Closes the run: its summary in status.lastRun, the state idle, the lock released."""
     st = status()
     done = st.get("doneThisRun", [])
     st["lastRun"] = {
         "startedAt": st.get("runStartedAt"), "finishedAt": iso(now()), "mode": st.get("mode"),
         "done": sum(1 for d in done if d["outcome"] == "done"),
         "blocked": sum(1 for d in done if d["outcome"] == "blocked"),
-        "failed": sum(1 for d in done if d["outcome"] not in ("done", "blocked")),
-        "scans": st.get("scansThisRun", 0), "stopReason": a.reason, "final": a.final == "yes",
-        # "skipped": the owner has no digest email set up — not a missing email.
-        "emailed": None if a.emailed == "skipped" else a.emailed == "yes", "report": a.report,
+        "paused": sum(1 for d in done if d["outcome"] == "paused"),
+        "failed": sum(1 for d in done if d["outcome"] not in ("done", "blocked", "paused")),
+        "scans": st.get("scansThisRun", 0), "stopReason": reason, "final": final,
+        "emailed": emailed, "report": report,
     }
     st.update({"state": "idle", "current": None})
     save_status(st)
     lk = read_lock()
     if lk and (not lk.get("pid") or lk.get("pid") == runner_pid() or not alive(lk.get("pid"))):
         os.remove(LOCK)
-    emit({"ok": True, "lastRun": st["lastRun"]})
+    return st["lastRun"]
+
+
+def cmd_end(a):
+    # "skipped": the owner has no digest email set up — not a missing email.
+    emit({"ok": True, "lastRun": end_run(a.reason, a.final == "yes",
+                                         None if a.emailed == "skipped" else a.emailed == "yes", a.report)})
 
 
 def relocate_missing():
@@ -1279,12 +1463,60 @@ def build_prompt(mode, only, test):
     return s
 
 
+HOLD_MAX_MIN = 60
+MAX_SWITCHES = 3
+
+
+def scan_limit(transcript, pos):
+    """A usage-limit error Claude Code wrote into the transcript after byte `pos` (a synthetic assistant
+    message, `isApiErrorMessage` with error "rate_limit") → (hit or None, the new position). Only the
+    transcript counts: the terminal also shows the session's own tool output, which may quote such text."""
+    try:
+        with open(transcript, "rb") as f:
+            f.seek(pos)
+            chunk = f.read()
+    except OSError:
+        return None, pos
+    whole = chunk.rfind(b"\n") + 1
+    hit = None
+    for line in chunk[:whole].splitlines():
+        if b'"isApiErrorMessage"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("isApiErrorMessage") is True and d.get("error") == "authentication_failed":
+            # Claude Code signed out ("Not logged in · Please run /login"): nothing can go on until the
+            # owner signs in again — stop, like a shared limit, but nothing to wait out.
+            hit = {"kind": "auth", "text": "authentication_failed", "at": d.get("timestamp") or iso(now())}
+        elif d.get("isApiErrorMessage") is True and d.get("error") in ("rate_limit", "consent_unanswered"):
+            content = (d.get("message") or {}).get("content")
+            text = content if isinstance(content, str) else " ".join(
+                x.get("text", "") for x in content or [] if isinstance(x, dict))
+            kind = classify_limit(text)
+            # Newer Claude Code asks, at a model's own limit, whether to go on with paid usage credits;
+            # unanswered (nobody is there), it writes "consent_unanswered" — still that model's limit.
+            model = re.search(r"\b(fable|opus|sonnet|haiku)\b", text.lower())
+            if d.get("error") == "consent_unanswered" and model:
+                kind = {"kind": "model", "model": model.group(1)}
+            hit = dict(kind, text=text[:200], at=d.get("timestamp") or iso(now()))
+    return hit, pos + whole
+
+
 def run_session(cwd, name, prompt, model, effort, remote_control, max_minutes, linger,
-                is_done=None, on_update=None, extra_env=None, session_id=None, unattended=True):
+                is_done=None, on_update=None, extra_env=None, session_id=None, unattended=True,
+                on_limit=None, hold=None):
     """Runs one interactive Claude Code session in a hidden terminal and returns its record. Interactive
     (not `-p`) so the Claude app lists it — under its project, by cwd — and Remote Control lets the app and
     the phone follow it live. It is closed with /exit `linger` seconds after is_done() turns true, after
-    IDLE_CLOSE_MIN without a transcript write, or at max_minutes; SIGTERM/SIGHUP are forwarded to it."""
+    IDLE_CLOSE_MIN without a transcript write, or at max_minutes; SIGTERM/SIGHUP are forwarded to it.
+
+    A usage limit the session runs into goes to on_limit(hit, model): a model name → the session is closed
+    and resumed on that model, its conversation intact (`switches`); None → it is closed, and `limitHit`
+    says which limit. hold() true postpones that close (the coordinator waits for the task it started).
+    Closing on a limit or on idleness goes by signal, never by keys: a limit can open a dialog whose
+    choices include paid usage credits."""
     import fcntl
     import pty
     import select
@@ -1299,11 +1531,6 @@ def run_session(cwd, name, prompt, model, effort, remote_control, max_minutes, l
         fail("claude not found")
     session_id = session_id or str(uuid.uuid4())
     started = now()
-    args = [claude, "--session-id", session_id, "--name", name, "--permission-mode", "auto",
-            "--model", model, "--effort", effort]
-    if remote_control:
-        args += ["--remote-control", name]
-    args.append(prompt)
     # A launch from inside another Claude session (a desktop chat) inherits its markers — among them
     # CLAUDE_CODE_CHILD_SESSION, which turns transcript saving off and hides the session from the Claude app.
     env = {k: v for k, v in os.environ.items()
@@ -1312,102 +1539,167 @@ def run_session(cwd, name, prompt, model, effort, remote_control, max_minutes, l
     if unattended:
         env["HARVEST_UNATTENDED"] = "1"
     env.update(extra_env or {})
-    pid, fd = pty.fork()
-    if pid == 0:
-        try:
-            os.chdir(cwd)
-            os.execve(claude, args, env)
-        finally:
-            os._exit(127)
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 160, 0, 0))
 
     info = {"sessionId": session_id, "name": name, "startedAt": iso(started), "launcherPid": os.getpid(),
-            "claudePid": pid, "workdir": cwd, "remoteControl": remote_control,
+            "claudePid": None, "workdir": cwd, "remoteControl": remote_control, "model": model,
             "transcript": transcript_path(session_id, cwd), "bridgeSessionId": None,
-            "endedAt": None, "exitStatus": None}
-    if on_update:
-        on_update(info)
-    registry = os.path.expanduser("~/.claude/sessions/%d.json" % pid)
-    registry_checked = activity_checked = 0.0
+            "endedAt": None, "exitStatus": None, "switches": []}
+    proc = {}
+
+    def spawn(text, resume):
+        args = [claude] + (["--resume", info["sessionId"]] if resume else ["--session-id", info["sessionId"]])
+        args += ["--name", name, "--permission-mode", "auto", "--model", info["model"], "--effort", effort]
+        if remote_control:
+            args += ["--remote-control", name]
+        args.append(text)
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.chdir(cwd)
+                os.execve(claude, args, env)
+            finally:
+                os._exit(127)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 160, 0, 0))
+        proc.update(pid=pid, fd=fd, at=time.time(), registry=os.path.expanduser("~/.claude/sessions/%d.json" % pid),
+                    trust="watch", moves=0, tail=b"")
+        info.update(claudePid=pid, bridgeSessionId=None)
+        if on_update:
+            on_update(info)
 
     def forward(signum, frame):
         try:
-            os.killpg(pid, signal.SIGTERM)
+            os.killpg(proc["pid"], signal.SIGTERM)
         except OSError:
             pass
-    old_term = signal.signal(signal.SIGTERM, forward)
-    old_hup = signal.signal(signal.SIGHUP, forward)
 
     log_path = os.path.join(HOME, "logs", "run-%s-%s.tty" % (datetime.now().strftime("%Y%m%d-%H%M%S"), session_id[:8]))
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     log = open(log_path, "wb")
-    written, tail = 0, b""
-    trust_state, trust_moves = "watch", 0
+    written = [0]
+
+    def pump(timeout):
+        """Reads the terminal for up to `timeout` seconds; False once it has closed."""
+        ready, _, _ = select.select([proc["fd"]], [], [], timeout)
+        if proc["fd"] not in ready:
+            return True
+        try:
+            data = os.read(proc["fd"], 65536)
+        except OSError:
+            data = b""
+        if not data:
+            return False
+        if written[0] < TTY_LOG_CAP:
+            log.write(data[:TTY_LOG_CAP - written[0]])
+            written[0] += len(data)
+        proc["tail"] = (proc["tail"] + data)[-6000:]
+        # A new folder (each task's worktree) opens on "trust this folder?" with "No, exit"
+        # preselected: move the pointer until it is on "Yes, I trust this folder", then confirm.
+        if proc["trust"] != "done" and time.time() - proc["at"] < 120:
+            choice = trust_choice(proc["tail"][-1500:])
+            if choice == "yes":
+                time.sleep(0.3)
+                os.write(proc["fd"], b"\r")
+                proc["trust"] = "done"
+            elif choice == "no" and proc["moves"] < 3:
+                time.sleep(0.5)
+                os.write(proc["fd"], b"\x1b[B")
+                proc["moves"] += 1
+                proc["tail"] = b""
+        return True
+
+    def close():
+        """Ends the running claude by signal — SIGKILL after 15 s — reading its terminal meanwhile so it can
+        exit; returns its exit status."""
+        forward(None, None)
+        give_up = time.time() + 15
+        while True:
+            done, code = os.waitpid(proc["pid"], os.WNOHANG)
+            if done == proc["pid"]:
+                break
+            if time.time() > give_up:
+                try:
+                    os.killpg(proc["pid"], signal.SIGKILL)
+                except OSError:
+                    pass
+                code = os.waitpid(proc["pid"], 0)[1]
+                break
+            if not pump(0.2):
+                time.sleep(0.2)
+        try:
+            os.close(proc["fd"])
+        except OSError:
+            pass
+        return code
+
+    spawn(prompt, False)
+    old_term = signal.signal(signal.SIGTERM, forward)
+    old_hup = signal.signal(signal.SIGHUP, forward)
+    registry_checked = activity_checked = limit_checked = 0.0
+    limit_pos, hit, held_since = 0, None, None
     ended_at = exit_sent_at = None
     deadline = time.time() + max_minutes * 60
     exit_code = None
     while True:
-        ready, _, _ = select.select([fd], [], [], 1.0)
-        if fd in ready:
-            try:
-                data = os.read(fd, 65536)
-            except OSError:
-                data = b""
-            if not data:
-                break
-            if written < TTY_LOG_CAP:
-                log.write(data[:TTY_LOG_CAP - written])
-                written += len(data)
-            tail = (tail + data)[-6000:]
-            # A new folder (each task's worktree) opens on "trust this folder?" with "No, exit"
-            # preselected: move the pointer until it is on "Yes, I trust this folder", then confirm.
-            if trust_state != "done" and time.time() - started.timestamp() < 120:
-                choice = trust_choice(tail[-1500:])
-                if choice == "yes":
-                    time.sleep(0.3)
-                    os.write(fd, b"\r")
-                    trust_state = "done"
-                elif choice == "no" and trust_moves < 3:
-                    time.sleep(0.5)
-                    os.write(fd, b"\x1b[B")
-                    trust_moves += 1
-                    tail = b""
-        done, code = os.waitpid(pid, os.WNOHANG)
-        if done == pid:
+        open_ = pump(1.0)
+        done, code = os.waitpid(proc["pid"], os.WNOHANG)
+        if done == proc["pid"]:
             exit_code = code
             break
-        if remote_control and not info["bridgeSessionId"] and time.time() - registry_checked > 2:
+        if not open_:
+            exit_code = close()
+            break
+        if not info["bridgeSessionId"] and time.time() - registry_checked > 2:
             registry_checked = time.time()
-            bridge = (read_json(registry, {}) or {}).get("bridgeSessionId")
-            if bridge:
-                info["bridgeSessionId"] = bridge
+            reg = read_json(proc["registry"], {}) or {}
+            # A resumed session normally keeps its id; should Claude Code start a copy, follow the copy.
+            if reg.get("sessionId") and reg["sessionId"] != info["sessionId"]:
+                info.update(sessionId=reg["sessionId"], transcript=transcript_path(reg["sessionId"], cwd))
+                limit_pos = 0
+            if remote_control and reg.get("bridgeSessionId"):
+                info["bridgeSessionId"] = reg["bridgeSessionId"]
                 if on_update:
                     on_update(info)
-        if is_done and exit_sent_at is None and is_done(started):
+        finished = bool(is_done and is_done(started))
+        if finished and exit_sent_at is None:
             ended_at = ended_at or time.time()
             if time.time() - ended_at >= linger:
-                os.write(fd, b"/exit\r")
+                os.write(proc["fd"], b"/exit\r")
                 exit_sent_at = time.time()
+        if on_limit and not finished and exit_sent_at is None and time.time() - limit_checked > 5:
+            limit_checked = time.time()
+            if hit is None:
+                hit, limit_pos = scan_limit(info["transcript"], limit_pos)
+            if hit:
+                held_since = held_since or time.time()
+                if hold and time.time() - held_since < HOLD_MAX_MIN * 60 and hold():
+                    continue
+                nxt = on_limit(hit, info["model"])
+                code = close()
+                if nxt and nxt != info["model"] and len(info["switches"]) < MAX_SWITCHES:
+                    info["switches"].append({"from": info["model"], "to": nxt, "at": iso(now()), "limit": hit.get("text")})
+                    previous, info["model"] = info["model"], nxt
+                    hit = held_since = None
+                    spawn(fill_template("continue-prompt.md", {"from model": previous.capitalize(),
+                                                              "to model": nxt.capitalize()}), True)
+                    continue
+                info["limitHit"] = hit
+                exit_code = code
+                break
         # Safety net: a session nobody and nothing has written to for a long time (the owner stopped it
         # from the Claude app and left, or it's stuck on a question) is closed, so it can't hold the
         # lock for hours; `maintain` then returns its task to the queue.
         if is_done and exit_sent_at is None and time.time() - activity_checked > 30:
             activity_checked = time.time()
-            last = session_activity(info["transcript"]) or started.timestamp()
-            if time.time() - last > IDLE_CLOSE_MIN * 60:
-                os.write(fd, b"/exit\r")
-                exit_sent_at = time.time()
+            last = max(session_activity(info["transcript"]), proc["at"])
+            if time.time() - last > IDLE_CLOSE_MIN * 60 and not (hold and hold()):
                 info["closedIdle"] = True
+                exit_code = close()
+                break
         if exit_sent_at and time.time() - exit_sent_at > 30:
             forward(None, None)
         if time.time() > deadline:
             forward(None, None)
             deadline = time.time() + 30
-    if exit_code is None:
-        try:
-            exit_code = os.waitpid(pid, 0)[1]
-        except ChildProcessError:
-            exit_code = 0
     log.close()
     signal.signal(signal.SIGTERM, old_term)
     signal.signal(signal.SIGHUP, old_hup)
@@ -1600,8 +1892,23 @@ def cmd_launch(a):
     def record(info):
         write_json(LAUNCH, dict(info, mode=a.mode))
 
+    def task_running():
+        """A task session the coordinator started is still at work (or being recorded): closing the coordinator
+        now would take it down too, so a limit waits for it — the task stops at the same limit by itself."""
+        cur = status().get("current") or {}
+        return bool(cur) and (alive(cur.get("claudePid")) or alive(cur.get("launcherPid")))
+
     info = run_session(a.workdir, name, prompt, a.model, a.effort, a.remote_control, a.max_minutes, a.linger,
-                       is_done=run_ended if a.auto_exit else None, on_update=record)
+                       is_done=run_ended if a.auto_exit else None, on_update=record,
+                       on_limit=limit_fallback, hold=task_running)
+    hit = info.get("limitHit")
+    if hit and status().get("state") == "running":
+        # The coordinator itself ran out: the run ends here, saying why, so the widget's next pulse follows
+        # once the 5-hour window resets (a stalled run would read as "interrupted" and end the chain).
+        s = settings()
+        weekly = hit["kind"] == "weekly"
+        reason = "signed-out" if hit["kind"] == "auth" else "weekly-full" if weekly else "5h-full"
+        info["lastRun"] = end_run(reason, weekly, False if s["emailDigest"] and s["email"] else None)
     emit(dict(info, mode=a.mode, ok=True))
 
 
@@ -1638,17 +1945,118 @@ def transcript_tokens(transcript):
 LANGUAGE_NAMES = {"he": "Hebrew", "en": "English"}
 
 
+# The texts the owner may rewrite (Settings → Texts). The defaults stay where the installer put them; a
+# customized text lives in PROMPTS_DIR (one writer: `prompts --set`, the owner only) and wins. `fills` are
+# the placeholders the engine fills in — a customized text must keep them — and `keeps` the lines the
+# harvest depends on (without the task-report step, no task could ever finish).
+PROMPTS_DIR = os.path.join(HOME, "prompts")
+PROMPTS = {
+    "task": {"file": "task-agent-prompt.md", "keeps": ["claude-harvest task-report"],
+             "fills": ["project path", "worktree path", "branch", "base", "title", "priority", "complexity",
+                       "tokens", "details"]},
+    "scan": {"file": "scan-agent-prompt.md", "fills": ["project path"], "keeps": ["claude-harvest task-report"]},
+    "talk": {"file": "talk-prompt.md", "fills": [], "keeps": []},
+    "onboard": {"file": "onboard-prompt.md", "fills": [], "keeps": []},
+    # Read by the coordinator itself (the skill says so), whole.
+    "digest": {"file": "digest-email.md", "fills": [], "keeps": [], "whole": True},
+    "continue": {"file": "continue-prompt.md", "fills": ["from model", "to model"], "keeps": [],
+                 "builtin": "[Quota harvest] The <from model> quota ran out in the middle of your work, so this session"
+                            " goes on with <to model>. Continue exactly where you stopped (if you were changing files,"
+                            " look at `git status` first) and finish as you were originally instructed."},
+}
+
+
+def default_prompt(key):
+    p = PROMPTS[key]
+    if "builtin" in p:
+        return p["builtin"]
+    with open(os.path.join(SKILL_REFS, p["file"]), encoding="utf-8") as f:
+        text = f.read()
+    if p.get("whole"):
+        return text
+    return text.split("```", 2)[1].strip("\n") if text.count("```") >= 2 else text
+
+
+def custom_prompt_path(key):
+    return os.path.join(PROMPTS_DIR, PROMPTS[key]["file"])
+
+
+def prompt_text(key):
+    """The text in force: the owner's version when there is one, else the default."""
+    try:
+        with open(custom_prompt_path(key), encoding="utf-8") as f:
+            text = f.read()
+        if text.strip():
+            return text
+    except OSError:
+        pass
+    return default_prompt(key)
+
+
+def prompt_problems(key, text):
+    p = PROMPTS[key]
+    return (["<%s>" % k for k in p["fills"] if "<%s>" % k not in text]
+            + [k for k in p["keeps"] if k not in text])
+
+
 def fill_template(name, values):
-    """The prompt between the ``` fences of a skill reference file, with its <placeholders> filled —
-    <owner language> always, from the settings."""
+    """A harvest prompt (the text between the ``` fences of a skill reference file, or the owner's version
+    of it), with its <placeholders> filled — <owner language> always, from the settings."""
     s = settings()
     values = dict({"owner language": LANGUAGE_NAMES[s["language"]], "owner name": s["ownerName"] or "the owner"}, **values)
-    with open(os.path.join(SKILL_REFS, name), encoding="utf-8") as f:
-        text = f.read()
-    body = text.split("```", 2)[1].strip("\n") if text.count("```") >= 2 else text
-    for key, value in values.items():
-        body = body.replace("<%s>" % key, str(value))
+    key = next((k for k, p in PROMPTS.items() if p["file"] == name), None)
+    if key:
+        body = prompt_text(key)
+    else:
+        with open(os.path.join(SKILL_REFS, name), encoding="utf-8") as f:
+            text = f.read()
+        body = text.split("```", 2)[1].strip("\n") if text.count("```") >= 2 else text
+    for k, value in values.items():
+        body = body.replace("<%s>" % k, str(value))
     return body
+
+
+def cmd_prompts(a):
+    """The texts the owner may rewrite: each one's default, the text in force and what it must keep.
+    --set <name> --file <path>: save the owner's version (refused when it drops a placeholder the engine
+    fills or a line the harvest needs). --reset <name>: back to the default. Only the owner: never from an
+    unattended run — an agent must not rewrite its own instructions."""
+    if a.set or a.reset:
+        if os.environ.get("HARVEST_UNATTENDED"):
+            fail("unattended runs cannot change the harvest's texts")
+        key = a.set or a.reset
+        if key not in PROMPTS:
+            fail("unknown text; one of " + ", ".join(PROMPTS))
+        if a.reset:
+            try:
+                os.remove(custom_prompt_path(key))
+            except OSError:
+                pass
+        else:
+            if not a.file:
+                fail("--set needs --file <path>")
+            with open(a.file, encoding="utf-8") as f:
+                text = f.read()
+            missing = prompt_problems(key, text)
+            if missing:
+                fail("the text must keep: " + ", ".join(missing), missing=missing)
+            if text.strip() == default_prompt(key).strip():
+                try:
+                    os.remove(custom_prompt_path(key))
+                except OSError:
+                    pass
+            else:
+                write_text(custom_prompt_path(key), text)
+    out = []
+    for key, p in PROMPTS.items():
+        try:
+            default = default_prompt(key)
+        except OSError:
+            continue
+        out.append({"name": key, "file": p["file"], "default": default, "text": prompt_text(key),
+                    "custom": os.path.exists(custom_prompt_path(key)),
+                    "keeps": ["<%s>" % k for k in p["fills"]] + p["keeps"]})
+    emit({"ok": True, "prompts": out, "folder": PROMPTS_DIR})
 
 
 def update_current(extra):
@@ -1672,23 +2080,35 @@ def cmd_run_task(a):
         "project path": repo, "worktree path": cur["worktree"], "branch": cur["branch"], "base": cur["base"],
         "title": a.title, "priority": cur["priority"], "complexity": cur["complexity"],
         "tokens": cur["tokens"], "details": cur["details"]})
+    if cur.get("resumed"):
+        prompt += ("\n\nAn earlier attempt at this task stopped at a usage limit. Its work is already on this branch"
+                   " (`git log %s..HEAD`; the last commit may be a WIP snapshot the harvest made of uncommitted"
+                   " changes). Go on from there instead of starting over." % cur["base"])
     effort = "high" if cur["complexity"] == "high" else "medium"
 
     def track(info):
         update_current({"sessionId": info["sessionId"], "sessionName": info["name"],
-                        "bridgeSessionId": info["bridgeSessionId"], "claudePid": info["claudePid"]})
+                        "bridgeSessionId": info["bridgeSessionId"], "claudePid": info["claudePid"],
+                        "launcherPid": info["launcherPid"],
+                        "model": "→".join([info["switches"][0]["from"]] + [x["to"] for x in info["switches"]])
+                        if info["switches"] else info["model"]})
 
     info = run_session(cur["worktree"], tr("task_name", a.title), prompt, a.model, effort, True, a.max_minutes, 10,
                        is_done=lambda started: os.path.exists(result_path), on_update=track,
-                       extra_env={"HARVEST_TASK_RESULT": result_path}, session_id=session_id)
-    res = read_json(result_path, None) or {"status": "failed", "summary": tr("no_report")}
+                       extra_env={"HARVEST_TASK_RESULT": result_path}, session_id=session_id,
+                       on_limit=limit_fallback)
+    res = read_json(result_path, None)
+    if not res and info.get("limitHit"):
+        res = {"status": "paused", "summary": limit_label(info["limitHit"])}
+    res = res or {"status": "failed", "summary": tr("no_report")}
     stats = session_stats(info["transcript"])
     record_session(repo, cur["complexity"], stats)
     tokens = stats["total"]
     out = finish_task(repo, a.title, res.get("status", "failed"), res.get("summary"), res.get("question"),
-                      tokens, a.usage_json, session_id, tests=res.get("tests"))
-    emit(dict(out, sessionId=session_id, sessionName=info["name"], tokens=tokens, tests=res.get("tests"),
-              question=res.get("question"), closedIdle=info.get("closedIdle", False)))
+                      tokens, a.usage_json, info["sessionId"], tests=res.get("tests"))
+    emit(dict(out, sessionId=info["sessionId"], sessionName=info["name"], tokens=tokens, tests=res.get("tests"),
+              question=res.get("question"), closedIdle=info.get("closedIdle", False),
+              switches=info["switches"], limitHit=info.get("limitHit")))
 
 
 def cmd_run_scan(a):
@@ -1710,7 +2130,8 @@ def cmd_run_scan(a):
     prompt = fill_template("scan-agent-prompt.md", {"project path": repo})
     info = run_session(path, tr("scan_name"), prompt, "sonnet", "medium", True, a.max_minutes, 10,
                        is_done=lambda started: os.path.exists(result_path),
-                       extra_env={"HARVEST_TASK_RESULT": result_path}, session_id=session_id)
+                       extra_env={"HARVEST_TASK_RESULT": result_path}, session_id=session_id,
+                       on_limit=limit_fallback)
     remove_worktree(repo, path)
     stats = session_stats(info["transcript"])
     record_session(repo, "scan", stats)
@@ -1816,6 +2237,11 @@ def main():
     p.add_argument("--set", action="append", metavar="KEY=VALUE")
     p.set_defaults(fn=cmd_settings)
 
+    p = sub.add_parser("prompts")
+    p.add_argument("--set", metavar="NAME"); p.add_argument("--file")
+    p.add_argument("--reset", metavar="NAME")
+    p.set_defaults(fn=cmd_prompts)
+
     p = sub.add_parser("set-status")
     p.add_argument("project"); p.add_argument("title"); p.add_argument("status")
     p.add_argument("--result")
@@ -1869,7 +2295,7 @@ def main():
 
     p = sub.add_parser("finish-task")
     p.add_argument("project"); p.add_argument("title")
-    p.add_argument("--outcome", choices=("done", "blocked", "failed"), required=True)
+    p.add_argument("--outcome", choices=("done", "blocked", "failed", "paused"), required=True)
     p.add_argument("--summary", default=""); p.add_argument("--question")
     p.add_argument("--tokens", type=int, default=0); p.add_argument("--usage-json")
     p.set_defaults(fn=cmd_finish_task)

@@ -85,7 +85,9 @@ BACKLOG.md itself. Files under `~/.claude/harvest/`, one writer each:
 - `usage.json` — written by the widget after every successful poll (the engine
   budgets from it; older than 15 min = unreadable). An inactive 5-hour window is
   written as null and read as 0 %.
-- `config.json` — written by the widget: `auto` (bool), `leadHours` (1–24).
+- `config.json` — written by the widget: `auto` (bool), `pulses` (0 = automatic, 1–6) and `leadHours`
+  (pulses × 5 + 1, automatic counting as 6 — the engine refuses an auto run started earlier than that).
+  A file from before pulses (`leadHours` only) reads as ⌈leadHours / 5⌉ pulses.
 - `status.json`, `calibration.md`, `history.jsonl`, `launch.json`, `.lock`,
   `worktrees/`, BACKLOG.md edits — written by the engine only. `logs/run-*.jsonl` — each run's stream-json
   output, newest 20 kept.
@@ -151,9 +153,11 @@ and the trigger share one plan (`autoHarvestPlan`): the window's start (weekly
 reset − `leadHours`), a follow-up after the 5-hour reset while the last run
 stopped on a full window, or next week's window. Then "הרץ עכשיו" (the queue's share in its tooltip) when the
 queue isn't empty, and the last run's summary, which opens that run's
-conversation in the Claude app. Expanded: the auto switch, a
-1–24 h slider ("יוצא לדרך N ש׳ לפני האיפוס") and what it buys: ⌈N/5⌉ five-hour
-windows, capacity = min(weekly room − 2, windows × weekly points per window).
+conversation in the Claude app. Expanded: the auto switch, the pulses
+("2 פעימות לפני האיפוס" / "אוטומטי · 3 פעימות…", `PulsesPicker`: a segmented אוטומטי · 1–6, shared with
+Settings) and what they buy: N five-hour windows, capacity = min(weekly room − weeklyReserve, N × weekly
+points per window), a window being worth (100 − fiveReserve) × ratio.five / ratio.weekly weekly points.
+Automatic = ⌈min(weekly room, queued %) / points per window⌉, 1–6.
 Running: pulsing dot, the current task, Stop, an indeterminate bar. A run started
 elsewhere (a live lock this widget didn't take) shows as "קציר רץ מסשן אחר"
 without Stop.
@@ -206,24 +210,70 @@ widget restart is still shown as ours, watchable and stoppable. On exit:
 notification when the panel is hidden (and always when an automatic cycle ended
 without its digest email).
 
-Automatic runs (checked every 30 s): when `auto` is on, usage is under 15 min
-old, and the weekly reset is between 20 min and `leadHours` away — once per
-weekly cycle (cycle id = reset time rounded to the hour, since the API's reset
-time jitters across the hour mark), and again after each 5-hour reset while the
-last run stopped with `5h-full` and the queue isn't empty (at most 4 runs per
-cycle).
+Automatic runs (checked every 30 s) come in **pulses**, one 5-hour window each: when `auto` is on, usage
+is under 15 min old, and the weekly reset is between 20 min and pulses × 5 h + 30 min away — once per weekly
+cycle (cycle id = reset time rounded to the hour, since the API's reset time jitters across the hour mark;
+the number of pulses is fixed then, `HarvestCyclePulses`), and again after each 5-hour reset while the last
+run stopped with `5h-full` and the queue isn't empty (at most that many runs per cycle). The next pulse waits
+for `HarvestLastSessionReset` (the 5-hour reset known when the run ended) and for `status.limits.five.until`
+(a 5-hour limit a session ran into), whichever is later.
+
+Usage limits mid-run (engine, `run_session`): Claude Code writes a limit it hits into the session's transcript
+(a synthetic assistant message, `isApiErrorMessage`, `error: "rate_limit"`: "You've hit your session limit…",
+"…weekly limit…", "You've reached your Fable limit…"); the launcher reads it there — never from the terminal,
+which also shows the session's own tool output. The limit is recorded in `status.limits` (`five`, `weekly`,
+`model:<name>`, each with `until` from usage.json's reset times) and `plan` / the model choice keep to it until
+then. A model's own limit, with `switchMidTask`, closes the session (by signal: the limit can open a dialog
+whose choices include paid usage credits, so no keys are ever sent) and resumes it — `claude --resume <id>
+--model <fallback>` with the "continue" text — in the same worktree, conversation intact (at most 3
+switches). The shared 5-hour or weekly limit closes it at once: `run-task` records the outcome `paused` —
+uncommitted work committed as "WIP: stopped at a usage limit (quota harvest)", the `backlog/<slug>` branch
+kept, the task back to open with "· paused at … · continues from <branch>" (no strike), and its next attempt
+reuses the branch. The coordinator's own limit waits for a running task to stop, then ends the run with
+`5h-full` / `weekly-full`, so the next pulse follows. The 45-minute idle close is a signal too.
+
+### Signed out
+
+Without a signed-in Claude Code nothing works — no fresh figures, no harvest — so this one problem is spelled
+out (`SignInProblem`: not installed / signed out / expired). Two sources: the widget's own poll (no stored login
+→ signed out; 401/403 after a renewal → expired) and `claude auth status --json` (the harvest runs the command
+line, which can be signed out on its own), checked at launch, every 30 min, after "Check again", and every 30 s
+for 15 min after "Sign in". While it's set: a red card under the usage rows ("Claude Code לא מחובר", what it
+stops, when the figures shown were last updated, **התחבר** / **בדוק שוב**); the menu bar image gets a red "!"
+after the gauges and its tooltip says why; one notification (category `signin`, at most twice a day — a click
+starts signing in); the automatic harvest doesn't start (footer: "לא יתחיל — Claude Code לא מחובר") and "Run
+now" explains instead of launching. **התחבר** writes `quota-harvest-sign-in.command` to the temporary folder
+(`claude auth login`, then `claude auth status --text`) and opens it in Terminal; with Claude Code missing it
+opens claude.com/claude-code. Back signed in, the card clears and a poll goes out at once. At launch the panel
+and gauges show usage.json's figures (their time in the card and the dot's tooltip) until a poll comes back —
+a restart never blanks them; those figures never count as fresh for the harvest. A session that finds itself
+signed out mid-run (`authentication_failed` in its transcript) is closed at once: a task is `paused` ("· paused
+at a sign-out"), the coordinator ends the run as `signed-out`. `--snapshot … --signed-out` renders the card; `--snapshot-menubar` draws the "!" in its third row.
 
 ### Settings
 
-⋯ → "הגדרות…" opens one ordinary, resizable window (`SettingsView`, reused, filled from the
+⋯ → "הגדרות…" opens one window with five tabs (`SettingsView`, reused, filled from the
 latest listing): **General** — language (he/en: `setLanguage`, stored in the harvest settings
 when installed, else in the widget's `UILanguage` default; the panel, menus and help follow
 at once), start at login, menu bar mode (these two moved here from the ⋯ menu). **Harvest**
-(installed) — automatic runs and hours before the reset (`config.json`), a model per task
-size (`settings --set models=…` on change), name, folder, email + weekly digest (saved with
-"Save"). **Projects** — a "Proposals" switch per registered project (`proposals … on|off`,
-off confirmed as above). Help, and "Remove the harvest…" (the setup window). Not
-installed: "Set up the harvest…". `--snapshot-settings <png> [--he|--en]` renders it.
+(installed) — automatic runs, pulses (`PulsesPicker`, `config.json`), the next harvest and the capacity, and
+"kept free for you": the 5-hour reserve (0–60, step 5) and the weekly one (0–30), `settings --set
+fiveReserve=… / weeklyReserve=…` on each step. **Models** — a model per task size (`settings --set models=…`),
+and for the model with its own weekly quota (`scopedLabel`, Fable): the percent it gives way at (50–100, step
+5), the model it gives way to or "None — the tasks wait for the reset" (`fallback`), and "Mid-task too"
+(`switchMidTask`). **Projects** — a "Proposals" switch per registered project (`proposals … on|off`, off
+confirmed as above). **Texts** — the harvest's texts (`harvest.py prompts`): a sidebar list (task, proposal
+scan, what waits for you, getting started, weekly summary email, going on with another model; a blue dot =
+customized, orange = unsaved), an editor (monospaced, left to right), what must stay in the text (the
+placeholders the engine fills, the task-report step), Save (`prompts --set <name> --file <tmp>`; a refusal
+shows what is missing), Discard changes, Restore the default (`prompts --reset`). The owner's versions live in
+`~/.claude/harvest/prompts/`, the installed defaults stay untouched; unattended runs can't change them.
+General also holds name, email + weekly digest and folder (saved with "Save"), Help and "Remove the
+harvest…" (the setup window). Not installed: only General, with "Set up the harvest…". The tabs are a
+toolbar-like row of symbols in SwiftUI (so they follow the app's language and direction), each over a
+`.formStyle(.grouped)` form; the window is titled after the tab and takes on its height
+(`NSHostingController`, `.preferredContentSize`). `--snapshot-settings <png> [--tab
+general|harvest|models|projects|texts] [--he|--en] [--light]` renders one tab.
 
 ### Setup
 

@@ -37,7 +37,7 @@ Nothing personal goes into `harvest/`. Who the owner is — name, language, emai
 - One place for each sensitive job: `callSecurityTool` is the only code that runs `/usr/bin/security`; `authorizedGET` is the only code that sets the Bearer header; `warningColor` holds the 70 / 90 % thresholds; `makeContextMenu` builds the right-click menu.
 - Decode the API defensively (`JSONSerialization`, optional casts): its shape has changed before. Prefer the `limits` array; keep the older fallbacks.
 - Polling is gentle on purpose — the usage endpoint answers 429 when asked too often. One request at a time, the next one scheduled after each attempt, `Retry-After` and backoff honored (`PollPacing`, driven by `refresh()`), never more often than every 5 minutes (`basePoll`). No repeating timer, no quick retries.
-- Problems never appear as text in the panel. The last numbers stay; only the live dot's color and tooltip change (`setStatus`): yellow — it will retry by itself; red — the user must act.
+- Problems never appear as text in the panel. The last numbers stay; only the live dot's color and tooltip change (`setStatus`): yellow — it will retry by itself; red — the user must act. The one exception is Claude Code missing or signed out (`SignInProblem`): nothing works until it's fixed, so the panel says so in a card with **Sign in** / **Check again**, the menu bar icon gets a red "!", and one notification goes out (the owner's call, 2026-10-07).
 
 ## Two languages
 

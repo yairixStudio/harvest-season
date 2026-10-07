@@ -574,6 +574,171 @@ class Harvest(unittest.TestCase):
         plan = self.run_engine("plan", "--mode", "auto", "--usage-json", json.dumps(raw))
         self.assertTrue(plan["harvest"])
 
+    def set_scoped(self, pct):
+        path = os.path.join(self.home, "usage.json")
+        with open(path) as f:
+            u = json.load(f)
+        u["scoped"]["pct"] = pct
+        with open(path, "w") as f:
+            json.dump(u, f)
+
+    def test_limit_messages_are_classified_from_the_transcript_only(self):
+        os.environ["HARVEST_HOME"] = self.home
+        try:
+            h = self.load_engine()
+            # The texts Claude Code writes, as found in real transcripts.
+            self.assertEqual(h.classify_limit("You've hit your session limit · resets 4pm (Asia/Jerusalem)"), {"kind": "five"})
+            self.assertEqual(h.classify_limit("You've hit your weekly limit · resets 4am (Asia/Jerusalem)"), {"kind": "weekly"})
+            self.assertEqual(h.classify_limit("You've reached your Fable limit. Switch to another model, or manage usage"
+                                              " credits at claude.ai/settings/usage, to continue."),
+                             {"kind": "model", "model": "fable"})
+            self.assertEqual(h.classify_limit("You've hit your Opus limit · resets Oct 12"), {"kind": "model", "model": "opus"})
+            self.assertEqual(h.classify_limit("Something new and unknown"), {"kind": "five"})
+            t = os.path.join(self.tmp, "t.jsonl")
+            with open(t, "w") as f:
+                # The session's own words (a tool result or a reply quoting such text) never count.
+                f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "the Fable limit test"}]}}) + "\n")
+                f.write(json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "server_error",
+                                    "message": {"content": [{"type": "text", "text": "API Error: 529 Overloaded"}]}}) + "\n")
+            hit, pos = h.scan_limit(t, 0)
+            self.assertIsNone(hit)
+            with open(t, "a") as f:
+                f.write(json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
+                                    "timestamp": "2026-10-07T10:00:00.000Z",
+                                    "message": {"model": "<synthetic>", "content": [{"type": "text",
+                                                "text": "You've reached your Fable limit. Switch to another model."}]}}) + "\n")
+                f.write('{"type": "assistant", "isApiErrorMessage": tr')  # a line still being written
+            hit, pos2 = h.scan_limit(t, pos)
+            self.assertEqual((hit["kind"], hit["model"]), ("model", "fable"))
+            self.assertLess(pos2, os.path.getsize(t), "a half-written line waits for the next read")
+            self.assertEqual(h.scan_limit(t, pos2), (None, pos2))
+            # Newer Claude Code: the "go on with usage credits?" question at Fable's limit, unanswered.
+            with open(t, "a") as f:
+                f.write("\n" + json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "consent_unanswered",
+                                           "message": {"content": [{"type": "text", "text": "Fable now uses usage credits"
+                                                                    " \u00b7 the prompt to confirm went unanswered"}]}}) + "\n")
+            hit, _ = h.scan_limit(t, pos2)
+            self.assertEqual((hit["kind"], hit["model"]), ("model", "fable"))
+            # Signed out mid-run: stop, nothing to switch to, nothing recorded to wait out.
+            u = os.path.join(self.tmp, "u.jsonl")
+            with open(u, "w") as f:
+                f.write(json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "authentication_failed",
+                                    "message": {"content": [{"type": "text", "text": "Not logged in · Please run /login"}]}}) + "\n")
+            hit, _ = h.scan_limit(u, 0)
+            self.assertEqual(hit["kind"], "auth")
+            self.assertIsNone(h.limit_fallback(hit, "opus"))
+            self.assertNotIn("auth", (h.status().get("limits") or {}))
+            self.assertIn(h.limit_label(hit), ("a sign-out", "ניתוק מהחשבון"))
+        finally:
+            os.environ.pop("HARVEST_HOME")
+
+    def test_fallback_points_follow_the_settings(self):
+        self.add("Hard one", complexity="high", tokens=60000)
+        self.usage(five=0, weekly=10)  # a "high" task's default estimate needs a fresh 5-hour window
+        self.set_scoped(84)
+        self.assertEqual(self.run_engine("plan")["next"]["model"], "fable")
+        self.set_scoped(85)
+        self.assertEqual(self.run_engine("plan")["next"]["model"], "opus", "85 % reached → the fallback")
+        self.run_engine("settings", "--set", 'fallback={"fable": {"to": "sonnet", "atPct": 95}}')
+        self.assertEqual(self.run_engine("plan")["next"]["model"], "fable")
+        self.set_scoped(96)
+        self.assertEqual(self.run_engine("plan")["next"]["model"], "sonnet")
+        # No fallback: the task waits for Fable's quota instead of running on another model.
+        self.run_engine("settings", "--set", 'fallback={"fable": {"to": "", "atPct": 95}}')
+        plan = self.run_engine("plan")
+        self.assertFalse(plan["harvest"])
+        self.assertEqual((plan["reason"], plan["deferred"][0]["why"]), ("model-full", "model-full"))
+        for bad in ('fallback={"fable": {"to": "opus", "atPct": 0}}', "fallback=[1]", "fiveReserve=70", "weeklyReserve=x"):
+            self.run_engine("settings", "--set", bad, code=2)
+        self.run_engine("settings", "--set", "switchMidTask=no", "--set", "fiveReserve=30")
+        s = self.run_engine("settings")
+        self.assertEqual((s["switchMidTask"], s["fiveReserve"], s["weeklyReserve"]), (False, 30, 2))
+
+    def test_reserves_come_from_the_settings(self):
+        self.add("Some task")
+        self.usage(five=20, weekly=60)
+        plan = self.run_engine("plan")
+        self.assertEqual((plan["fiveRoom"], plan["weeklyRoom"]), (65, 38))
+        self.run_engine("settings", "--set", "fiveReserve=40", "--set", "weeklyReserve=10")
+        plan = self.run_engine("plan")
+        self.assertEqual((plan["fiveRoom"], plan["weeklyRoom"]), (40, 30))
+
+    def test_a_recorded_limit_holds_until_it_resets(self):
+        self.add("Hard one", complexity="high", tokens=60000)
+        self.usage(five=0, weekly=10)
+        os.environ["HARVEST_HOME"] = self.home
+        try:
+            h = self.load_engine()
+            # Fable ran out mid-task: the session goes on with Opus, and Fable stays off until its reset,
+            # even while a minutes-old usage.json still shows it low.
+            self.assertEqual(h.limit_fallback({"kind": "model", "model": "fable", "text": "x"}, "fable"), "opus")
+            self.assertEqual(self.run_engine("plan")["next"]["model"], "opus")
+            # The shared 5-hour window: nothing to switch to; plan counts it full until it resets.
+            self.assertIsNone(h.limit_fallback({"kind": "five", "text": "x"}, "opus"))
+            plan = self.run_engine("plan", "--mode", "auto")
+            self.assertEqual(plan["reason"], "5h-full")
+            self.assertFalse(plan["final"], "the next pulse follows after the 5-hour reset")
+            st = self.run_engine("list")["status"]
+            self.assertIn("model:fable", st["limits"])
+            self.run_engine("settings", "--set", "switchMidTask=no")
+            self.assertIsNone(h.limit_fallback({"kind": "model", "model": "fable", "text": "x"}, "fable"))
+        finally:
+            os.environ.pop("HARVEST_HOME")
+
+    def test_a_task_stopped_by_a_limit_is_paused_not_failed(self):
+        self.add("Long work")
+        self.usage()
+        self.run_engine("begin")
+        wt = self.run_engine("worktree", self.repo, "Long work")
+        self.commit_in(wt["path"])
+        with open(os.path.join(wt["path"], "half.txt"), "w") as f:
+            f.write("not committed yet\n")
+        out = self.run_engine("finish-task", self.repo, "Long work", "--outcome", "paused", "--summary", "the 5-hour limit")
+        self.assertEqual((out["outcome"], out["backlog"]["status"]), ("paused", "open"))
+        self.assertIn("backlog/long-work", out["backlog"]["result"])
+        self.assertFalse(os.path.exists(wt["path"]))
+        log = subprocess.run(["git", "-C", self.repo, "log", "--format=%s", "main..backlog/long-work"],
+                             capture_output=True, text=True).stdout.split("\n")
+        self.assertEqual(log[0], "WIP: stopped at a usage limit (quota harvest)", "uncommitted work is kept")
+        # The next attempt goes on from the same branch, with everything on it.
+        again = self.run_engine("worktree", self.repo, "Long work")
+        self.assertEqual(again["branch"], "backlog/long-work")
+        self.assertTrue(os.path.exists(os.path.join(again["path"], "half.txt")))
+        # A pause is no strike: the first real failure after it returns the task to the queue.
+        out = self.run_engine("finish-task", self.repo, "Long work", "--outcome", "failed", "--summary", "x")
+        self.assertEqual(out["backlog"]["status"], "open")
+        end = self.run_engine("end", "--reason", "queue-empty")
+        self.assertEqual((end["lastRun"]["paused"], end["lastRun"]["failed"]), (1, 1))
+
+    def test_the_owner_can_rewrite_the_texts(self):
+        listing = {p["name"]: p for p in self.run_engine("prompts")["prompts"]}
+        self.assertEqual(set(listing), {"task", "scan", "talk", "onboard", "digest", "continue"})
+        self.assertFalse(listing["task"]["custom"])
+        self.assertIn("<worktree path>", listing["task"]["keeps"])
+        path = os.path.join(self.tmp, "t.txt")
+        # Dropping a placeholder the engine fills, or the task-report step, is refused.
+        with open(path, "w") as f:
+            f.write(listing["task"]["default"].replace("<worktree path>", "the folder"))
+        self.assertEqual(self.run_engine("prompts", "--set", "task", "--file", path, code=2)["missing"], ["<worktree path>"])
+        with open(path, "w") as f:
+            f.write("Be brief. " + listing["task"]["default"])
+        env = dict(self.env, HARVEST_UNATTENDED="1")
+        self.run_engine("prompts", "--set", "task", "--file", path, env=env, code=2)
+        out = {p["name"]: p for p in self.run_engine("prompts", "--set", "task", "--file", path)["prompts"]}
+        self.assertTrue(out["task"]["custom"])
+        self.assertTrue(out["task"]["text"].startswith("Be brief. "))
+        os.environ["HARVEST_HOME"] = self.home
+        try:
+            h = self.load_engine()
+            filled = h.fill_template("task-agent-prompt.md", {"worktree path": "/w"})
+            self.assertTrue(filled.startswith("Be brief. "))
+            self.assertIn("/w", filled)
+            self.assertIn("Opus", h.fill_template("continue-prompt.md", {"from model": "Fable", "to model": "Opus"}))
+        finally:
+            os.environ.pop("HARVEST_HOME")
+        out = {p["name"]: p for p in self.run_engine("prompts", "--reset", "task")["prompts"]}
+        self.assertFalse(out["task"]["custom"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

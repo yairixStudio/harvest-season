@@ -11,7 +11,8 @@ In Hebrew or English. [עברית](README.he.md)
 - **Usage at a glance.** Three bars in the panel (or three small gauges in the menu bar), orange from 70 %, red from 90 %, with the reset times.
 - **A backlog that fills itself.** Once set up, every Claude Code session (and Codex, if you use it) knows to record small, non-urgent things it notices — a missing test, a stale README, a TODO — in the project's `BACKLOG.md`, instead of doing them now or forgetting them. You can also just say "add this to the backlog".
 - **Proposals you approve.** Tasks an agent records on its own arrive as proposals. ⊕ next to a proposal moves it to the queue; the trash can deletes it; a project can be kept out of proposals altogether.
-- **The harvest.** A few hours before your weekly reset (you choose how many), the widget starts a Claude Code session that works through the queue, one task at a time, as far as the remaining quota allows. A task that can't finish before the reset doesn't start. You can also run the queue right away.
+- **The harvest.** Before your weekly reset the widget starts a Claude Code session that works through the queue, one task at a time, as far as the remaining quota allows — in **pulses** of one 5-hour window each, as many as you choose or as many as the quota left and the queue call for. A task that can't finish before the reset doesn't start. You can also run the queue right away.
+- **When a quota runs out.** A model with its own weekly quota (Fable) gives way to another at the percent you set — before a task, and mid-task too, the session going on with its context intact. When the shared 5-hour or weekly limit runs out, the task stops at once, keeps its work on its branch and goes on from there in the next pulse.
 - **Live, and on your phone.** Every run is published through Remote Control, so it appears in the Claude app — and on your phone — while it works, and you can write to it.
 - **You merge.** Each task ends on its own `backlog/…` branch in its project. Nothing is pushed or merged by the harvest. "Waiting for you" opens a session that shows the change and merges it when you approve; a reminder comes if something waits too long.
 
@@ -23,6 +24,10 @@ In Hebrew or English. [עברית](README.he.md)
 - git
 
 ## Install
+
+**With your AI agent:** give it this link and let it do the rest — https://github.com/yairixStudio/quota-harvest/blob/main/INSTALL-WITH-AGENT.md
+
+**By hand:**
 
 ```sh
 git clone https://github.com/yairixStudio/quota-harvest.git
@@ -47,7 +52,7 @@ Anything it replaces is backed up first. At the end it offers a short getting-st
 - **Waiting for you** — finished branches and questions; a click opens a Claude session that walks you through the change.
 - **Done** — the last 30 days; a click opens the session that did the task.
 - **Harvest** (bottom) — the countdown to the next automatic run, **Run now**, and the schedule.
-- ⋯ → **Settings…** — language, start at login, menu bar or floating, the automatic schedule, a model per task size, your details, and which projects may get proposals. ⋯ → **Help** explains every part of the panel.
+- ⋯ → **Settings…** — five tabs: **General** (language, start at login, menu bar or floating, your details), **Harvest** (automatic runs, pulses, how much of each limit is kept free for you), **Models** (a model per task size, when and to what to switch), **Projects** (which may get proposals) and **Texts** (every instruction the harvest gives its agents, editable, with the default a click away). ⋯ → **Help** explains every part of the panel.
 
 ## How it works
 

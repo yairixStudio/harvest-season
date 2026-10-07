@@ -520,6 +520,7 @@ struct HRun: Decodable, Equatable {
     let finishedAt: String?
     let mode: String?
     let done: Int?
+    let paused: Int?
     let stopReason: String?
     let final: Bool?
     let emailed: Bool?
@@ -539,11 +540,18 @@ struct HRecord: Decodable, Equatable {
     let outcome: String?
 }
 
+/// A usage limit a session ran into, as the engine recorded it: in force until `until`.
+struct HLimit: Decodable, Equatable {
+    let until: String?
+}
+
 struct HStatus: Decodable, Equatable {
     let state: String?
     let current: HCurrent?
     let lastRun: HRun?
     let doneThisRun: [HRecord]?
+    /// "five", "weekly", "model:<name>".
+    let limits: [String: HLimit]?
 }
 
 struct HRatio: Decodable, Equatable {
@@ -578,6 +586,30 @@ struct HSettings: Decodable, Equatable {
     var emailDigest: Bool?
     var models: [String: String]?
     var noProposals: [String]?
+    /// A model with its own weekly quota → the model it gives way to, and from what percent.
+    var fallback: [String: HFallback]?
+    var switchMidTask: Bool?
+    var fiveReserve: Double?
+    var weeklyReserve: Double?
+}
+
+struct HFallback: Codable, Equatable {
+    var to: String
+    var atPct: Double
+}
+
+/// One of the harvest's texts the owner may rewrite (`harvest.py prompts`).
+struct HPrompt: Decodable, Equatable, Identifiable {
+    var name: String
+    var text: String
+    var `default`: String
+    var custom: Bool
+    var keeps: [String]
+    var id: String { name }
+}
+
+struct HPrompts: Decodable {
+    var prompts: [HPrompt]
 }
 
 /// A registered project as `list` reports it.
@@ -602,17 +634,26 @@ struct HListing: Decodable, Equatable {
     var launch: HLaunch?
 }
 
+/// When the automatic harvest runs: `pulses` 5-hour windows before the weekly reset, one after
+/// another (0 = as many as the quota left and the queue call for, up to `maxPulses`).
 struct HarvestConfig: Equatable {
     var auto = true
-    var leadHours = 8
+    var pulses = 0
 }
+
+let maxPulses = 6
 
 func loadHarvestConfig() -> HarvestConfig {
     var c = HarvestConfig()
     if let data = try? Data(contentsOf: harvestHome.appendingPathComponent("config.json")),
        let saved = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
         if let auto = saved["auto"] as? Bool { c.auto = auto }
-        if let lead = jsonNumber(saved["leadHours"]) { c.leadHours = min(max(Int(lead), 1), 24) }
+        if let pulses = jsonNumber(saved["pulses"]) {
+            c.pulses = min(max(Int(pulses), 0), maxPulses)
+        } else if let lead = jsonNumber(saved["leadHours"]) {
+            // Before pulses: "N hours before the reset" covered ⌈N/5⌉ windows.
+            c.pulses = min(max(Int((lead / 5).rounded(.up)), 1), maxPulses)
+        }
     }
     return c
 }
@@ -624,7 +665,10 @@ func writeJSONFile(_ obj: Any, to url: URL) {
 }
 
 func saveHarvestConfig(_ c: HarvestConfig) {
-    writeJSONFile(["auto": c.auto, "leadHours": c.leadHours],
+    // The engine reads only leadHours (in auto mode it refuses a run started earlier than that); the
+    // widget schedules the pulses, so it gives the engine the widest lead they can need.
+    let pulses = c.pulses == 0 ? maxPulses : c.pulses
+    writeJSONFile(["auto": c.auto, "pulses": c.pulses, "leadHours": pulses * 5 + 1],
                   to: harvestHome.appendingPathComponent("config.json"))
 }
 
@@ -850,6 +894,11 @@ func appSessionId(forCli cliSessionId: String) -> String? {
 }
 
 /// Follows the newest run in Terminal, one readable line per step.
+/// `text` as one single-quoted shell word.
+func shellQuoted(_ text: String) -> String {
+    "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
 func watchInTerminal() {
     let script = harvestHome.appendingPathComponent("bin/watch.command")
     let body = "#!/bin/zsh\nexec \"$HOME/.local/bin/claude-harvest\" watch\n"
@@ -937,6 +986,8 @@ func stopReasonText(_ reason: String?) -> String? {
     switch r {
     case "queue-empty": return L("התור התרוקן", "the queue ran out")
     case "5h-full": return L("חלון 5 השעות התמלא — ימשיך אחרי האיפוס שלו", "the 5-hour window filled up — it goes on after that resets")
+    case "model-full": return L("המשימות שנשארו מחכות למכסה של מודל", "the tasks left wait for a model's quota")
+    case "signed-out": return L("Claude Code לא היה מחובר", "Claude Code was signed out")
     case "weekly-full": return L("המכסה השבועית נוצלה", "the weekly quota is used up")
     case "cutoff-near": return L("קרוב מדי לאיפוס", "too close to the reset")
     case "too-early": return L("מוקדם מדי לפני האיפוס", "too early before the reset")
@@ -1062,14 +1113,24 @@ func drawGauge(at origin: NSPoint, pct: Double, tag: String) {
     ctx.endTransparencyLayer()
 }
 
-/// The status item's image: the harvester, then one gauge per limit. Drawn on
-/// demand, so it follows the menu bar's light or dark appearance.
-func menuBarImage(gauges: [(tag: String, pct: Double)], reel: CGFloat) -> NSImage {
-    let width: CGFloat = gauges.isEmpty ? 21 : 26 + CGFloat(gauges.count) * 19 - 3
+/// The status item's image: the harvester, then one gauge per limit — and, with `alert`, a red
+/// "!" at the end (Claude Code isn't signed in: nothing works until it is). Drawn on demand, so it
+/// follows the menu bar's light or dark appearance.
+func menuBarImage(gauges: [(tag: String, pct: Double)], reel: CGFloat, alert: Bool = false) -> NSImage {
+    let base: CGFloat = gauges.isEmpty ? 21 : 26 + CGFloat(gauges.count) * 19 - 3
+    let width = base + (alert ? 15 : 0)
     return NSImage(size: NSSize(width: width, height: 18), flipped: false) { _ in
         drawHarvester(at: NSPoint(x: 0, y: 1), color: .labelColor, reel: reel)
         for (i, g) in gauges.enumerated() {
             drawGauge(at: NSPoint(x: 26 + CGFloat(i) * 19, y: 1), pct: g.pct, tag: g.tag)
+        }
+        if alert {
+            NSColor.systemRed.setFill()
+            NSBezierPath(ovalIn: NSRect(x: base + 3, y: 3, width: 12, height: 12)).fill()
+            let mark = NSAttributedString(string: "!", attributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .heavy), .foregroundColor: NSColor.white])
+            let size = mark.size()
+            mark.draw(at: NSPoint(x: base + 9 - size.width / 2, y: 9 - size.height / 2))
         }
         return true
     }
@@ -1106,8 +1167,19 @@ protocol WidgetActions: AnyObject {
     func setProposals(project: String, name: String, on: Bool)
     func setLanguage(hebrew: Bool)
     func saveHarvestSettings(_ values: [String])
+    func loadPrompts()
+    func savePrompt(_ name: String, _ text: String)
+    func resetPrompt(_ name: String)
     func moveQueued(_ id: String, before target: String?)
     func resetQueueOrder()
+    func startSignIn()
+    func recheckSignIn()
+}
+
+/// Why Claude Code can't be used right now. The one problem the panel spells out instead of
+/// leaving it to the dot: without a signed-in Claude Code nothing works — no fresh figures, no harvest.
+enum SignInProblem: Equatable {
+    case notInstalled, signedOut, expired
 }
 
 final class WidgetModel: ObservableObject {
@@ -1121,6 +1193,10 @@ final class WidgetModel: ObservableObject {
     /// Whether the harvest engine is installed; until it is, the panel shows only the usage and
     /// an invitation to set it up. True until the first check, so nothing flashes at start.
     @Published var harvestInstalled = true
+    /// Set while Claude Code is missing or not signed in (the widget's poll, or `claude auth status`).
+    @Published var signIn: SignInProblem?
+    /// When the figures shown were fetched, while they are the last saved ones rather than fresh.
+    @Published var figuresFrom: Date?
     /// The queued task a dragged one would land above while it's held over it ("end" = the bottom).
     @Published var queueDropTarget: String?
     @Published var listing = HListing() {
@@ -1175,17 +1251,22 @@ final class WidgetModel: ObservableObject {
     var lastRunInApp: Bool { listing.launch?.sessionId != nil && listing.launch?.endedAt != nil }
     var queuePct: Double { listing.queue.reduce(0) { $0 + $1.pct } }
 
-    /// Weekly points one 5-hour window can deliver, keeping the engine's
-    /// 15-point margin free, from the engine's calibration.
+    var fiveReserve: Double { listing.settings?.fiveReserve ?? 15 }
+    var weeklyReserve: Double { listing.settings?.weeklyReserve ?? 2 }
+    /// Weekly points one 5-hour window can deliver, keeping the owner's reserve in it free,
+    /// from the engine's calibration.
     var weeklyPointsPerWindow: Double {
-        guard let r = listing.ratio, r.weekly > 0 else { return 85 / 3.8 }
-        return 85 * r.five / r.weekly
+        guard let r = listing.ratio, r.weekly > 0 else { return (100 - fiveReserve) / 3.8 }
+        return (100 - fiveReserve) * r.five / r.weekly
     }
-    var harvestWindows: Int { Int((Double(config.leadHours) / 5).rounded(.up)) }
-    var harvestCapacity: Double {
-        let room = 100 - (weekly?.pct ?? 100) - 2
-        return max(0, min(room, Double(harvestWindows) * weeklyPointsPerWindow))
+    var weeklyRoom: Double { max(0, 100 - (weekly?.pct ?? 100) - weeklyReserve) }
+    /// "Automatic": the windows it takes to spend what is left of the week on what is queued.
+    var autoPulses: Int {
+        let need = min(weeklyRoom, queuePct)
+        return min(maxPulses, max(1, Int((need / max(1, weeklyPointsPerWindow)).rounded(.up))))
     }
+    var harvestWindows: Int { config.pulses == 0 ? autoPulses : config.pulses }
+    var harvestCapacity: Double { min(weeklyRoom, Double(harvestWindows) * weeklyPointsPerWindow) }
 }
 
 struct PanelView: View {
@@ -1195,6 +1276,7 @@ struct PanelView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             usage
+            if let problem = m.signIn { signInCard(problem) }
             if m.harvestInstalled {
                 section(L("בתור", "Queue"), summary: queueSummary, open: $m.queueOpen) { queueList }
                 section(L("הצעות", "Proposals"), summary: proposalsSummary, open: $m.proposalsOpen) { proposalList }
@@ -1408,6 +1490,40 @@ struct PanelView: View {
         }
     }
 
+    /// Claude Code missing or signed out: what that stops, and the way back in.
+    func signInCard(_ problem: SignInProblem) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: problem == .notInstalled ? "exclamationmark.triangle.fill" : "person.crop.circle.badge.exclamationmark")
+                    .foregroundStyle(.red)
+                Text(problem == .notInstalled ? L("Claude Code לא מותקן", "Claude Code isn't installed")
+                     : problem == .expired ? L("ההתחברות ל-Claude Code פגה", "Your Claude Code sign-in expired")
+                     : L("Claude Code לא מחובר", "Claude Code isn't signed in"))
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            Text(problem == .notInstalled
+                 ? L("בלי Claude Code אין מדדי מכסה, והקציר לא ירוץ.", "Without Claude Code there are no usage figures, and the harvest won't run.")
+                 : L("בלי חיבור אין מדדי מכסה עדכניים, והקציר לא ירוץ. ההתחברות נפתחת בטרמינל ונגמרת בדפדפן.",
+                     "Without it there are no fresh usage figures, and the harvest won't run. Signing in opens in Terminal and finishes in the browser."))
+                .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let from = m.figuresFrom {
+                Text(L("המספרים למעלה עודכנו לאחרונה: ", "The figures above were last updated: ") + whenText(from))
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            HStack(spacing: 8) {
+                Button(problem == .notInstalled ? L("להתקנה", "Install it") : L("התחבר", "Sign in")) { m.actions?.startSignIn() }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+                Button(L("בדוק שוב", "Check again")) { m.actions?.recheckSignIn() }
+                    .controlSize(.small)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.red.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(Color.red.opacity(0.3)))
+        .padding(.top, 8)
+    }
+
     // MARK: Footer
 
     /// The panel while the harvest isn't installed: what it is, and the way in.
@@ -1525,37 +1641,61 @@ struct PanelView: View {
                 }))
                 .toggleStyle(.switch).controlSize(.mini).labelsHidden().help(L("קציר אוטומטי", "Automatic harvest"))
             }
-            // Continuous (no tick marks); the binding rounds to whole hours.
-            Slider(value: Binding(get: { Double(m.config.leadHours) }, set: { v in
-                var c = m.config
-                c.leadHours = Int(v.rounded())
-                m.actions?.setConfig(c)
-            }), in: 1...24)
-            .controlSize(.small)
+            PulsesPicker(m: m).controlSize(.small)
             Text(capacityText).font(.system(size: 11)).foregroundStyle(.secondary)
         }
         .padding(.leading, 16)
     }
 
-    /// "Starts **8h** before the reset", the hours in bold. A whole literal per language, not
+    /// "**2 pulses** before the reset", the count in bold. A whole literal per language, not
     /// L() pieces: strings interpolated into a Text are isolated from one another, and with no
     /// Hebrew letter left outside them the sentence would lay out left to right, its order scrambled.
-    var leadText: Text {
-        uiHebrew ? Text("יוצא לדרך \(Text("\(m.config.leadHours) ש׳").fontWeight(.semibold)) לפני האיפוס")
-            : Text("Starts \(Text("\(m.config.leadHours)h").fontWeight(.semibold)) before the reset")
-    }
+    var leadText: Text { pulsesSentence(m) }
 
-    var capacityText: String {
-        let w = m.harvestWindows
-        return L("\(w) \(w == 1 ? "חלון" : "חלונות") של 5 ש׳ · מספיק לכ־\(pctText(m.harvestCapacity)) · בתור \(pctText(m.queuePct))",
-                 "\(w) × 5h \(w == 1 ? "window" : "windows") · enough for ~\(pctText(m.harvestCapacity)) · queued \(pctText(m.queuePct))")
-    }
+    var capacityText: String { capacityLine(m) }
 
     var lastRunText: String? {
         guard let r = m.listing.status?.lastRun, let f = parseDate(r.finishedAt) else { return nil }
         var s = L("קציר אחרון ", "Last harvest ") + whenText(f) + L(" · \(r.done ?? 0) הסתיימו", " · \(r.done ?? 0) done")
         if let why = stopReasonText(r.stopReason) { s += " · " + why }
         return s
+    }
+}
+
+/// "**N pulses** before the reset" (or "automatic — N pulses"), the count in bold; a whole literal
+/// per language, so the Hebrew sentence keeps its order.
+func pulsesSentence(_ m: WidgetModel) -> Text {
+    let n = m.harvestWindows
+    if m.config.pulses == 0 {
+        return uiHebrew ? Text("אוטומטי · \(Text(n == 1 ? "פעימה אחת" : "\(n) פעימות").fontWeight(.semibold)) לפני האיפוס")
+            : Text("Automatic · \(Text(n == 1 ? "1 pulse" : "\(n) pulses").fontWeight(.semibold)) before the reset")
+    }
+    return uiHebrew ? Text("\(Text(n == 1 ? "פעימה אחת" : "\(n) פעימות").fontWeight(.semibold)) לפני האיפוס")
+        : Text("\(Text(n == 1 ? "1 pulse" : "\(n) pulses").fontWeight(.semibold)) before the reset")
+}
+
+func capacityLine(_ m: WidgetModel) -> String {
+    let w = m.harvestWindows
+    return L("\(w) \(w == 1 ? "חלון" : "חלונות") של 5 ש׳ · מספיק לכ־\(pctText(m.harvestCapacity)) · בתור \(pctText(m.queuePct))",
+             "\(w) × 5h \(w == 1 ? "window" : "windows") · enough for ~\(pctText(m.harvestCapacity)) · queued \(pctText(m.queuePct))")
+}
+
+/// How many pulses — 5-hour windows — the automatic harvest takes before the weekly reset:
+/// "automatic" or 1…maxPulses. The panel and the settings share it.
+struct PulsesPicker: View {
+    @ObservedObject var m: WidgetModel
+    var body: some View {
+        Picker("", selection: Binding(get: { m.config.pulses }, set: { v in
+            var c = m.config
+            c.pulses = v
+            m.actions?.setConfig(c)
+        })) {
+            Text(L("אוטומטי", "Auto")).tag(0)
+            ForEach(1...maxPulses, id: \.self) { Text("\($0)").tag($0) }
+        }
+        .pickerStyle(.segmented).labelsHidden()
+        .help(L("כמה חלונות של 5 שעות הקציר מקבל לפני האיפוס השבועי. אוטומטי — כמה שצריך כדי לנצל את מה שנשאר.",
+                "How many 5-hour windows the harvest gets before the weekly reset. Auto — as many as it takes to use what's left."))
     }
 }
 
@@ -1952,7 +2092,8 @@ struct HelpView: View {
         ("המדדים למעלה", [
             "**5 ש׳** — חלון של חמש שעות. **שבועי** — כל המודלים. השורה השלישית — מכסה שבועית של מודל מסוים (למשל Fable).",
             "כחול עד 70%, כתום מ-70%, אדום מ-90%. מתחת: מתי כל מכסה מתאפסת.",
-            "הנקודה הצבעונית: **ירוק** — מחובר. **צהוב** — יש תקלה והווידג'ט מנסה שוב לבד. **אדום** — צריך אותך: להתחבר מחדש ל-Claude Code. ↻ מרענן עכשיו.",
+            "הנקודה הצבעונית: **ירוק** — מחובר. **צהוב** — יש תקלה והווידג'ט מנסה שוב לבד. **אדום** — צריך אותך. ↻ מרענן עכשיו.",
+            "**כש-Claude Code לא מחובר** (או לא מותקן) מופיע מתחת למדדים כרטיס אדום: מה זה עוצר (אין מדדים עדכניים, הקציר לא ירוץ), ממתי המספרים שמוצגים, **התחבר** — פותח טרמינל עם ההתחברות, שנגמרת בדפדפן — ו**בדוק שוב**. בשורת התפריט מופיע \"!\" אדום, ומגיעה התראה אחת שלחיצה עליה מתחילה להתחבר. כשההתחברות מצליחה, הכרטיס נעלם לבד.",
         ]),
         ("בתור", [
             "משימות שאישרת. הן ירוצו בקציר הבא.",
@@ -1981,19 +2122,24 @@ struct HelpView: View {
             "**לחיצה על שורה** פותחת באפליקציית Claude את הסשן שעשה את העבודה.",
         ]),
         ("קציר (בתחתית)", [
-            "ספירה לאחור עד שהקציר האוטומטי מתחיל. הוא יוצא לדרך כמה שעות לפני האיפוס השבועי — כמה, קובעים בסליידר (1–24 שעות) — ורק כשהמתג \"אוטומטי\" דלוק.",
+            "ספירה לאחור עד שהקציר האוטומטי מתחיל — רק כשהמתג \"אוטומטי\" דלוק. הוא רץ ב**פעימות**: כל פעימה היא חלון של 5 שעות, והאחרונה נגמרת לפני האיפוס השבועי. כמה פעימות — בוחרים בשורה (1–6), או \"אוטומטי\": כמה שצריך כדי לנצל את מה שנשאר מהשבוע על מה שבתור.",
+            "פעימה מסתיימת כשחלון ה־5 שעות מתמלא; הבאה מתחילה כשהוא מתאפס, כל עוד יש בתור עבודה. מתחת: כמה חלונות, לכמה אחוזים מהמכסה השבועית הם מספיקים, וכמה בתור.",
             "**הרץ עכשיו** מריץ את כל התור מיד.",
             "בזמן ריצה: נקודה מהבהבת, המשימה הנוכחית, **צפה** (הסשן החי באפליקציית Claude) ו**עצור**. אפשר גם לכתוב לו מהאפליקציה או מהטלפון.",
             "כל משימה רצה בסשן משלה ובענף נפרד משלה בתוך הפרויקט. שום דבר לא נדחף לשרת ולא ממוזג — את זה רק אתה מאשר. משימה שלא תספיק להסתיים לפני האיפוס לא מתחילה.",
+            "**כשמכסה נגמרת באמצע:** אם נגמרה המכסה של המודל עצמו (למשל Fable), הסשן ממשיך מאותה נקודה על המודל החלופי. אם נגמר חלון 5 השעות או השבועי — המשימה נעצרת מיד, העבודה נשמרת בענף שלה, והיא ממשיכה משם בפעימה הבאה. זה לא נחשב כישלון.",
             "אחרי ריצה: שורת \"קציר אחרון\" — לחיצה פותחת את כל השיחה של הריצה.",
         ]),
         ("התפריט ⋯", [
             "**הגדרות…** · **פתח את תיקיית הקציר** (דוחות ולוגים) · **צפה בריצה בטרמינל** · **עזרה** — המסך הזה · **צא מהווידג'ט**.",
         ]),
         ("הגדרות", [
-            "**כללי:** שפה, הפעלה בכניסה למחשב, ובשורת התפריט או כווידג'ט צף.",
-            "**קציר:** קציר אוטומטי וכמה שעות לפני האיפוס, מודל לכל גודל משימה, שם, תיקייה ומייל לסיכום שבועי (שומרים בכפתור \"שמור\").",
-            "**פרויקטים:** מתג \"הצעות\" לכל פרויקט רשום — כבוי = בלי הצעות ממנו. בתחתית: עזרה והסרת הקציר.",
+            "חמש לשוניות בראש החלון.",
+            "**כללי:** שפה, הפעלה בכניסה למחשב, בשורת התפריט או כווידג'ט צף; השם שלך, מייל לסיכום שבועי ותיקיית הקציר (שומרים ב\"שמור\"); עזרה והסרת הקציר.",
+            "**קציר:** קציר אוטומטי, כמה פעימות לפני האיפוס, ו**שמירת מקום בשבילך** — כמה אחוזים הקציר לא ייגע בהם בחלון ה־5 שעות (כדי שתוכל לעבוד) ובמכסה השבועית.",
+            "**מודלים:** מודל לכל גודל משימה, ו**מעבר בין מודלים** — מאיזה אחוז של המכסה של Fable עוברים, לאיזה מודל (או \"בלי\": המשימות יחכו), והאם לעבור גם באמצע משימה.",
+            "**פרויקטים:** מתג \"הצעות\" לכל פרויקט רשום — כבוי = בלי הצעות ממנו.",
+            "**טקסטים:** ההנחיות שהקציר נותן לסוכנים — משימה, סריקת הצעות, השיחות, מייל הסיכום וההודעה במעבר מודל. אפשר לערוך כל אחת; נקודה כחולה = מותאם אישית, כתומה = שינוי שלא נשמר. מה שחייב להישאר בטקסט כתוב מתחתיו, ושמירה בלעדיו נדחית. \"שחזר ברירת מחדל\" מחזיר את המקור.",
         ]),
         ("הגדרה והתקנה", [
             "כשהקציר לא מותקן, הווידג'ט מראה רק את המדדים וכפתור **\"הגדר את הקציר…\"**.",
@@ -2015,7 +2161,8 @@ struct HelpView: View {
         ("The meters at the top", [
             "**5h** — the five-hour window. **Weekly** — all models. The third row — the weekly quota of one particular model (for example Fable).",
             "Blue below 70%, orange from 70%, red from 90%. Underneath: when each quota resets.",
-            "The colored dot: **green** — connected. **Yellow** — something went wrong and the widget is retrying on its own. **Red** — it needs you: sign in to Claude Code again. ↻ refreshes now.",
+            "The colored dot: **green** — connected. **Yellow** — something went wrong and the widget is retrying on its own. **Red** — it needs you. ↻ refreshes now.",
+            "**When Claude Code isn't signed in** (or isn't installed), a red card appears under the meters: what that stops (no fresh figures, no harvest), how old the figures shown are, **Sign in** — opens Terminal with the sign-in, which finishes in the browser — and **Check again**. The menu bar icon gets a red \"!\", and one notification comes; clicking it starts signing in. Once you're signed in, the card goes away by itself.",
         ]),
         ("Queue", [
             "Tasks you approved. They run in the next harvest.",
@@ -2044,19 +2191,24 @@ struct HelpView: View {
             "**Clicking a row** opens the session that did the work in the Claude app.",
         ]),
         ("Harvest (at the bottom)", [
-            "A countdown to the start of the automatic harvest. It starts a few hours before the weekly reset — how many, you set with the slider (1–24 hours) — and only while the \"automatic\" switch is on.",
+            "A countdown to the start of the automatic harvest — only while the \"automatic\" switch is on. It runs in **pulses**: each pulse is one 5-hour window, and the last one ends before the weekly reset. How many — you choose in the row (1–6), or \"Auto\": as many as it takes to spend what's left of the week on what's queued.",
+            "A pulse ends when its 5-hour window fills up; the next starts when that window resets, as long as the queue has work. Underneath: how many windows, how much of the weekly quota they are enough for, and how much is queued.",
             "**Run now** runs the whole queue right away.",
             "During a run: a blinking dot, the current task, **Watch** (the live session in the Claude app) and **Stop**. You can also write to it from the app or from your phone.",
             "Each task runs in its own session and on its own branch inside the project. Nothing is pushed to the server or merged — only you approve that. A task that wouldn't finish before the reset doesn't start.",
+            "**When a quota runs out midway:** if it's the model's own quota (Fable, say), the session goes on from the same point with the fallback model. If it's the 5-hour window or the weekly quota, the task stops at once, its work is kept on its branch, and it goes on from there in the next pulse. That doesn't count as a failure.",
             "After a run: the \"Last harvest\" line — a click opens the run's whole conversation.",
         ]),
         ("The ⋯ menu", [
             "**Settings…** · **Open the harvest folder** (reports and logs) · **Watch the run in Terminal** · **Help** — this screen · **Quit the widget**.",
         ]),
         ("Settings", [
-            "**General:** language, start at login, and the menu bar or a floating widget.",
-            "**Harvest:** automatic harvest and how many hours before the reset, a model per task size, your name, the folder and an email for a weekly summary (kept with \"Save\").",
-            "**Projects:** a \"Proposals\" switch per registered project — off = no proposals from it. At the bottom: help and removing the harvest.",
+            "Five tabs at the top of the window.",
+            "**General:** language, start at login, the menu bar or a floating widget; your name, an email for the weekly summary and the harvest folder (kept with \"Save\"); help and removing the harvest.",
+            "**Harvest:** the automatic harvest, how many pulses before the reset, and **kept free for you** — how many percent the harvest leaves alone in the 5-hour window (so you can work) and in the weekly quota.",
+            "**Models:** a model per task size, and **switching models** — from what percent of Fable's own quota to switch, to which model (or \"None\": the tasks wait), and whether to switch mid-task too.",
+            "**Projects:** a \"Proposals\" switch per registered project — off = no proposals from it.",
+            "**Texts:** the instructions the harvest gives its agents — a task, the proposal scan, the conversations, the summary email and the message on a model switch. Each can be edited; a blue dot = customized, orange = unsaved changes. What must stay in a text is listed under it, and saving without it is refused. \"Restore the default\" brings back the original.",
         ]),
         ("Setup and install", [
             "While the harvest isn't installed, the widget shows only the meters and a **\"Set up the harvest…\"** button.",
@@ -2376,16 +2528,62 @@ struct SetupView: View {
 
 // MARK: Settings
 
-/// ⋯ → "הגדרות…": everything the owner can set, in one window — the widget (language, start at
-/// login, menu bar), the harvest (name, email, folder, automatic runs, models) and which
-/// projects may get proposals. Toggles apply at once; the text fields with "Save".
+/// The settings window's tabs, in the macOS way: one toolbar-like row of symbols, a grouped form under it.
+enum SettingsTab: String, CaseIterable, Identifiable {
+    case general, harvest, models, projects, texts
+    var id: String { rawValue }
+    var symbol: String {
+        switch self {
+        case .general: return "gearshape"
+        case .harvest: return "calendar.badge.clock"
+        case .models: return "cpu"
+        case .projects: return "folder"
+        case .texts: return "text.bubble"
+        }
+    }
+    var title: String {
+        switch self {
+        case .general: return L("כללי", "General")
+        case .harvest: return L("קציר", "Harvest")
+        case .models: return L("מודלים", "Models")
+        case .projects: return L("פרויקטים", "Projects")
+        case .texts: return L("טקסטים", "Texts")
+        }
+    }
+    /// Each tab's height; the window takes it on, like the system's own settings windows.
+    var height: CGFloat {
+        switch self {
+        case .general: return 610
+        case .harvest: return 610
+        case .models: return 540
+        case .projects: return 420
+        case .texts: return 580
+        }
+    }
+}
+
+/// ⋯ → "הגדרות…": everything the owner can set — the widget (language, start at login, menu bar),
+/// the harvest (schedule, reserves, models and fallbacks, name, email, folder), which projects
+/// may get proposals, and the harvest's texts. Switches apply at once; text fields with "Save".
 final class SettingsModel: ObservableObject {
+    @Published var tab: SettingsTab = .general { didSet { onTab?(tab) } }
     @Published var name = ""
     @Published var email = ""
     @Published var digest = false
     @Published var workdir = ""
     @Published var models: [String: String] = [:]
+    @Published var fallback: [String: HFallback] = [:]
+    @Published var switchMidTask = true
+    @Published var fiveReserve = 15
+    @Published var weeklyReserve = 2
     @Published var saved = false
+    @Published var prompts: [HPrompt] = []
+    @Published var promptName = "task"
+    /// Edits not saved yet, per text.
+    @Published var drafts: [String: String] = [:]
+    @Published var promptProblem: String?
+    @Published var promptSaved = false
+    var onTab: ((SettingsTab) -> Void)?
 
     func load(_ settings: HSettings?) {
         name = settings?.ownerName ?? ""
@@ -2393,167 +2591,400 @@ final class SettingsModel: ObservableObject {
         digest = settings?.emailDigest ?? false
         workdir = settings?.workdir ?? ""
         models = settings?.models ?? [:]
+        fallback = settings?.fallback ?? ["fable": HFallback(to: "opus", atPct: 85)]
+        switchMidTask = settings?.switchMidTask ?? true
+        fiveReserve = Int(settings?.fiveReserve ?? 15)
+        weeklyReserve = Int(settings?.weeklyReserve ?? 2)
         saved = false
+    }
+
+    var prompt: HPrompt? { prompts.first { $0.name == promptName } }
+    func draft(_ p: HPrompt) -> String { drafts[p.name] ?? p.text }
+    func dirty(_ p: HPrompt) -> Bool { drafts[p.name].map { $0 != p.text } ?? false }
+}
+
+/// What each of the harvest's texts is for, in the owner's words.
+func promptTitle(_ name: String) -> String {
+    switch name {
+    case "task": return L("משימה", "A task")
+    case "scan": return L("סריקת הצעות", "Proposal scan")
+    case "talk": return L("מה מחכה לך", "What waits for you")
+    case "onboard": return L("שיחת היכרות", "Getting started")
+    case "digest": return L("מייל הסיכום השבועי", "Weekly summary email")
+    case "continue": return L("המשך על מודל אחר", "Going on with another model")
+    default: return name
+    }
+}
+
+func promptNote(_ name: String) -> String {
+    switch name {
+    case "task": return L("ההנחיה שכל משימה מקבלת כשהיא רצה בסשן משלה, בענף משלה בתוך הפרויקט.",
+                          "What every task is told when it runs in its own session, on its own branch in the project.")
+    case "scan": return L("מה הסוכן מחפש כשהוא מציע משימות לפרויקט שאין בו תור.",
+                          "What the agent looks for when it proposes tasks for a project with an empty queue.")
+    case "talk": return L("השיחה שנפתחת מהתזכורת: הסבר על כל ענף שמחכה, ומיזוג רק באישורך.",
+                          "The conversation the reminder opens: each waiting branch explained, merged only on your word.")
+    case "onboard": return L("השיחה שאחרי ההתקנה: מוצאת את הפרויקטים שלך ורושמת הצעות ראשונות.",
+                             "The conversation after the install: finds your projects and records first proposals.")
+    case "digest": return L("איך נכתב המייל שנשלח בסוף כל מחזור שבועי.",
+                            "How the email sent at the end of each weekly cycle is written.")
+    case "continue": return L("ההודעה שסשן מקבל כשהמכסה של המודל שלו נגמרה והוא ממשיך על מודל אחר.",
+                              "The message a session gets when its model's quota ran out and it goes on with another model.")
+    default: return ""
+    }
+}
+
+/// The row of tabs at the top, like the system's own settings windows: a symbol over a short name,
+/// the chosen one tinted.
+struct SettingsTabBar: View {
+    @ObservedObject var s: SettingsModel
+    var tabs: [SettingsTab]
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(tabs) { t in
+                let on = s.tab == t
+                Button { s.tab = t } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: t.symbol)
+                            .symbolVariant(on ? .fill : .none)
+                            .font(.system(size: 18))
+                            .frame(height: 22)
+                        Text(t.title).font(.system(size: 11, weight: on ? .medium : .regular))
+                    }
+                    .foregroundStyle(on ? Color.accentColor : Color.secondary)
+                    .frame(minWidth: 68)
+                    .padding(.vertical, 6).padding(.horizontal, 4)
+                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(on ? Color.primary.opacity(0.07) : Color.clear))
+                    .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(on ? .isSelected : [])
+            }
+        }
+        .padding(.top, 4).padding(.bottom, 8)
+        .frame(maxWidth: .infinity)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
     }
 }
 
 struct SettingsView: View {
     @ObservedObject var m: WidgetModel
     @ObservedObject var s: SettingsModel
-    var scrolls = true
 
     static let modelChoices = ["haiku", "sonnet", "opus", "fable"]
+    static let width: CGFloat = 600
+
+    var tabs: [SettingsTab] { m.harvestInstalled ? SettingsTab.allCases : [.general] }
 
     var body: some View {
-        Group {
-            if scrolls { ScrollView { content } } else { content.fixedSize(horizontal: false, vertical: true) }
+        VStack(spacing: 0) {
+            SettingsTabBar(s: s, tabs: tabs)
+            Group {
+                switch tabs.contains(s.tab) ? s.tab : .general {
+                case .general: general
+                case .harvest: harvest
+                case .models: modelsTab
+                case .projects: projects
+                case .texts: texts
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .font(.system(size: 12))
+        .frame(width: Self.width, height: (tabs.contains(s.tab) ? s.tab : .general).height)
+        .font(.system(size: 13))
         .environment(\.layoutDirection, uiHebrew ? .rightToLeft : .leftToRight)
         .focusEffectDisabled()
     }
 
-    func heading(_ text: String) -> some View {
-        Text(text).font(.system(size: 13, weight: .semibold)).padding(.top, 6)
-    }
-
-    func row<Control: View>(_ title: String, _ note: String? = nil, @ViewBuilder control: () -> Control) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                if let note = note {
-                    Text(note).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            control()
-        }
-    }
-
-    func field(_ title: String, _ text: Binding<String>, path: Bool = false) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+    /// A row's title with a quieter line under it, the way System Settings explains a switch.
+    func titled(_ title: String, _ note: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
             Text(title)
-            if path {
-                TextField("", text: text).textFieldStyle(.roundedBorder).environment(\.layoutDirection, .leftToRight)
-            } else {
-                TextField("", text: text).textFieldStyle(.roundedBorder)
-            }
+            Text(note).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    var content: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(L("הגדרות", "Settings")).font(.system(size: 17, weight: .semibold))
+    func modelName(_ id: String) -> String { id.isEmpty ? L("בלי", "None") : id.prefix(1).uppercased() + id.dropFirst() }
 
-            heading(L("כללי", "General"))
-            row(L("שפה", "Language"), L("של הווידג'ט, הדוחות וההודעות", "For the widget, the reports and the notifications")) {
-                Picker("", selection: Binding(get: { uiHebrew }, set: { m.actions?.setLanguage(hebrew: $0) })) {
+    // MARK: General
+
+    var general: some View {
+        Form {
+            Section {
+                Picker(L("שפה", "Language"), selection: Binding(get: { uiHebrew }, set: { m.actions?.setLanguage(hebrew: $0) })) {
                     Text("עברית").tag(true)
                     Text("English").tag(false)
                 }
-                .pickerStyle(.segmented).labelsHidden().fixedSize()
+                .pickerStyle(.segmented)
+                Toggle(L("הפעל בכניסה למחשב", "Start at login"),
+                       isOn: Binding(get: { m.startAtLogin }, set: { m.actions?.toggleStartAtLogin($0) }))
+                Toggle(isOn: Binding(get: { m.inMenuBar }, set: { m.actions?.setMenuBar($0) })) {
+                    titled(L("בשורת התפריט", "In the menu bar"), L("כבוי — ווידג'ט צף על המסך", "Off — a floating widget on the screen"))
+                }
+            } footer: {
+                Text(L("השפה חלה על הווידג'ט, על הדוחות ועל ההודעות.", "The language applies to the widget, the reports and the notifications."))
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
             }
-            row(L("הפעל בכניסה למחשב", "Start at login")) {
-                Toggle("", isOn: Binding(get: { m.startAtLogin }, set: { m.actions?.toggleStartAtLogin($0) }))
-                    .toggleStyle(.switch).controlSize(.small).labelsHidden()
-            }
-            row(L("בשורת התפריט", "In the menu bar"), L("כבוי — ווידג'ט צף על המסך", "Off — a floating widget on the screen")) {
-                Toggle("", isOn: Binding(get: { m.inMenuBar }, set: { m.actions?.setMenuBar($0) }))
-                    .toggleStyle(.switch).controlSize(.small).labelsHidden()
-            }
-
-            Divider().padding(.top, 4)
-            heading(L("קציר", "Harvest"))
             if m.harvestInstalled {
-                harvest
+                Section(L("עליך", "About you")) {
+                    TextField(L("השם שלך", "Your name"), text: $s.name)
+                    TextField(L("מייל לסיכום השבועי", "Email for the weekly summary"), text: $s.email)
+                    Toggle(L("שלח סיכום שבועי במייל", "Send a weekly summary by email"), isOn: $s.digest)
+                        .disabled(s.email.trimmingCharacters(in: .whitespaces).isEmpty)
+                    TextField(L("תיקיית הקציר", "Harvest folder"), text: $s.workdir)
+                    HStack {
+                        Spacer()
+                        if s.saved { Text(L("נשמר ✓", "Saved ✓")).foregroundStyle(.secondary) }
+                        Button(L("שמור", "Save")) {
+                            let email = s.email.trimmingCharacters(in: .whitespaces)
+                            m.actions?.saveHarvestSettings(["ownerName=" + s.name.trimmingCharacters(in: .whitespaces),
+                                                            "workdir=" + s.workdir.trimmingCharacters(in: .whitespaces),
+                                                            "email=" + email,
+                                                            "emailDigest=" + (s.digest && !email.isEmpty ? "yes" : "no")])
+                            s.saved = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+                Section {
+                    HStack {
+                        Button(L("עזרה", "Help")) { m.actions?.showHelp() }
+                        Spacer()
+                        Button(L("הסר את הקציר…", "Remove the harvest…")) { m.actions?.showSetup() }
+                            .help(L("פותח את חלון ההתקנה, ושם אפשר להסיר", "Opens the setup window, where it can be removed"))
+                    }
+                }
             } else {
-                Text(L("הקציר לא מותקן.", "The harvest isn't installed.")).foregroundStyle(.secondary)
-                Button(L("הגדר את הקציר…", "Set up the harvest…")) { m.actions?.showSetup() }
+                Section(L("קציר", "Harvest")) {
+                    Text(L("הקציר לא מותקן. הוא מנצל מכסה שבועית שהייתה הולכת לאיבוד, על משימות קטנות מהפרויקטים שלך.",
+                           "The harvest isn't installed. It spends weekly quota that would otherwise be lost on small tasks from your projects."))
+                        .foregroundStyle(.secondary)
+                    Button(L("הגדר את הקציר…", "Set up the harvest…")) { m.actions?.showSetup() }
+                }
             }
+        }
+        .formStyle(.grouped)
+    }
 
-            if m.harvestInstalled {
-                Divider().padding(.top, 4)
-                heading(L("פרויקטים", "Projects"))
-                Text(L("כבוי = בלי הצעות מהפרויקט: ההצעות שלו יוסרו, וסוכנים לא יציעו בו חדשות. משימות שכבר בתור נשארות.",
-                       "Off = no proposals from the project: its proposals are removed and agents won't propose new ones. Queued tasks stay."))
+    // MARK: Harvest
+
+    var harvest: some View {
+        Form {
+            Section {
+                Toggle(isOn: Binding(get: { m.config.auto }, set: { var c = m.config; c.auto = $0; m.actions?.setConfig(c) })) {
+                    titled(L("קציר אוטומטי", "Automatic harvest"),
+                           L("רץ לבד לפני האיפוס השבועי. \"הרץ עכשיו\" בווידג'ט עובד תמיד.",
+                             "Runs by itself before the weekly reset. \"Run now\" in the widget always works."))
+                }
+            }
+            Section {
+                VStack(alignment: .leading, spacing: 8) {
+                    pulsesSentence(m)
+                    PulsesPicker(m: m)
+                }
+                .padding(.vertical, 2)
+                LabeledContent(L("הקציר הבא", "Next harvest")) {
+                    Text(m.autoNext.map(whenText) ?? m.autoNote ?? "–").foregroundStyle(.secondary)
+                }
+                LabeledContent(L("קיבולת", "Capacity")) {
+                    Text(capacityLine(m)).foregroundStyle(.secondary)
+                }
+            } header: {
+                Text(L("פעימות", "Pulses"))
+            } footer: {
+                Text(L("פעימה היא חלון של 5 שעות. הראשונה מתחילה כך שכל הפעימות ייכנסו לפני האיפוס, וכל אחת אחריה מתחילה כשחלון ה־5 שעות הקודם מתאפס — כל עוד יש בתור עבודה. אוטומטי: כמה שצריך כדי לנצל את מה שנשאר מהשבוע על מה שבתור. כל פעימה גם עולה לסשן המתאם בערך 2–5% מהמכסה השבועית.",
+                       "A pulse is one 5-hour window. The first starts so that all of them fit before the reset; each next one starts when the previous 5-hour window resets — as long as the queue has work. Auto: as many as it takes to spend what's left of the week on what's queued. Each pulse also costs the coordinating session about 2–5% of the weekly quota."))
                     .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Section {
+                Stepper(value: Binding(get: { s.fiveReserve }, set: { v in
+                    s.fiveReserve = v
+                    m.actions?.saveHarvestSettings(["fiveReserve=\(v)"])
+                }), in: 0...60, step: 5) {
+                    titled(L("בחלון 5 השעות: \(s.fiveReserve)%", "In the 5-hour window: \(s.fiveReserve)%"),
+                           L("כדי שתוכל להמשיך לעבוד בזמן שהקציר רץ", "So you can keep working while the harvest runs"))
+                }
+                Stepper(value: Binding(get: { s.weeklyReserve }, set: { v in
+                    s.weeklyReserve = v
+                    m.actions?.saveHarvestSettings(["weeklyReserve=\(v)"])
+                }), in: 0...30) {
+                    titled(L("במכסה השבועית: \(s.weeklyReserve)%", "In the weekly quota: \(s.weeklyReserve)%"),
+                           L("מה שנשאר באיפוס הולך לאיבוד, אז מעט מספיק", "Whatever is left at the reset is lost, so a little is enough"))
+                }
+            } header: {
+                Text(L("שמירת מקום בשבילך", "Kept free for you"))
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    // MARK: Models
+
+    var scopedKey: String { m.scopedLabel.lowercased() }
+
+    func saveFallback() {
+        let obj = s.fallback.mapValues { ["to": $0.to, "atPct": Int($0.atPct)] as [String: Any] }
+        let json = (try? JSONSerialization.data(withJSONObject: obj)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        m.actions?.saveHarvestSettings(["fallback=" + json])
+    }
+
+    var fallbackRule: Binding<HFallback> {
+        Binding(get: { s.fallback[scopedKey] ?? HFallback(to: "opus", atPct: 85) },
+                set: { s.fallback[scopedKey] = $0; saveFallback() })
+    }
+
+    var modelsTab: some View {
+        Form {
+            Section {
+                ForEach([("low", L("משימה קטנה", "Small task")), ("medium", L("משימה בינונית", "Medium task")),
+                         ("high", L("משימה גדולה", "Large task"))], id: \.0) { size, title in
+                    Picker(title, selection: Binding(get: { s.models[size] ?? "" }, set: { value in
+                        s.models[size] = value
+                        let json = (try? JSONSerialization.data(withJSONObject: s.models)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+                        m.actions?.saveHarvestSettings(["models=" + json])
+                    })) {
+                        ForEach(Self.modelChoices + ((s.models[size]).map { Self.modelChoices.contains($0) ? [] : [$0] } ?? []), id: \.self) {
+                            Text(modelName($0)).tag($0)
+                        }
+                    }
+                }
+            } header: {
+                Text(L("מודל לפי גודל משימה", "Model by task size"))
+            }
+            Section {
+                Stepper(value: Binding(get: { Int(fallbackRule.wrappedValue.atPct) },
+                                       set: { var r = fallbackRule.wrappedValue; r.atPct = Double($0); fallbackRule.wrappedValue = r }),
+                        in: 50...100, step: 5) {
+                    titled(L("עובר כש־\(m.scopedLabel) מגיע ל־\(Int(fallbackRule.wrappedValue.atPct))%",
+                             "Switch when \(m.scopedLabel) reaches \(Int(fallbackRule.wrappedValue.atPct))%"),
+                           L("לפני שמשימה מתחילה — לפי המכסה השבועית של המודל עצמו", "Before a task starts — by the model's own weekly quota"))
+                }
+                Picker(L("עובר אל", "Switch to"), selection: Binding(get: { fallbackRule.wrappedValue.to },
+                                                                    set: { var r = fallbackRule.wrappedValue; r.to = $0; fallbackRule.wrappedValue = r })) {
+                    ForEach(Self.modelChoices.filter { $0 != scopedKey }, id: \.self) { Text(modelName($0)).tag($0) }
+                    Text(L("בלי — המשימות יחכו לאיפוס", "None — the tasks wait for the reset")).tag("")
+                }
+                Toggle(isOn: Binding(get: { s.switchMidTask }, set: { v in
+                    s.switchMidTask = v
+                    m.actions?.saveHarvestSettings(["switchMidTask=" + (v ? "yes" : "no")])
+                })) {
+                    titled(L("גם באמצע משימה", "Mid-task too"),
+                           L("אם המכסה נגמרת תוך כדי עבודה, הסשן ממשיך מאותה נקודה על המודל החלופי, עם כל ההקשר.",
+                             "If the quota runs out mid-work, the session goes on from the same point with the other model, its context intact."))
+                }
+            } header: {
+                Text(L("כשהמכסה של \(m.scopedLabel) נגמרת", "When \(m.scopedLabel)'s own quota runs out"))
+            } footer: {
+                Text(L("חלון 5 השעות והמכסה השבועית משותפים לכל המודלים, ולכן כשהם נגמרים אין לאן לעבור: המשימה נעצרת מיד, העבודה נשמרת בענף שלה, והיא ממשיכה משם בפעימה הבאה — בלי להיחשב כישלון.",
+                       "The 5-hour window and the weekly quota are shared by all models, so when they run out there is nowhere to switch: the task stops at once, its work is kept on its branch, and it goes on from there in the next pulse — not counted as a failure."))
+                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    // MARK: Projects
+
+    var projects: some View {
+        Form {
+            Section {
                 if m.listing.projects.isEmpty {
                     Text(L("עוד אין פרויקטים רשומים.", "No projects registered yet.")).foregroundStyle(.secondary)
                 }
                 ForEach(m.listing.projects) { p in
-                    row(p.name + ((p.exists ?? true) ? "" : L(" (לא נמצא)", " (not found)"))) {
-                        Toggle(L("הצעות", "Proposals"), isOn: Binding(get: { !(p.proposalsOff ?? false) },
-                                                                        set: { m.actions?.setProposals(project: p.path, name: p.name, on: $0) }))
-                            .toggleStyle(.switch).controlSize(.mini)
+                    Toggle(isOn: Binding(get: { !(p.proposalsOff ?? false) },
+                                         set: { m.actions?.setProposals(project: p.path, name: p.name, on: $0) })) {
+                        Label(p.name + ((p.exists ?? true) ? "" : L(" (לא נמצא)", " (not found)")), systemImage: "folder")
                     }
                     .help(p.path)
                 }
-
-                Divider().padding(.top, 4)
-                HStack(spacing: 8) {
-                    Button(L("עזרה", "Help")) { m.actions?.showHelp() }
-                    Spacer()
-                    Button(L("הסר את הקציר…", "Remove the harvest…")) { m.actions?.showSetup() }
-                        .help(L("פותח את חלון ההתקנה, ושם אפשר להסיר", "Opens the setup window, where it can be removed"))
-                }
+            } header: {
+                Text(L("הצעות מכל פרויקט", "Proposals per project"))
+            } footer: {
+                Text(L("כבוי = בלי הצעות מהפרויקט: ההצעות שלו יוסרו, וסוכנים לא יציעו בו חדשות. משימות שכבר בתור נשארות.",
+                       "Off = no proposals from the project: its proposals are removed and agents won't propose new ones. Queued tasks stay."))
+                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(20)
-        .frame(width: 460, alignment: .leading)
+        .formStyle(.grouped)
     }
 
-    var harvest: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            row(L("קציר אוטומטי", "Automatic harvest"),
-                L("יוצא לדרך \(m.config.leadHours) ש׳ לפני האיפוס השבועי", "Starts \(m.config.leadHours)h before the weekly reset")) {
-                HStack(spacing: 6) {
-                    Stepper("", value: Binding(get: { m.config.leadHours },
-                                               set: { var c = m.config; c.leadHours = min(24, max(1, $0)); m.actions?.setConfig(c) }),
-                            in: 1...24).labelsHidden()
-                    Toggle("", isOn: Binding(get: { m.config.auto }, set: { var c = m.config; c.auto = $0; m.actions?.setConfig(c) }))
-                        .toggleStyle(.switch).controlSize(.small).labelsHidden()
-                }
-            }
-            row(L("מודל לפי גודל משימה", "Model by task size"), L("קטנה · בינונית · גדולה", "small · medium · large")) {
-                HStack(spacing: 4) {
-                    ForEach(["low", "medium", "high"], id: \.self) { size in
-                        Picker("", selection: Binding(get: { s.models[size] ?? "" }, set: { value in
-                            s.models[size] = value
-                            let json = (try? JSONSerialization.data(withJSONObject: s.models)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-                            m.actions?.saveHarvestSettings(["models=" + json])
-                        })) {
-                            ForEach(Self.modelChoices + ((s.models[size]).map { Self.modelChoices.contains($0) ? [] : [$0] } ?? []), id: \.self) {
-                                Text($0).tag($0)
-                            }
+    // MARK: Texts
+
+    var texts: some View {
+        HStack(spacing: 0) {
+            List(selection: Binding(get: { Optional(s.promptName) }, set: { if let v = $0 { s.promptName = v; s.promptProblem = nil; s.promptSaved = false } })) {
+                ForEach(s.prompts) { p in
+                    HStack(spacing: 6) {
+                        Text(promptTitle(p.name))
+                        Spacer(minLength: 2)
+                        if p.custom || s.dirty(p) {
+                            Circle().fill(s.dirty(p) ? Color.orange : Color.accentColor).frame(width: 6, height: 6)
+                                .help(s.dirty(p) ? L("יש שינויים שלא נשמרו", "Unsaved changes") : L("מותאם אישית", "Customized"))
                         }
-                        .labelsHidden().fixedSize()
                     }
+                    .tag(p.name)
                 }
             }
-            field(L("השם שלך", "Your name"), $s.name)
-            field(L("תיקיית הקציר", "Harvest folder"), $s.workdir, path: true)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(L("סיכום שבועי במייל", "Weekly summary by email"))
-                HStack(spacing: 8) {
-                    TextField(L("כתובת מייל", "Email address"), text: $s.email).textFieldStyle(.roundedBorder)
-                        .environment(\.layoutDirection, .leftToRight)
-                    Toggle(L("שלח", "Send"), isOn: $s.digest).toggleStyle(.switch).controlSize(.mini)
-                        .disabled(s.email.trimmingCharacters(in: .whitespaces).isEmpty)
-                }
-            }
-            HStack(spacing: 8) {
-                Button(L("שמור", "Save")) {
-                    let email = s.email.trimmingCharacters(in: .whitespaces)
-                    m.actions?.saveHarvestSettings(["ownerName=" + s.name.trimmingCharacters(in: .whitespaces),
-                                                    "workdir=" + s.workdir.trimmingCharacters(in: .whitespaces),
-                                                    "email=" + email,
-                                                    "emailDigest=" + (s.digest && !email.isEmpty ? "yes" : "no")])
-                    s.saved = true
-                }
-                .buttonStyle(.borderedProminent)
-                if s.saved { Text(L("נשמר ✓", "Saved ✓")).foregroundStyle(.secondary) }
+            .listStyle(.sidebar)
+            .frame(width: 190)
+            Divider()
+            if let p = s.prompt {
+                editor(p)
+            } else {
+                Text(L("טוען…", "Loading…")).foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .onAppear { m.actions?.loadPrompts() }
+    }
+
+    func editor(_ p: HPrompt) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Text(promptTitle(p.name)).font(.system(size: 15, weight: .semibold))
+                if p.custom {
+                    Text(L("מותאם אישית", "Customized")).font(.system(size: 10, weight: .medium))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+            Text(promptNote(p.name)).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            TextEditor(text: Binding(get: { s.draft(p) }, set: { s.drafts[p.name] = $0; s.promptSaved = false; s.promptProblem = nil }))
+                .font(.system(size: 11.5, design: .monospaced))
+                .scrollContentBackground(.hidden)
+                .padding(6)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color(nsColor: .textBackgroundColor)))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.primary.opacity(0.12)))
+                .environment(\.layoutDirection, .leftToRight)
+            if !p.keeps.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(L("חייב להישאר בטקסט:", "Must stay in the text:")).font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text(p.keeps.joined(separator: "  ·  ")).font(.system(size: 10.5, design: .monospaced)).foregroundStyle(.secondary)
+                        .environment(\.layoutDirection, .leftToRight).frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            if let problem = s.promptProblem {
+                Label(problem, systemImage: "exclamationmark.triangle.fill").font(.system(size: 11)).foregroundStyle(.red)
+            }
+            HStack(spacing: 8) {
+                Button(L("שחזר ברירת מחדל", "Restore the default")) {
+                    s.drafts[p.name] = nil
+                    m.actions?.resetPrompt(p.name)
+                }
+                .disabled(!p.custom && !s.dirty(p))
+                Spacer()
+                if s.promptSaved { Text(L("נשמר ✓", "Saved ✓")).foregroundStyle(.secondary) }
+                Button(L("בטל שינויים", "Discard changes")) { s.drafts[p.name] = nil; s.promptProblem = nil }
+                    .disabled(!s.dirty(p))
+                Button(L("שמור", "Save")) { m.actions?.savePrompt(p.name, s.draft(p)) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!s.dirty(p))
+            }
+        }
+        .padding(16)
     }
 }
 
@@ -2837,9 +3268,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
 
         setupNotifications()
         holdOffAppNap()
+        // config.json follows the widget's schedule from the start: a file from before pulses (or none)
+        // would leave the engine's lead behind the pulses, and it would refuse their first run.
+        if FileManager.default.fileExists(atPath: harvestHome.path) { saveHarvestConfig(model.config) }
         makePanel()
+        // Until a poll comes back, the last saved figures (marked with their time) — a restart
+        // shouldn't blank the gauges, least of all while the sign-in is broken.
+        loadSavedUsage()
+        model.figuresFrom = savedUsageTime()
         refresh()
         refreshUserLine()
+        checkCLISignIn()
         runEngine(["maintain"]) { [weak self] _ in self?.refreshListing() }
         // The 30 s tick refreshes relative times, the harvest listing and the
         // automatic harvest trigger, and doubles as the poll watchdog:
@@ -2917,6 +3356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         autoHarvestTick()
         refreshNotificationPermission()
         nudgeTick()
+        signInTick()
     }
 
     /// The right-click menu — built only here, the same in both modes except that menu bar mode
@@ -3079,7 +3519,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         guard let button = statusItem?.button else { return }
         let gauges = statusGauges()
         let figures = gauges.map { "\($0.name) \(Int($0.pct.rounded()))%" }.joined(separator: " · ")
-        button.toolTip = gauges.isEmpty ? "Claude usage — waiting for data"
+        button.toolTip = model.signIn != nil ? L("Claude Code לא מחובר — לחץ לפרטים", "Claude Code isn't signed in — click for details")
+            : gauges.isEmpty ? "Claude usage — waiting for data"
             : "Claude usage — " + figures + (model.harvestActive ? L(" — קציר רץ", " — harvest running") : "")
         drawStatusImage(on: button)
         if model.harvestActive {
@@ -3100,7 +3541,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
 
     /// The status image at the reel's current angle, described for VoiceOver by the tooltip.
     func drawStatusImage(on button: NSStatusBarButton) {
-        button.image = menuBarImage(gauges: statusGauges().map { ($0.tag, $0.pct) }, reel: reelAngle)
+        button.image = menuBarImage(gauges: statusGauges().map { ($0.tag, $0.pct) }, reel: reelAngle,
+                                    alert: model.signIn != nil)
         button.image?.accessibilityDescription = button.toolTip
     }
 
@@ -3154,7 +3596,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
 
     func showStatusTip() {
         let tip = statusTip()
-        guard let last = lastSuccess else { model.dotTip = tip; return }
+        guard let last = lastSuccess ?? model.figuresFrom else { model.dotTip = tip; return }
         model.dotTip = L("\(tip) · עודכן \(formatTime(last, "HH:mm"))", "\(tip) · updated \(formatTime(last, "HH:mm"))")
     }
 
@@ -3199,6 +3641,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         writeUsageFile(usage)
         redrawStatusItem()
         lastSuccess = Date()
+        model.figuresFrom = nil
+        pollProblem = nil
+        updateSignIn()
         setStatus(.systemGreen, L("מחובר", "Connected"))
         updateAutoPlan()
         // Launched with a lapsed token, the profile fetch came back empty; now that a poll got
@@ -3211,9 +3656,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     func report(_ error: Error) -> PollPacing.Outcome {
         switch error {
         case PollFailure.signedOut:
-            setStatus(.systemRed, L("לא מחובר — הרץ claude כדי להתחבר", "Not signed in — run claude to sign in"))
+            setStatus(.systemRed, L("לא מחובר — \"התחבר\" בפאנל", "Not signed in — \"Sign in\" in the panel"))
+            pollProblem = .signedOut
+            updateSignIn()
         case PollFailure.status(let code) where code == 401 || code == 403:
-            setStatus(.systemRed, L("ההתחברות פגה — פתח את Claude Code", "Sign-in expired — open Claude Code"))
+            setStatus(.systemRed, L("ההתחברות פגה — \"התחבר\" בפאנל", "Sign-in expired — \"Sign in\" in the panel"))
+            pollProblem = .expired
+            updateSignIn()
         case PollFailure.throttled(let retryAfter):
             setStatus(.systemYellow, L("מושהה — Claude ביקש להאט", "Paused — Claude asked to slow down"))
             return .throttled(retryAfter: retryAfter)
@@ -3221,6 +3670,137 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             setStatus(.systemYellow, L("אין חיבור ל-Claude — מנסה שוב", "Can't reach Claude — trying again"))
         }
         return .failed
+    }
+
+    // MARK: Sign-in
+
+    /// What the last poll said about the sign-in (nil after one got through).
+    var pollProblem: SignInProblem?
+    /// `claude auth status`: the harvest runs the Claude Code command line, which can be signed out
+    /// while the widget still reads the figures (or the other way round). Nil until checked.
+    var cliSignedIn: Bool?
+    var cliMissing = false
+    var cliCheckedAt = Date.distantPast
+    var cliChecking = false
+    /// After "Sign in": checked every 30 s for 15 minutes, so the panel clears as soon as it's done.
+    var signInWatchUntil = Date.distantPast
+
+    func updateSignIn() {
+        let problem: SignInProblem? = cliMissing ? .notInstalled
+            : pollProblem ?? (cliSignedIn == false ? .signedOut : nil)
+        guard problem != model.signIn else { return }
+        let wasFine = model.signIn == nil
+        model.signIn = problem
+        redrawStatusItem()
+        updateAutoPlan()
+        if problem == nil {
+            signInWatchUntil = .distantPast
+        } else if wasFine {
+            notifySignIn()
+        }
+    }
+
+    /// One notification per sign-out (and not more than twice a day) — clicking it starts signing in.
+    func notifySignIn() {
+        let d = UserDefaults.standard, now = Date().timeIntervalSince1970
+        guard now - d.double(forKey: "SignInNotifiedAt") > 12 * 3600 else { return }
+        d.set(now, forKey: "SignInNotifiedAt")
+        notify(title: L("קציר מכסה", "Quota harvest"),
+               body: L("Claude Code לא מחובר — בלי זה אין מדדים והקציר לא ירוץ. לחץ כדי להתחבר.",
+                       "Claude Code isn't signed in — without it there are no figures and the harvest won't run. Click to sign in."),
+               category: "signin", id: "signin")
+    }
+
+    /// `claude auth status --json` → loggedIn, off the main thread; at most one at a time.
+    func checkCLISignIn() {
+        guard !cliChecking else { return }
+        guard let claude = claudeExecutable() else {
+            cliMissing = true
+            updateSignIn()
+            return
+        }
+        cliMissing = false
+        cliChecking = true
+        cliCheckedAt = Date()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: claude)
+            p.arguments = ["auth", "status", "--json"]
+            var env = harvestEnvironment(unattended: false)
+            for key in env.keys where key.hasPrefix("CLAUDE") || key.hasPrefix("MCP_") || key == "ANTHROPIC_BASE_URL" {
+                env.removeValue(forKey: key)
+            }
+            p.environment = env
+            let out = Pipe()
+            p.standardOutput = out
+            p.standardError = FileHandle.nullDevice
+            var signedIn: Bool?
+            if (try? p.run()) != nil {
+                let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 20, execute: watchdog)
+                let data = out.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                watchdog.cancel()
+                signedIn = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["loggedIn"] as? Bool
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.cliChecking = false
+                let cameBack = self.cliSignedIn == false && signedIn == true
+                if signedIn != nil { self.cliSignedIn = signedIn }
+                self.updateSignIn()
+                // Signed in again: fetch the figures now rather than at the next scheduled poll.
+                if cameBack || (signedIn == true && self.pollProblem != nil) { self.refresh(manual: true) }
+            }
+        }
+    }
+
+    /// Every 30 min (every 30 s while waiting for a sign-in the owner started).
+    func signInTick() {
+        let every: TimeInterval = Date() < signInWatchUntil ? 30 : 30 * 60
+        if -cliCheckedAt.timeIntervalSinceNow >= every { checkCLISignIn() }
+    }
+
+    /// "Sign in": `claude auth login` in a Terminal window (it opens the browser), or Claude Code's
+    /// page when it isn't installed.
+    func startSignIn() {
+        if statusItem != nil { panel.orderOut(nil) }
+        guard let claude = claudeExecutable() else {
+            if let url = URL(string: "https://claude.com/claude-code") { NSWorkspace.shared.open(url) }
+            signInWatchUntil = Date().addingTimeInterval(15 * 60)
+            return
+        }
+        let script = FileManager.default.temporaryDirectory.appendingPathComponent("quota-harvest-sign-in.command")
+        let quoted = shellQuoted(claude)
+        let body = """
+        #!/bin/zsh
+        unset ANTHROPIC_BASE_URL
+        clear
+        echo \(shellQuoted(L("מתחבר ל-Claude Code — ההתחברות תיפתח בדפדפן.", "Signing in to Claude Code — it continues in your browser.")))
+        echo
+        \(quoted) auth login
+        echo
+        \(quoted) auth status --text
+        echo
+        echo \(shellQuoted(L("אפשר לסגור את החלון. הווידג'ט יזהה את החיבור תוך חצי דקה.", "You can close this window. The widget notices within half a minute.")))
+
+        """
+        try? body.write(to: script, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
+        NSWorkspace.shared.open(script)
+        signInWatchUntil = Date().addingTimeInterval(15 * 60)
+    }
+
+    func recheckSignIn() {
+        checkCLISignIn()
+        refresh(manual: true)
+    }
+
+    /// When the figures in usage.json were fetched.
+    func savedUsageTime() -> Date? {
+        guard let data = try? Data(contentsOf: harvestHome.appendingPathComponent("usage.json")),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return parseDate(obj["fetchedAt"])
     }
 
     // MARK: Harvest
@@ -3302,6 +3882,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     func launchHarvest(mode: String, only: [HTask]) {
         guard !runner.isRunning, !model.harvestActive else { flash(L("קציר כבר רץ", "A harvest is already running")); return }
         guard claudeExecutable() != nil else { flash(L("לא נמצא claude במחשב", "claude isn't installed on this Mac")); return }
+        guard model.signIn == nil else {
+            flash(L("Claude Code לא מחובר — \"התחבר\" למעלה, ואז שוב", "Claude Code isn't signed in — \"Sign in\" above, then again"))
+            return
+        }
         model.running = true
         redrawStatusItem()
         runEngine(["maintain"]) { [weak self] _ in
@@ -3426,26 +4010,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     func harvestCycle(_ reset: Date) -> Int { Int((reset.timeIntervalSince1970 / 3600).rounded()) }
 
     /// When the automatic harvest starts next, and whether that is now — the one
-    /// place for the rules, used by the trigger and by the footer's countdown:
-    /// once per weekly cycle when the window opens (lead hours before the reset,
-    /// until 20 min before it), again after each 5-hour reset while the last run
-    /// stopped on a full window and the queue still has work (4 runs at most),
-    /// otherwise next week's window.
+    /// place for the rules, used by the trigger and by the footer's countdown.
+    /// The harvest is a chain of pulses, one 5-hour window each: the first starts
+    /// pulses × 5 h (+ 30 min) before the weekly reset — once per weekly cycle,
+    /// until 20 min before the reset —, each next one once the 5-hour window the
+    /// last run filled has reset, while the queue still has work. The number of
+    /// pulses is fixed when the cycle's first one starts. Otherwise: next week.
     func autoHarvestPlan() -> (next: Date, due: Bool, followUp: Bool)? {
         guard model.config.auto, let raw = model.weekly?.resetsAt else { return nil }
         let reset = Date(timeIntervalSince1970: (raw.timeIntervalSince1970 / 60).rounded() * 60)
         let now = Date()
-        let start = reset.addingTimeInterval(-Double(model.config.leadHours) * 3600)
+        let d = UserDefaults.standard
+        let inCycle = d.integer(forKey: "HarvestCycle") == harvestCycle(raw)
+        let pulses = inCycle ? max(1, d.integer(forKey: "HarvestCyclePulses")) : model.harvestWindows
+        let start = reset.addingTimeInterval(-(Double(pulses) * 5 + 0.5) * 3600)
         let cutoff = reset.addingTimeInterval(-20 * 60)
         let nextWeek = start.addingTimeInterval(7 * 24 * 3600)
-        if now < start { return (start, false, false) }
+        if now < start && !inCycle { return (start, false, false) }
         if now >= cutoff { return (nextWeek, false, false) }
-        let d = UserDefaults.standard
-        if d.integer(forKey: "HarvestCycle") != harvestCycle(raw) { return (now, true, false) }
-        if d.integer(forKey: "HarvestCycleRuns") < 4,
+        if !inCycle { return (now, true, false) }
+        if d.integer(forKey: "HarvestCycleRuns") < pulses,
            model.listing.status?.lastRun?.stopReason == "5h-full",
            !model.listing.queue.isEmpty {
-            let after = Date(timeIntervalSince1970: d.double(forKey: "HarvestLastSessionReset") + 60)
+            var after = Date(timeIntervalSince1970: d.double(forKey: "HarvestLastSessionReset") + 60)
+            // A limit a session ran into holds until the engine says it lifts.
+            if let until = parseDate(model.listing.status?.limits?["five"]?.until) {
+                after = max(after, until.addingTimeInterval(60))
+            }
             if after < cutoff { return (max(after, now), after <= now, true) }
         }
         return (nextWeek, false, false)
@@ -3453,7 +4044,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
 
     /// Launches the automatic harvest when its plan says it's due — on fresh numbers only.
     func autoHarvestTick() {
-        guard model.harvestInstalled, !runner.isRunning, !model.harvestActive, let raw = model.weekly?.resetsAt,
+        guard model.harvestInstalled, model.signIn == nil, !runner.isRunning, !model.harvestActive, let raw = model.weekly?.resetsAt,
               let fresh = lastSuccess, -fresh.timeIntervalSinceNow < 15 * 60,
               let plan = autoHarvestPlan(), plan.due else { return }
         let d = UserDefaults.standard
@@ -3462,6 +4053,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         } else {
             d.set(harvestCycle(raw), forKey: "HarvestCycle")
             d.set(1, forKey: "HarvestCycleRuns")
+            d.set(model.harvestWindows, forKey: "HarvestCyclePulses")
         }
         launchHarvest(mode: "auto", only: [])
     }
@@ -3474,7 +4066,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         } else if let plan = autoHarvestPlan() {
             let fresh = lastSuccess.map { -$0.timeIntervalSinceNow < 15 * 60 } ?? false
             if plan.due {
-                note = fresh ? L("מתחיל עכשיו", "starting now") : L("ממתין לנתוני מכסה", "waiting for quota data")
+                note = fresh ? L("מתחיל עכשיו", "starting now")
+                    : model.signIn != nil ? L("לא יתחיל — Claude Code לא מחובר", "won't start — Claude Code isn't signed in")
+                    : L("ממתין לנתוני מכסה", "waiting for quota data")
             } else {
                 next = plan.next
             }
@@ -3558,21 +4152,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         setupWindow?.makeKeyAndOrderFront(nil)
     }
 
-    /// ⋯ → "הגדרות…": one window, reused, filled from the latest listing.
+    /// ⋯ → "הגדרות…": one window, reused, filled from the latest listing. Tabs in the macOS way:
+    /// the window is titled after the open tab and takes on its size.
     func showSettings() {
         if statusItem != nil { panel.orderOut(nil) }
         settingsModel.load(model.listing.settings)
         if settingsWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 620),
-                                  styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                                  backing: .buffered, defer: false)
+            let host = NSHostingController(rootView: SettingsView(m: model, s: settingsModel))
+            host.sizingOptions = [.preferredContentSize]
+            let window = NSWindow(contentViewController: host)
+            window.styleMask = [.titled, .closable, .miniaturizable]
+            window.titlebarSeparatorStyle = .none
+            window.toolbarStyle = .preference
             window.isReleasedWhenClosed = false
-            window.contentView = NSHostingView(rootView: SettingsView(m: model, s: settingsModel))
-            window.contentMinSize = NSSize(width: 460, height: 300)
             window.center()
             settingsWindow = window
+            settingsModel.onTab = { [weak self] tab in self?.settingsWindow?.title = tab.title }
         }
-        settingsWindow?.title = L("הגדרות — קציר מכסה", "Settings — Quota harvest")
+        settingsWindow?.title = settingsModel.tab.title
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
         refreshListing()
@@ -3580,6 +4177,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
 
     func saveHarvestSettings(_ values: [String]) {
         runEngine(["settings"] + values.flatMap { ["--set", $0] }) { [weak self] _ in self?.refreshListing() }
+    }
+
+    /// Settings → Texts: the harvest's texts from the engine (default, in force, what must stay).
+    func loadPrompts() {
+        runEngine(["prompts"]) { [weak self] data in self?.takePrompts(data) }
+    }
+
+    func takePrompts(_ data: Data?) {
+        guard let data = data else { return }
+        if let list = try? JSONDecoder().decode(HPrompts.self, from: data) {
+            settingsModel.prompts = list.prompts
+            return
+        }
+        // A refusal: {"ok": false, "error": …, "missing": [...]}.
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        if let missing = obj?["missing"] as? [String], !missing.isEmpty {
+            settingsModel.promptProblem = L("לא נשמר — חסר בטקסט: ", "Not saved — the text lacks: ") + missing.joined(separator: ", ")
+        } else if let error = obj?["error"] as? String {
+            settingsModel.promptProblem = error
+        }
+    }
+
+    func savePrompt(_ name: String, _ text: String) {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("harvest-prompt-\(UUID().uuidString).md")
+        guard (try? text.write(to: file, atomically: true, encoding: .utf8)) != nil else { return }
+        settingsModel.promptProblem = nil
+        runEngine(["prompts", "--set", name, "--file", file.path]) { [weak self] data in
+            try? FileManager.default.removeItem(at: file)
+            guard let self else { return }
+            let before = self.settingsModel.promptProblem
+            self.takePrompts(data)
+            if self.settingsModel.promptProblem == before {
+                self.settingsModel.drafts[name] = nil
+                self.settingsModel.promptSaved = true
+            }
+        }
+    }
+
+    func resetPrompt(_ name: String) {
+        settingsModel.promptProblem = nil
+        runEngine(["prompts", "--reset", name]) { [weak self] data in
+            self?.takePrompts(data)
+            self?.settingsModel.promptSaved = false
+        }
     }
 
     /// The language of the widget, the reports and the notifications. With the harvest installed it
@@ -3760,7 +4401,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         let category = response.notification.request.content.categoryIdentifier
         let action = response.actionIdentifier
         DispatchQueue.main.async { [weak self] in
-            if category == "waiting" {
+            if category == "signin" {
+                if action != UNNotificationDismissActionIdentifier { self?.startSignIn() }
+            } else if category == "waiting" {
                 if action == "later" {
                     UserDefaults.standard.set(Date().addingTimeInterval(24 * 3600).timeIntervalSince1970,
                                               forKey: "NudgeSnoozeUntil")
@@ -3953,9 +4596,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     func snapshotMenuBar(to path: String) {
         forceSnapshotLanguage()
         loadSavedUsage()
-        let rows: [[(tag: String, pct: Double)]] = [
-            statusGauges().map { ($0.tag, $0.pct) },
-            [("S", 76), ("W", 93), ("F", 0)],
+        // The third row: signed out — the same gauges with the red "!".
+        let rows: [(gauges: [(tag: String, pct: Double)], alert: Bool)] = [
+            (statusGauges().map { ($0.tag, $0.pct) }, false),
+            ([("S", 76), ("W", 93), ("F", 0)], false),
+            (statusGauges().map { ($0.tag, $0.pct) }, true),
         ]
         let size = NSSize(width: 2 * 110, height: CGFloat(rows.count) * 26)
         guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width * 2),
@@ -3970,8 +4615,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             NSAppearance(named: name)?.performAsCurrentDrawingAppearance {
                 NSColor(white: col == 0 ? 0.93 : 0.17, alpha: 1).setFill()
                 NSRect(x: CGFloat(col) * 110, y: 0, width: 110, height: size.height).fill()
-                for (i, gauges) in rows.enumerated() {
-                    menuBarImage(gauges: gauges, reel: 0.3).draw(
+                for (i, row) in rows.enumerated() {
+                    menuBarImage(gauges: row.gauges, reel: 0.3, alert: row.alert).draw(
                         at: NSPoint(x: CGFloat(col) * 110 + 8, y: size.height - CGFloat(i + 1) * 26 + 4),
                         from: .zero, operation: .sourceOver, fraction: 1)
                 }
@@ -4000,19 +4645,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         }
     }
 
-    /// `--snapshot-settings <png> [--light] [--he|--en]`: the settings window, unscrolled, from the
-    /// current listing — and exits.
+    /// `--snapshot-settings <png> [--tab general|harvest|models|projects|texts] [--light] [--he|--en]`:
+    /// one tab of the settings window, from the current listing — and exits.
     func snapshotSettings(to path: String) {
         let args = CommandLine.arguments
         if args.contains("--he") { uiHebrew = true; uiLanguageForced = true } else if args.contains("--en") { uiHebrew = false; uiLanguageForced = true }
         model.harvestInstalled = FileManager.default.fileExists(atPath: harvestEngine.path)
         model.startAtLogin = FileManager.default.fileExists(atPath: loginAgentPlist.path)
         model.inMenuBar = UserDefaults.standard.bool(forKey: inMenuBarDefaultsKey)
+        if let i = args.firstIndex(of: "--tab"), i + 1 < args.count, let tab = SettingsTab(rawValue: args[i + 1]) {
+            settingsModel.tab = tab
+        }
         runEngine(["list"]) { data in
             if let data = data, let listing = try? JSONDecoder().decode(HListing.self, from: data) { self.model.listing = listing }
             self.settingsModel.load(self.model.listing.settings)
-            self.renderSnapshot(NSHostingView(rootView: SettingsView(m: self.model, s: self.settingsModel, scrolls: false)
-                .background(Color(nsColor: .windowBackgroundColor))), width: 460, to: path)
+            runEngine(["prompts"]) { data in
+                self.takePrompts(data)
+                self.renderSnapshot(NSHostingView(rootView: SettingsView(m: self.model, s: self.settingsModel)
+                    .background(Color(nsColor: .windowBackgroundColor))), width: SettingsView.width, to: path)
+            }
         }
     }
 
@@ -4081,6 +4732,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     func snapshot(to path: String, expandAll: Bool) {
         forceSnapshotLanguage()
         loadSavedUsage()
+        // --signed-out: the panel as it looks when Claude Code isn't signed in.
+        if CommandLine.arguments.contains("--signed-out") {
+            model.signIn = .signedOut
+            model.figuresFrom = savedUsageTime()
+        }
         model.harvestInstalled = FileManager.default.fileExists(atPath: harvestEngine.path)
             && !CommandLine.arguments.contains("--not-installed")
         model.dotColor = .systemGreen

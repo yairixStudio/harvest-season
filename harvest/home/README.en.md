@@ -8,10 +8,10 @@ Spends Claude Code plan quota that would otherwise vanish at the weekly reset on
 After the install, in the setup window: **"Start the getting-started conversation"** — a live session in the Claude app ("Harvest · getting started", `claude-harvest talk --topic onboard`) that finds the projects you worked on with Claude Code (`claude-harvest discover`), asks which ones to work on, reads them without touching them, and records up to 3 first tasks per project — as proposals, which you approve with their switch.
 
 ## The idea in one line
-There is one queue. It runs by itself a few hours before the weekly reset (you choose how many, with the slider), or right away at a click.
+There is one queue. It runs by itself before the weekly reset, in pulses of one 5-hour window each (you choose how many, or "Auto"), or right away at a click.
 
 ## Where it lives
-- **The menu bar widget** (the `quota-harvest` repository) — the interface: usage bars, **Queue** / **Proposals** / **Waiting for you**, the slider, "Run now", "Stop". Opens at login.
+- **The menu bar widget** (the `quota-harvest` repository) — the interface: usage bars, **Queue** / **Proposals** / **Waiting for you**, the pulses, "Run now", "Stop". Opens at login.
 - **The engine** `bin/harvest.py` (on the command line: `claude-harvest`) — every deterministic step: reading and editing `BACKLOG.md`, budget, task choice, git worktrees and branches, calibration, status, the lock and recovery after a stop. Tests: `python3 bin/test_harvest.py`.
 - **The skills** in `~/.claude/skills/`: `harvest-quota` (the harvest itself), `backlog` (recording tasks), `check-usage` (checking quota).
 - **`~/.claude/CLAUDE.md`** and **`~/.codex/AGENTS.md`** — every Claude session, and Codex too, knows how to record tasks in the backlog.
@@ -19,7 +19,7 @@ There is one queue. It runs by itself a few hours before the weekly reset (you c
 ## How a harvest runs
 1. The widget starts a coordinating session ("Quota harvest · …" in the harvest folder) — an interactive Claude Code session in a hidden terminal (`claude-harvest launch`, in the harvest folder — `workdir` in the settings), published through Remote Control — **you can watch it live in the Claude app and on your phone**, and write to it. The Mac stays awake until it ends.
 2. The agent asks the engine: what is queued, how much quota is left, what fits. A task that can't finish before the reset doesn't start.
-3. Each task: **its own session inside its own project**, named "Harvest · <task title>" — it appears in the app under that project, with the project's CLAUDE.md and memory. It works in a worktree inside the project, on its own `backlog/<slug>` branch. The model follows the complexity (low → Sonnet, medium → Opus, high → Fable; when the Fable quota is full → Opus; change it with `models` in the settings). No push, no merge.
+3. Each task: **its own session inside its own project**, named "Harvest · <task title>" — it appears in the app under that project, with the project's CLAUDE.md and memory. It works in a worktree inside the project, on its own `backlog/<slug>` branch. The model follows the complexity (low → Sonnet, medium → Opus, high → Fable; from 85 % of Fable's own quota → Opus; change them in Settings → Models). When a model's own quota runs out mid-task, the session goes on with the fallback model; when the shared 5-hour or weekly limit does, the task stops, its work stays on its branch (a WIP commit) and the next attempt goes on from there — a pause, not a failure. No push, no merge.
 4. At the end: a report in `reports/`, and the task moves to "Waiting for you". An automatic run sends one summary email a week — only when an email is set up (`emailDigest`).
 
 ## Watching
@@ -35,7 +35,7 @@ There is one queue. It runs by itself a few hours before the weekly reset (you c
 - A branch untouched for 35 days moves to `backlog-archive/*` (not deleted).
 
 ## Settings
-`settings.json` — the owner's name, language (`he` / `en`), email and `emailDigest`, the harvest folder (`workdir`) and a model per complexity (`models`). The installer writes it; to see or change it: `claude-harvest settings [--set key=value]` (an automatic run can't change it).
+`settings.json` — the owner's name, language (`he` / `en`), email and `emailDigest`, the harvest folder (`workdir`) a model per complexity (`models`), the fallbacks (`fallback`: `{"fable": {"to": "opus", "atPct": 85}}`), `switchMidTask`, and the points left free (`fiveReserve`, `weeklyReserve`). The texts the harvest gives its agents can be rewritten in Settings → Texts (`claude-harvest prompts`); the owner's versions live in `prompts/` and win over the defaults. The installer writes it; to see or change it: `claude-harvest settings [--set key=value]` (an automatic run can't change it).
 
 ## Files here (one writer each)
 - `settings.json` — the settings (above). `install-manifest.json` — what the installer wrote, with a hash per file. `backups/` — a copy of everything the installer replaced.
