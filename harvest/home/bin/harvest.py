@@ -233,6 +233,41 @@ def git(repo, *args):
     return subprocess.run(["git", "-C", repo] + list(args), capture_output=True, text=True)
 
 
+def checked_out_at(repo, branch):
+    """The worktree (the project's own checkout included) that has this branch out, or None."""
+    path = None
+    for line in git(repo, "worktree", "list", "--porcelain").stdout.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line == "branch refs/heads/" + branch:
+            return path
+    return None
+
+
+def move_branch(repo, branch, target):
+    """Renames a harvest branch without git's reflog. A project kept in iCloud Drive can have git's own files
+    evicted ("dataless"); `git branch -m` then fails half-way when it appends to the reflog — the branch stays,
+    its log has already moved (seen 2026-10-07). So: both names' reflogs go (a harvest branch's isn't worth
+    keeping; its commits stay), the new ref is created only if it doesn't exist, then the old one is deleted.
+    The caller makes sure no worktree has the branch out. Returns git's complaint, or None."""
+    sha = git(repo, "rev-parse", "--verify", "--quiet", "refs/heads/" + branch).stdout.strip()
+    if not sha:
+        return "no branch " + branch
+    for name in (branch, target):
+        log = git(repo, "rev-parse", "--git-path", "logs/refs/heads/" + name).stdout.strip()
+        if log:
+            try:
+                os.remove(log if os.path.isabs(log) else os.path.join(repo, log))
+            except OSError:
+                pass
+    quiet = ("-c", "core.logAllRefUpdates=false")
+    for step in (("update-ref", "refs/heads/" + target, sha, ""), ("update-ref", "-d", "refs/heads/" + branch, sha)):
+        r = git(repo, *(quiet + step))
+        if r.returncode != 0:
+            return (r.stderr or r.stdout).strip() or "git " + step[0] + " failed"
+    return None
+
+
 def is_git(repo):
     return os.path.isdir(repo) and git(repo, "rev-parse", "--git-dir").returncode == 0
 
@@ -1437,7 +1472,7 @@ def cmd_maintain(a):
                 remove_worktree(repo, path)
                 if ahead:
                     target = "backlog-stopped/%s-%s" % (slug, today())
-                    git(repo, "branch", "-m", branch, target)
+                    move_branch(repo, branch, target)
                     entry["kept"] = target
                 else:
                     git(repo, "branch", "-D", branch)
@@ -1452,7 +1487,7 @@ def cmd_maintain(a):
     for t in tasks:
         if t["status"] == "done" and t.get("branchState") == "unmerged" and t.get("ageDays", 0) >= ARCHIVE_AFTER_DAYS:
             target = t["branch"].replace("backlog/", "backlog-archive/", 1)
-            if git(t["project"], "branch", "-m", t["branch"], target).returncode == 0:
+            if not checked_out_at(t["project"], t["branch"]) and move_branch(t["project"], t["branch"], target) is None:
                 set_fields(t["project"], t["title"], {"result": t["result"].replace(t["branch"], target) + " · archived " + today()})
                 report["archived"].append({"project": t["project"], "title": t["title"], "branch": target})
     report["relocated"] = relocate_missing()
@@ -1881,15 +1916,16 @@ def reject_task(repo, title, reason, r=None):
     branch = v.get("branch") or (found.group(1) if found else None)
     archived = None
     if branch and branch.startswith("backlog/") and branch_exists(repo, branch):
-        if git(repo, "branch", "--show-current").stdout.strip() == branch:
-            raise Refused("the branch is checked out in the project — switch back to %s first" % base_branch(repo),
-                          branch=branch, inTheWay="checkout-branch")
+        where = checked_out_at(repo, branch)
+        if where:
+            raise Refused("the branch is checked out in %s — switch it back to %s first" % (where, base_branch(repo)),
+                          branch=branch, inTheWay="checkout-branch", worktree=where)
         archived = branch.replace("backlog/", "backlog-archive/", 1)
         if branch_exists(repo, archived):
             archived += "-" + today()
-        mv = git(repo, "branch", "-m", branch, archived)
-        if mv.returncode != 0:
-            raise Refused("could not archive the branch: " + (mv.stderr or mv.stdout).strip()[:300], branch=branch)
+        problem = move_branch(repo, branch, archived)
+        if problem:
+            raise Refused("could not archive the branch: " + problem[:300], branch=branch)
         result = result.replace(branch, archived)
     note = tr("rejected", today()) + (" · " + " ".join(reason.split()) if reason else "")
     write_fields(repo, lines, t, {"status": "dropped", "result": note + (" · " + result if result else "")})

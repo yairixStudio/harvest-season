@@ -307,6 +307,25 @@ class Harvest(unittest.TestCase):
         self.assertIn("backlog-archive/rename-the-helper", task["result"])
         self.run_engine("reject", self.repo, "Rename the helper", code=2)  # nothing waits any more
 
+    def test_rejecting_survives_a_half_done_rename_and_respects_worktrees(self):
+        branch = self.finished_branch("Tidy the docs")
+        logs = os.path.join(self.repo, ".git", "logs", "refs", "heads")
+        # What a failed `git branch -m` in iCloud Drive left behind: the reflog already moved, the branch not.
+        os.makedirs(os.path.join(logs, "backlog-archive"), exist_ok=True)
+        os.rename(os.path.join(logs, branch), os.path.join(logs, "backlog-archive", "tidy-the-docs"))
+        wt = os.path.join(self.tmp, "review")
+        subprocess.run(["git", "-C", self.repo, "worktree", "add", "-q", wt, branch], check=True)
+        out = self.run_engine("reject", self.repo, "Tidy the docs", code=2)
+        self.assertEqual((out["inTheWay"], os.path.realpath(out["worktree"])), ("checkout-branch", os.path.realpath(wt)))
+        subprocess.run(["git", "-C", self.repo, "worktree", "remove", wt], check=True)
+        out = self.run_engine("reject", self.repo, "Tidy the docs")
+        self.assertEqual(out["archivedBranch"], "backlog-archive/tidy-the-docs")
+        refs = subprocess.run(["git", "-C", self.repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+                              capture_output=True, text=True).stdout.split()
+        self.assertEqual(sorted(refs), ["backlog-archive/tidy-the-docs", "main"])
+        self.assertEqual(subprocess.run(["git", "-C", self.repo, "log", "-1", "--format=%s", "backlog-archive/tidy-the-docs"],
+                                        capture_output=True, text=True).stdout.strip(), "edit added.txt")
+
     def test_the_owner_rejects_a_blocked_task(self):
         self.add("Pick a license")
         self.run_engine("set-status", self.repo, "Pick a license", "blocked", "--result", "2026-10-01 · MIT or GPL?")

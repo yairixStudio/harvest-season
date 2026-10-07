@@ -166,9 +166,11 @@ open or a harvest runs, else every 2 min):
   field, "דחה" (red) and "ביטול". "דחה" sends `reject <project> <title> [--reason "<chips, words>"]` at
   once and takes the task off the lists — it becomes `dropped` (result: "<date> · rejected by the owner ·
   reason · the old result"), an unmerged `backlog/*` branch is renamed to `backlog-archive/*` (kept, never
-  merged, never deleted). Under the list, beside "לשיחה עם קלוד", "דחה הכל" opens the same form for every
+  merged, never deleted) by `move_branch`: `update-ref` without the reflog, not `git branch -m` — in a project
+  kept in iCloud Drive git's own files can be evicted ("dataless"), and `branch -m` failed half-way appending
+  to the reflog (a "fatal" the owner hit twice on 2026-10-07). The same helper archives in `maintain`. Under the list, beside "לשיחה עם קלוד", "דחה הכל" opens the same form for every
   waiting task (`reject --all`, each on its own: one refusal doesn't stop the rest). The engine refuses
-  while a branch is checked out (`inTheWay: checkout-branch`) and in unattended runs; a refusal shows as a
+  while a branch is checked out in any worktree (`inTheWay: checkout-branch`, with `worktree`) and in unattended runs; a refusal shows as a
   line under the list (and in the all-tasks window's details) with the reason, until dismissed or the next
   try, and the task comes back. One form open at a time (`WidgetModel.rejecting`: a task id or "all");
   opening the panel closes it. The talk session's prompt uses the same command for "don't merge".

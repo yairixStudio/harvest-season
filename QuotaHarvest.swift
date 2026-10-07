@@ -5086,7 +5086,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         runEngine(args) { [weak self] data in
             guard let self else { return }
             let reply = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-            if reply?["ok"] as? Bool != true { self.model.rejectProblem = self.notRejected(task.title, reply) }
+            if reply?["ok"] as? Bool != true { self.model.rejectProblem = self.notRejected(task.title, task.project, reply) }
             self.refreshListing()
         }
     }
@@ -5107,16 +5107,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             let reply = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             if reply?["ok"] as? Bool != true {
                 let refused = reply?["refused"] as? [[String: Any]] ?? []
-                self.model.rejectProblem = refused.isEmpty ? self.notRejected(nil, reply)
-                    : refused.map { self.notRejected($0["title"] as? String, $0) }.joined(separator: "\n")
+                self.model.rejectProblem = refused.isEmpty ? self.notRejected(nil, nil, reply)
+                    : refused.map { self.notRejected($0["title"] as? String, $0["project"] as? String, $0) }.joined(separator: "\n")
             }
             self.refreshListing()
         }
     }
 
-    func notRejected(_ title: String?, _ reply: [String: Any]?) -> String {
+    func notRejected(_ title: String?, _ project: String?, _ reply: [String: Any]?) -> String {
         let what = title.map { L("\"\($0)\" לא נדחתה: ", "\"\($0)\" wasn't rejected: ") } ?? L("הדחייה לא עברה: ", "Rejecting didn't go through: ")
         if reply?["inTheWay"] as? String == "checkout-branch" {
+            if let tree = reply?["worktree"] as? String, let project = project,
+               URL(fileURLWithPath: tree).standardizedFileURL != URL(fileURLWithPath: project).standardizedFileURL {
+                return what + L("הענף שלה פתוח בעותק עבודה אחר (\(tree)) — סגור אותו או החזר אותו לענף הראשי, ונסה שוב.",
+                                "its branch is checked out in another worktree (\(tree)) — close it or switch it back to the main branch, and try again.")
+            }
             return what + L("הענף שלה פתוח עכשיו בפרויקט — חזור לענף הראשי ונסה שוב.",
                             "its branch is checked out in the project — switch back to the main branch and try again.")
         }
