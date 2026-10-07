@@ -85,7 +85,8 @@ BACKLOG.md itself. Files under `~/.claude/harvest/`, one writer each:
 - `usage.json` — written by the widget after every successful poll (the engine
   budgets from it; older than 15 min = unreadable). An inactive 5-hour window is
   written as null and read as 0 %.
-- `config.json` — written by the widget: `auto` (bool), `pulses` (0 = automatic, 1–6) and `leadHours`
+- `config.json` — written by the widget: `auto` (bool), `pulses` (0 = automatic, 1–6), `batteryGuard` (bool,
+  default true) and `minBattery` (5–80, default 10), and `leadHours`
   (pulses × 5 + 1, automatic counting as 6 — the engine refuses an auto run started earlier than that).
   A file from before pulses (`leadHours` only) reads as ⌈leadHours / 5⌉ pulses.
 - `status.json`, `calibration.md`, `history.jsonl`, `launch.json`, `.lock`,
@@ -216,7 +217,12 @@ cycle (cycle id = reset time rounded to the hour, since the API's reset time jit
 the number of pulses is fixed then, `HarvestCyclePulses`), and again after each 5-hour reset while the last
 run stopped with `5h-full` and the queue isn't empty (at most that many runs per cycle). The next pulse waits
 for `HarvestLastSessionReset` (the 5-hour reset known when the run ended) and for `status.limits.five.until`
-(a 5-hour limit a session ran into), whichever is later.
+(a 5-hour limit a session ran into), whichever is later. A run that ended `interrupted` (the Mac slept, the
+session stalled) — unless the owner pressed Stop during it (`HarvestStoppedAt`) — is resumed at once while the
+queue has work and the reset is over 20 min away, at most twice a cycle (`HarvestCycleRetries`, not counted as
+pulses), with a notification. The battery guard (`batteryGuard`, on by default) holds an automatic start while the
+Mac runs on battery at or below `minBattery` % (`powerState`, IOKit): the footer says "ממתין לחשמל — הסוללה על
+N%" and one notification per cycle asks to plug in. "Run now" is never held.
 
 Usage limits mid-run (engine, `run_session`): Claude Code writes a limit it hits into the session's transcript
 (a synthetic assistant message, `isApiErrorMessage`, `error: "rate_limit"`: "You've hit your session limit…",
@@ -258,7 +264,8 @@ when installed, else in the widget's `UILanguage` default; the panel, menus and 
 at once), start at login, menu bar mode (these two moved here from the ⋯ menu). **Harvest**
 (installed) — automatic runs, pulses (`PulsesPicker`, `config.json`), the next harvest and the capacity, and
 "kept free for you": the 5-hour reserve (0–60, step 5) and the weekly one (0–30), `settings --set
-fiveReserve=… / weeklyReserve=…` on each step. **Models** — a model per task size (`settings --set models=…`),
+fiveReserve=… / weeklyReserve=…` on each step — and "Battery": "Don't start on a low battery" (`batteryGuard`) and
+"Starts only above N % or when the Mac is plugged in" (5–80, step 5). **Models** — a model per task size (`settings --set models=…`),
 and for the model with its own weekly quota (`scopedLabel`, Fable): the percent it gives way at (50–100, step
 5), the model it gives way to or "None — the tasks wait for the reset" (`fallback`), and "Mid-task too"
 (`switchMidTask`). **Projects** — a "Proposals" switch per registered project (`proposals … on|off`, off

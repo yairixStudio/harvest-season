@@ -16,6 +16,7 @@
 
 import AppKit
 import Combine
+import IOKit.ps
 import SwiftUI
 import UserNotifications
 
@@ -517,6 +518,7 @@ struct HTask: Decodable, Identifiable, Equatable {
 }
 
 struct HRun: Decodable, Equatable {
+    let startedAt: String?
     let finishedAt: String?
     let mode: String?
     let done: Int?
@@ -639,6 +641,10 @@ struct HListing: Decodable, Equatable {
 struct HarvestConfig: Equatable {
     var auto = true
     var pulses = 0
+    /// The automatic harvest starts only on AC power or above `minBattery` % (a run started on a
+    /// nearly empty battery dies with the Mac). "Run now" always starts.
+    var batteryGuard = true
+    var minBattery = 10
 }
 
 let maxPulses = 6
@@ -648,6 +654,8 @@ func loadHarvestConfig() -> HarvestConfig {
     if let data = try? Data(contentsOf: harvestHome.appendingPathComponent("config.json")),
        let saved = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
         if let auto = saved["auto"] as? Bool { c.auto = auto }
+        if let guardOn = saved["batteryGuard"] as? Bool { c.batteryGuard = guardOn }
+        if let minimum = jsonNumber(saved["minBattery"]) { c.minBattery = min(max(Int(minimum), 5), 80) }
         if let pulses = jsonNumber(saved["pulses"]) {
             c.pulses = min(max(Int(pulses), 0), maxPulses)
         } else if let lead = jsonNumber(saved["leadHours"]) {
@@ -668,7 +676,8 @@ func saveHarvestConfig(_ c: HarvestConfig) {
     // The engine reads only leadHours (in auto mode it refuses a run started earlier than that); the
     // widget schedules the pulses, so it gives the engine the widest lead they can need.
     let pulses = c.pulses == 0 ? maxPulses : c.pulses
-    writeJSONFile(["auto": c.auto, "pulses": c.pulses, "leadHours": pulses * 5 + 1],
+    writeJSONFile(["auto": c.auto, "pulses": c.pulses, "leadHours": pulses * 5 + 1,
+                   "batteryGuard": c.batteryGuard, "minBattery": c.minBattery],
                   to: harvestHome.appendingPathComponent("config.json"))
 }
 
@@ -1134,6 +1143,20 @@ func menuBarImage(gauges: [(tag: String, pct: Double)], reel: CGFloat, alert: Bo
         }
         return true
     }
+}
+
+/// The Mac's power: whether it runs on AC (a Mac without a battery counts as AC), and the battery's charge.
+func powerState() -> (onAC: Bool, battery: Int?) {
+    guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue() else { return (true, nil) }
+    let source = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() as String?
+    var battery: Int?
+    for ps in (IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef]) ?? [] {
+        guard let d = IOPSGetPowerSourceDescription(info, ps)?.takeUnretainedValue() as? [String: Any],
+              let current = d[kIOPSCurrentCapacityKey] as? Int, let maximum = d[kIOPSMaxCapacityKey] as? Int,
+              maximum > 0 else { continue }
+        battery = current * 100 / maximum
+    }
+    return (source != kIOPSBatteryPowerValue, battery)
 }
 
 /// `date` written in `pattern` (e.g. "HH:mm"), in the Mac's locale and time zone.
@@ -2124,6 +2147,7 @@ struct HelpView: View {
         ("קציר (בתחתית)", [
             "ספירה לאחור עד שהקציר האוטומטי מתחיל — רק כשהמתג \"אוטומטי\" דלוק. הוא רץ ב**פעימות**: כל פעימה היא חלון של 5 שעות, והאחרונה נגמרת לפני האיפוס השבועי. כמה פעימות — בוחרים בשורה (1–6), או \"אוטומטי\": כמה שצריך כדי לנצל את מה שנשאר מהשבוע על מה שבתור.",
             "פעימה מסתיימת כשחלון ה־5 שעות מתמלא; הבאה מתחילה כשהוא מתאפס, כל עוד יש בתור עבודה. מתחת: כמה חלונות, לכמה אחוזים מהמכסה השבועית הם מספיקים, וכמה בתור.",
+            "**סוללה:** כברירת מחדל ההתחלה האוטומטית מחכה עד שהמק מחובר לחשמל או שהסוללה מעל 10% (משנים או מכבים בהגדרות ← קציר), ומגיעה התראה אחת. \"הרץ עכשיו\" תמיד מתחיל. ריצה שנקטעה באמצע — למשל כי המחשב נכנס לשינה — ממשיכה מעצמה אם יש עוד זמן לפני האיפוס, עם התראה; אבל לא אחרי ש\"עצור\" שלך.",
             "**הרץ עכשיו** מריץ את כל התור מיד.",
             "בזמן ריצה: נקודה מהבהבת, המשימה הנוכחית, **צפה** (הסשן החי באפליקציית Claude) ו**עצור**. אפשר גם לכתוב לו מהאפליקציה או מהטלפון.",
             "כל משימה רצה בסשן משלה ובענף נפרד משלה בתוך הפרויקט. שום דבר לא נדחף לשרת ולא ממוזג — את זה רק אתה מאשר. משימה שלא תספיק להסתיים לפני האיפוס לא מתחילה.",
@@ -2136,7 +2160,7 @@ struct HelpView: View {
         ("הגדרות", [
             "חמש לשוניות בראש החלון.",
             "**כללי:** שפה, הפעלה בכניסה למחשב, בשורת התפריט או כווידג'ט צף; השם שלך, מייל לסיכום שבועי ותיקיית הקציר (שומרים ב\"שמור\"); עזרה והסרת הקציר.",
-            "**קציר:** קציר אוטומטי, כמה פעימות לפני האיפוס, ו**שמירת מקום בשבילך** — כמה אחוזים הקציר לא ייגע בהם בחלון ה־5 שעות (כדי שתוכל לעבוד) ובמכסה השבועית.",
+            "**קציר:** קציר אוטומטי, כמה פעימות לפני האיפוס, **שמירת מקום בשבילך** — כמה אחוזים הקציר לא ייגע בהם בחלון ה־5 שעות (כדי שתוכל לעבוד) ובמכסה השבועית — ו**סוללה**: לא להתחיל אוטומטית על סוללה חלשה, ומאיזה אחוז.",
             "**מודלים:** מודל לכל גודל משימה, ו**מעבר בין מודלים** — מאיזה אחוז של המכסה של Fable עוברים, לאיזה מודל (או \"בלי\": המשימות יחכו), והאם לעבור גם באמצע משימה.",
             "**פרויקטים:** מתג \"הצעות\" לכל פרויקט רשום — כבוי = בלי הצעות ממנו.",
             "**טקסטים:** ההנחיות שהקציר נותן לסוכנים — משימה, סריקת הצעות, השיחות, מייל הסיכום וההודעה במעבר מודל. אפשר לערוך כל אחת; נקודה כחולה = מותאם אישית, כתומה = שינוי שלא נשמר. מה שחייב להישאר בטקסט כתוב מתחתיו, ושמירה בלעדיו נדחית. \"שחזר ברירת מחדל\" מחזיר את המקור.",
@@ -2193,6 +2217,7 @@ struct HelpView: View {
         ("Harvest (at the bottom)", [
             "A countdown to the start of the automatic harvest — only while the \"automatic\" switch is on. It runs in **pulses**: each pulse is one 5-hour window, and the last one ends before the weekly reset. How many — you choose in the row (1–6), or \"Auto\": as many as it takes to spend what's left of the week on what's queued.",
             "A pulse ends when its 5-hour window fills up; the next starts when that window resets, as long as the queue has work. Underneath: how many windows, how much of the weekly quota they are enough for, and how much is queued.",
+            "**Battery:** by default the automatic start waits until the Mac is plugged in or the battery is above 10% (change it or turn it off in Settings → Harvest), and one notification comes. \"Run now\" always starts. A run cut off midway — the Mac went to sleep, say — goes on by itself if there is time before the reset, with a notification; never after your own \"Stop\".",
             "**Run now** runs the whole queue right away.",
             "During a run: a blinking dot, the current task, **Watch** (the live session in the Claude app) and **Stop**. You can also write to it from the app or from your phone.",
             "Each task runs in its own session and on its own branch inside the project. Nothing is pushed to the server or merged — only you approve that. A task that wouldn't finish before the reset doesn't start.",
@@ -2205,7 +2230,7 @@ struct HelpView: View {
         ("Settings", [
             "Five tabs at the top of the window.",
             "**General:** language, start at login, the menu bar or a floating widget; your name, an email for the weekly summary and the harvest folder (kept with \"Save\"); help and removing the harvest.",
-            "**Harvest:** the automatic harvest, how many pulses before the reset, and **kept free for you** — how many percent the harvest leaves alone in the 5-hour window (so you can work) and in the weekly quota.",
+            "**Harvest:** the automatic harvest, how many pulses before the reset, **kept free for you** — how many percent the harvest leaves alone in the 5-hour window (so you can work) and in the weekly quota — and **battery**: don't start automatically on a low battery, and from what percent.",
             "**Models:** a model per task size, and **switching models** — from what percent of Fable's own quota to switch, to which model (or \"None\": the tasks wait), and whether to switch mid-task too.",
             "**Projects:** a \"Proposals\" switch per registered project — off = no proposals from it.",
             "**Texts:** the instructions the harvest gives its agents — a task, the proposal scan, the conversations, the summary email and the message on a model switch. Each can be edited; a blue dot = customized, orange = unsaved changes. What must stay in a text is listed under it, and saving without it is refused. \"Restore the default\" brings back the original.",
@@ -2554,7 +2579,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var height: CGFloat {
         switch self {
         case .general: return 610
-        case .harvest: return 610
+        case .harvest: return 760
         case .models: return 540
         case .projects: return 420
         case .texts: return 580
@@ -2815,6 +2840,27 @@ struct SettingsView: View {
                 }
             } header: {
                 Text(L("שמירת מקום בשבילך", "Kept free for you"))
+            }
+            Section {
+                Toggle(isOn: Binding(get: { m.config.batteryGuard },
+                                     set: { var c = m.config; c.batteryGuard = $0; m.actions?.setConfig(c) })) {
+                    titled(L("לא להתחיל על סוללה חלשה", "Don't start on a low battery"),
+                           L("מק שנכבה מסוללה ריקה עוצר את הקציר באמצע. נוגע רק בהתחלה האוטומטית — \"הרץ עכשיו\" תמיד עובד.",
+                             "A Mac that dies on an empty battery stops the harvest midway. Only the automatic start waits — \"Run now\" always works."))
+                }
+                Stepper(value: Binding(get: { m.config.minBattery },
+                                       set: { var c = m.config; c.minBattery = $0; m.actions?.setConfig(c) }),
+                        in: 5...80, step: 5) {
+                    Text(L("מתחיל רק מעל \(m.config.minBattery)% או כשהמק מחובר לחשמל",
+                           "Starts only above \(m.config.minBattery)% or when the Mac is plugged in"))
+                }
+                .disabled(!m.config.batteryGuard)
+            } header: {
+                Text(L("סוללה", "Battery"))
+            } footer: {
+                Text(L("כשהקציר מחכה לחשמל תגיע התראה אחת. וכשריצה נקטעת באמצע (למשל כי המחשב נכנס לשינה) ויש עוד זמן לפני האיפוס, הקציר ממשיך מעצמו ומודיע לך — אבל לא אחרי שעצרת אותו בעצמך.",
+                       "While the harvest waits for power, one notification comes. And when a run is cut off midway (the Mac went to sleep, say) with time left before the reset, the harvest goes on by itself and tells you — never after you stopped it yourself."))
+                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         }
         .formStyle(.grouped)
@@ -3951,6 +3997,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     }
 
     func stopHarvest() {
+        // The run this stops ends as "interrupted"; this keeps it from being resumed as if the Mac had slept.
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "HarvestStoppedAt")
         let claudePid = model.listing.launch?.claudePid
         // The task session is a terminal session of its own: stop it directly too.
         if let taskPid = model.listing.status?.current?.claudePid, taskPid > 1 {
@@ -4029,6 +4077,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         if now < start && !inCycle { return (start, false, false) }
         if now >= cutoff { return (nextWeek, false, false) }
         if !inCycle { return (now, true, false) }
+        // A run cut off midway (the Mac slept, the session stalled) goes on as soon as possible — at most
+        // twice a cycle, and not counted as a pulse.
+        if lastRunCutOff(), !model.listing.queue.isEmpty, d.integer(forKey: "HarvestCycleRetries") < 2, now < cutoff {
+            return (now, true, true)
+        }
         if d.integer(forKey: "HarvestCycleRuns") < pulses,
            model.listing.status?.lastRun?.stopReason == "5h-full",
            !model.listing.queue.isEmpty {
@@ -4048,14 +4101,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
               let fresh = lastSuccess, -fresh.timeIntervalSinceNow < 15 * 60,
               let plan = autoHarvestPlan(), plan.due else { return }
         let d = UserDefaults.standard
-        if plan.followUp {
+        if let battery = batteryHold() {
+            // Once a cycle: the harvest is due but waits for power.
+            if d.integer(forKey: "BatteryNotifiedCycle") != harvestCycle(raw) {
+                d.set(harvestCycle(raw), forKey: "BatteryNotifiedCycle")
+                notify(title: L("קציר מכסה", "Quota harvest"),
+                       body: L("הקציר מחכה: הסוללה על \(battery)%. חבר לחשמל והוא יתחיל.",
+                               "The harvest is waiting: the battery is at \(battery)%. Plug in and it starts."))
+            }
+            return
+        }
+        if plan.followUp, lastRunCutOff() {
+            notify(title: L("קציר מכסה", "Quota harvest"),
+                   body: L("הריצה הקודמת נקטעה באמצע (למשל כשהמחשב נכנס לשינה). יש עוד זמן לפני האיפוס — הקציר ממשיך עכשיו.",
+                           "The last run was cut off midway (the Mac went to sleep, say). There is still time before the reset — the harvest goes on now."))
+            d.set(d.integer(forKey: "HarvestCycleRetries") + 1, forKey: "HarvestCycleRetries")
+        } else if plan.followUp {
             d.set(d.integer(forKey: "HarvestCycleRuns") + 1, forKey: "HarvestCycleRuns")
         } else {
             d.set(harvestCycle(raw), forKey: "HarvestCycle")
             d.set(1, forKey: "HarvestCycleRuns")
+            d.set(0, forKey: "HarvestCycleRetries")
             d.set(model.harvestWindows, forKey: "HarvestCyclePulses")
         }
         launchHarvest(mode: "auto", only: [])
+    }
+
+    /// The last run ended "interrupted" without the owner stopping it — the Mac slept, the session stalled.
+    func lastRunCutOff() -> Bool {
+        guard let run = model.listing.status?.lastRun, run.stopReason == "interrupted" else { return false }
+        let started = parseDate(run.startedAt)?.timeIntervalSince1970 ?? .infinity
+        return UserDefaults.standard.double(forKey: "HarvestStoppedAt") < started
+    }
+
+    /// The battery's charge when the battery guard holds the automatic harvest back (on battery, at or
+    /// below the owner's minimum), else nil.
+    func batteryHold() -> Int? {
+        guard model.config.batteryGuard else { return nil }
+        let power = powerState()
+        guard !power.onAC, let battery = power.battery, battery <= model.config.minBattery else { return nil }
+        return battery
     }
 
     /// The footer's line about the next automatic harvest: a countdown, or a note.
@@ -4066,7 +4151,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         } else if let plan = autoHarvestPlan() {
             let fresh = lastSuccess.map { -$0.timeIntervalSinceNow < 15 * 60 } ?? false
             if plan.due {
-                note = fresh ? L("מתחיל עכשיו", "starting now")
+                note = fresh ? (batteryHold().map { L("ממתין לחשמל — הסוללה על \($0)%", "waiting for power — battery at \($0)%") }
+                                ?? L("מתחיל עכשיו", "starting now"))
                     : model.signIn != nil ? L("לא יתחיל — Claude Code לא מחובר", "won't start — Claude Code isn't signed in")
                     : L("ממתין לנתוני מכסה", "waiting for quota data")
             } else {
