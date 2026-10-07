@@ -2,6 +2,7 @@
 """Tests for install.py, each in a throwaway HOME (with a space in its path, as many are).
 Run: python3 harvest/test_install.py"""
 
+import hashlib
 import json
 import os
 import shutil
@@ -68,8 +69,8 @@ class Install(unittest.TestCase):
         self.assertTrue(os.access(self.h(".claude", "harvest", "bin", "harvest.py"), os.X_OK))
         self.assertEqual(os.path.realpath(self.h(".local", "bin", "claude-harvest")),
                          os.path.realpath(self.h(".claude", "harvest", "bin", "harvest.py")))
-        self.assertTrue(os.path.isfile(self.h(".claude", "skills", "harvest-quota", "references", "digest-email.md")))
-        self.assertIn("# Quota Harvest", self.read(".claude", "harvest", "README.md"), "README in the chosen language")
+        self.assertTrue(os.path.isfile(self.h(".claude", "skills", "harvest-season", "references", "digest-email.md")))
+        self.assertIn("# Harvest Season", self.read(".claude", "harvest", "README.md"), "README in the chosen language")
         claude_md = self.read(".claude", "CLAUDE.md")
         self.assertEqual(claude_md.count(MARK), 1)
         self.assertIn("## Backlog — small tasks for later", claude_md)
@@ -97,7 +98,7 @@ class Install(unittest.TestCase):
         self.assertTrue(u["ok"])
         self.assertEqual(u["keptEditedByHand"], [])
         self.assertFalse(os.path.lexists(self.h(".local", "bin", "claude-harvest")))
-        self.assertFalse(os.path.exists(self.h(".claude", "skills", "harvest-quota")))
+        self.assertFalse(os.path.exists(self.h(".claude", "skills", "harvest-season")))
         self.assertFalse(os.path.exists(self.h(".claude", "harvest", "bin", "harvest.py")))
         self.assertNotIn(MARK, self.read(".claude", "CLAUDE.md"))
         self.assertTrue(os.path.exists(self.h(".claude", "harvest", "projects.md")), "state stays without --purge")
@@ -107,7 +108,7 @@ class Install(unittest.TestCase):
         os.makedirs(self.h(".codex"))
         self.inst("install", "--language", "he")
         self.assertEqual(self.read(".codex", "AGENTS.md").count(MARK), 1)
-        self.assertIn("# קציר מכסה", self.read(".claude", "harvest", "README.md"))
+        self.assertIn("# עונת הקציר", self.read(".claude", "harvest", "README.md"))
         self.inst("uninstall", "--purge")
         self.assertNotIn(MARK, self.read(".codex", "AGENTS.md"))
         self.assertFalse(os.path.exists(self.h(".claude", "harvest")))
@@ -166,7 +167,6 @@ class Install(unittest.TestCase):
         old_same, old_edited = self.h(".claude", "skills", "backlog", "old.md"), self.h(".claude", "skills", "backlog", "mine.md")
         self.write("from an earlier version\n", ".claude", "skills", "backlog", "old.md")
         self.write("edited\n", ".claude", "skills", "backlog", "mine.md")
-        import hashlib
         manifest["files"][old_same] = hashlib.sha256(b"from an earlier version\n").hexdigest()
         manifest["files"][old_edited] = hashlib.sha256(b"as installed\n").hexdigest()
         with open(manifest_path, "w", encoding="utf-8") as f:
@@ -181,7 +181,95 @@ class Install(unittest.TestCase):
         self.inst("install", "--language", "en")
         s = json.loads(self.read(".claude", "harvest", "settings.json"))
         self.assertEqual((s["ownerName"], s["language"], s["email"], s["emailDigest"]), ("Dana", "en", "d@example.com", True))
-        self.assertIn("# Quota Harvest", self.read(".claude", "harvest", "README.md"), "README follows the language")
+        self.assertIn("# Harvest Season", self.read(".claude", "harvest", "README.md"), "README follows the language")
+
+    # The upgrade from Quota Harvest — the app's name before Harvest Season, when the harvest skill was
+    # harvest-quota and the instruction blocks named both.
+    OLD_BEGIN = ("<!-- claude-harvest:begin — managed by the Quota Harvest installer; "
+                 "edit it in the quota-harvest repository (harvest/instructions/), then reinstall -->")
+    OLD_SKILL = {("SKILL.md",): "---\nname: harvest-quota\n---\nthe harvest, by its old name\n",
+                 ("references", "talk-prompt.md"): "the old talk prompt\n",
+                 ("references", "digest-email.md"): "the old digest\n"}
+
+    def old_skill_path(self, *parts):
+        return self.h(".claude", "skills", "harvest-quota", *parts)
+
+    def make_quota_harvest_home(self, edit=None):
+        """A home as the Quota Harvest installer left it: the harvest skill under its old name, recorded in
+        the manifest with a hash per file, and both instruction blocks in the old wording. `edit`: one of
+        the old skill's files, changed by hand since."""
+        os.makedirs(self.h(".codex"))
+        self.inst("install", "--language", "en")
+        shutil.rmtree(self.h(".claude", "skills", "harvest-season"))
+        manifest_path = self.h(".claude", "harvest", "install-manifest.json")
+        manifest = json.loads(slurp(manifest_path))
+        manifest["files"] = {p: d for p, d in manifest["files"].items() if os.sep + "harvest-season" + os.sep not in p}
+        for parts, text in self.OLD_SKILL.items():
+            self.write(text, ".claude", "skills", "harvest-quota", *parts)
+            manifest["files"][self.old_skill_path(*parts)] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if edit:
+            with open(self.old_skill_path(*edit), "a", encoding="utf-8") as f:
+                f.write("my own note\n")
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+        old_block = (self.OLD_BEGIN + "\n## Backlog — small tasks for later\nThe Quota Harvest widget launches the "
+                     "harvest (`harvest-quota` skill).\n<!-- claude-harvest:end -->")
+        self.write("# Global instructions\n\nmine before\n\n" + old_block + "\n\n## Mine after\nkept\n", ".claude", "CLAUDE.md")
+        self.write(old_block + "\n", ".codex", "AGENTS.md")
+
+    def test_an_upgrade_from_quota_harvest_moves_the_skill_and_rewrites_the_blocks(self):
+        self.make_quota_harvest_home()
+        p = self.inst("plan")
+        self.assertTrue(p["ok"], p["conflicts"])
+        new_skill = [f for f in p["files"] if os.sep + "harvest-season" + os.sep in f["path"]]
+        self.assertTrue(new_skill and all(f["action"] == "create" for f in new_skill), new_skill)
+        self.assertEqual([b["change"] for b in p["blocks"]], ["replace", "replace"])
+
+        r = self.inst("install")
+        self.assertTrue(r["ok"])
+        self.assertEqual(sorted(r["retired"]), sorted(self.old_skill_path(*parts) for parts in self.OLD_SKILL))
+        self.assertFalse(os.path.exists(self.old_skill_path()), "the old skill's folder goes, empty folders and all")
+        self.assertIn("name: harvest-season", self.read(".claude", "skills", "harvest-season", "SKILL.md"))
+        with open(os.path.join(r["backups"], ".claude", "skills", "harvest-quota", "SKILL.md"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), self.OLD_SKILL[("SKILL.md",)], "what goes is backed up first")
+        for rel in ((".claude", "CLAUDE.md"), (".codex", "AGENTS.md")):
+            text = self.read(*rel)
+            self.assertEqual(text.count(MARK), 1, rel)
+            self.assertIn("managed by the Harvest Season installer", text)
+            self.assertNotIn("Quota Harvest", text)
+            self.assertNotIn("harvest-quota", text)
+        claude_md = self.read(".claude", "CLAUDE.md")
+        self.assertTrue(claude_md.startswith("# Global instructions\n\nmine before\n\n" + MARK), claude_md)
+        self.assertTrue(claude_md.endswith("\n\n## Mine after\nkept\n"), claude_md)
+        self.assertIn("`harvest-season` skill", claude_md)
+
+        manifest = json.loads(self.read(".claude", "harvest", "install-manifest.json"))
+        self.assertFalse([path for path in manifest["files"] if "harvest-quota" in path])
+        self.assertEqual(self.inst("status")["modified"], [])
+        names = {x["name"] for x in self.engine("prompts")["prompts"]}
+        self.assertTrue({"task", "scan", "talk", "onboard", "digest"} <= names, "the engine reads the renamed skill's texts")
+        again = self.inst("install")
+        self.assertEqual((again["changed"], again["retired"]), ([], []), "a second install changes nothing")
+        self.assertEqual([b["change"] for b in again["blocks"]], ["none", "none"])
+
+    def test_an_old_skill_file_edited_by_hand_stays_with_its_folder(self):
+        self.make_quota_harvest_home(edit=("references", "talk-prompt.md"))
+        r = self.inst("install")
+        self.assertTrue(r["ok"], "an edited file the new version doesn't have is no conflict: it just stays")
+        self.assertEqual(sorted(r["retired"]), sorted([self.old_skill_path("SKILL.md"),
+                                                       self.old_skill_path("references", "digest-email.md")]))
+        self.assertEqual(slurp(self.old_skill_path("references", "talk-prompt.md")), "the old talk prompt\nmy own note\n")
+        self.assertFalse(os.path.exists(self.old_skill_path("SKILL.md")), "no skill by the old name is left to load")
+        self.assertTrue(os.path.isfile(self.h(".claude", "skills", "harvest-season", "SKILL.md")))
+
+    def test_uninstall_of_an_older_install_takes_the_old_skill_folder_too(self):
+        self.make_quota_harvest_home()
+        u = self.inst("uninstall")
+        self.assertEqual(u["keptEditedByHand"], [])
+        self.assertFalse(os.path.exists(self.old_skill_path()))
+        self.assertFalse(os.path.exists(self.h(".claude", "skills", "backlog")))
+        self.assertNotIn(MARK, self.read(".claude", "CLAUDE.md"))
+        self.assertNotIn(MARK, self.read(".codex", "AGENTS.md"))
 
 
 if __name__ == "__main__":

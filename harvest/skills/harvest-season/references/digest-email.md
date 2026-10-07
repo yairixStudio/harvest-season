@@ -7,7 +7,7 @@ Sources: `claude-harvest list` → `needsYou`, `proposals`, `status.cycle` (done
 
 The wording is given in both languages (he / en); use the owner's.
 
-Subject: he `קציר מכסה · <dd.mm> · <N> מחכות לך` — or `קציר מכסה · <dd.mm> · שקט` when nothing happened and nothing waits. en `Quota harvest · <dd.mm> · <N> waiting for you` — or `Quota harvest · <dd.mm> · quiet`.
+Subject: he `עונת הקציר · <dd.mm> · <N> מחכות לך` — or `עונת הקציר · <dd.mm> · שקט` when nothing happened and nothing waits. en `Harvest Season · <dd.mm> · <N> waiting for you` — or `Harvest Season · <dd.mm> · quiet`.
 
 ## Body — decisions first
 

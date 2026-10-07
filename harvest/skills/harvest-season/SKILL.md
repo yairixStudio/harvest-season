@@ -1,22 +1,22 @@
 ---
-name: harvest-quota
-description: Spend Claude Code plan quota that would otherwise vanish at the weekly reset on queued BACKLOG.md tasks across the owner's projects — one fresh subagent per task on its own git branch (never pushed), budgeted from the real 5-hour/weekly percentages by the harvest engine, then a report in the owner's language (and, at the end of an automatic cycle, an optional digest email). Use when the Quota Harvest widget launches a harvest, when the user says "harvest", "run the backlog", "use up my quota", "תנצל את המכסה", "קציר", "תריץ את התור", "אני הולך לישון, תעבוד על הבקלוג", or asks what is waiting for them in the backlog.
+name: harvest-season
+description: Spend Claude Code plan quota that would otherwise vanish at the weekly reset on queued BACKLOG.md tasks across the owner's projects — one fresh subagent per task on its own git branch (never pushed), budgeted from the real 5-hour/weekly percentages by the harvest engine, then a report in the owner's language (and, at the end of an automatic cycle, an optional digest email). Use when the Harvest Season widget launches a harvest, when the user says "harvest", "run the backlog", "use up my quota", "תנצל את המכסה", "קציר", "תריץ את התור", "אני הולך לישון, תעבוד על הבקלוג", or asks what is waiting for them in the backlog.
 ---
-<!-- Installed copy, managed by the Quota Harvest installer: edit harvest/skills/harvest-quota/SKILL.md in the quota-harvest repository, then reinstall. -->
+<!-- Installed copy, managed by the Harvest Season installer: edit harvest/skills/harvest-season/SKILL.md in the harvest-season repository, then reinstall. -->
 
 If `claude-harvest` isn't found, run `~/.claude/harvest/bin/harvest.py` with the same arguments.
 
-# Harvest quota
+# Harvest Season
 
 Plan quota left at the weekly reset is lost. Spend it on tasks the owner queued — as many as fit, each with a model matched to its complexity — and never start a task that can't finish before the reset: spilling past it eats next week's quota, which is not free.
 
-The engine `claude-harvest` (in `~/.local/bin`, linked to `~/.claude/harvest/bin/harvest.py`) does every deterministic step and prints JSON. It owns the backlog edits, budget, task choice, git worktrees/branches, calibration, `status.json`, the lock and crash recovery. The Quota Harvest widget reads the same state, so change BACKLOG.md, branches or harvest files only through `claude-harvest` — never by hand. Your part: run the agents, judge their results, write for the owner.
+The engine `claude-harvest` (in `~/.local/bin`, linked to `~/.claude/harvest/bin/harvest.py`) does every deterministic step and prints JSON. It owns the backlog edits, budget, task choice, git worktrees/branches, calibration, `status.json`, the lock and crash recovery. The Harvest Season widget reads the same state, so change BACKLOG.md, branches or harvest files only through `claude-harvest` — never by hand. Your part: run the agents, judge their results, write for the owner.
 
 The owner: `claude-harvest settings` gives `ownerName`, `language` (he / en), `email`, `emailDigest` and `workdir` (the harvest folder). Everything the owner reads — reports, the digest, notifications, your messages — is in that language, written for a product owner: what changed for them, not which files.
 
 ## Where you run
 Widget-launched runs have two layers, both interactive Claude Code sessions in hidden terminals, published through Remote Control so the owner can follow them live in the Claude app or on their phone:
-- **You**, the coordinator — "Quota harvest · <date> · <mode>" (the engine names sessions in the owner's language) in the harvest folder: you plan, start each task, wait, and report.
+- **You**, the coordinator — "Harvest Season · <date> · <mode>" (the engine names sessions in the owner's language) in the harvest folder: you plan, start each task, wait, and report.
 - **One session per task** — "Harvest · <task title>", started by `claude-harvest run-task` inside a worktree in the task's own project, so it appears under that project in the Claude app, with the project's CLAUDE.md, memory, settings and hooks. Proposal scans likewise ("Harvest · proposal scan").
 
 The owner may type to you or to a task session. Their message outranks this skill (stop, skip a task, answer a blocked question). When he tells you to stop: stop the running task (its session reports that the owner stopped it; if it doesn't, just stop waiting), then immediately run `claude-harvest end --reason stopped-by-owner --final no` — that releases the lock and lets the launcher close your session; `maintain` returns the interrupted task to the queue. Then answer them. Otherwise nobody is watching: never wait for input. The launcher closes your session about 20 s after `end`, so finish with the three-line summary.

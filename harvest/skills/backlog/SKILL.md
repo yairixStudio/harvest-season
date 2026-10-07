@@ -1,16 +1,16 @@
 ---
 name: backlog
-description: Record small, non-urgent tasks in the project's BACKLOG.md so the quota harvester can do them with leftover plan quota before the weekly reset, and review that backlog. Use whenever you notice out-of-scope cleanup, a missing test, a TODO, a doc gap or a dependency bump you shouldn't do right now, and whenever the user says "add to backlog", "later", "not now", "תוסיף לבקלוג", "משימה לאחר כך", "לא עכשיו", or asks what is in the backlog ("מה יש בבקלוג", "what's waiting").
+description: Record small, non-urgent tasks in the project's BACKLOG.md so the harvest (Harvest Season) can do them with leftover plan quota before the weekly reset, and review that backlog. Use whenever you notice out-of-scope cleanup, a missing test, a TODO, a doc gap or a dependency bump you shouldn't do right now, and whenever the user says "add to backlog", "later", "not now", "תוסיף לבקלוג", "משימה לאחר כך", "לא עכשיו", or asks what is in the backlog ("מה יש בבקלוג", "what's waiting").
 ---
-<!-- Installed copy, managed by the Quota Harvest installer: edit harvest/skills/backlog/SKILL.md in the quota-harvest repository, then reinstall. -->
+<!-- Installed copy, managed by the Harvest Season installer: edit harvest/skills/backlog/SKILL.md in the harvest-season repository, then reinstall. -->
 
 If `claude-harvest` isn't found, run `~/.claude/harvest/bin/harvest.py` with the same arguments.
 
 # Backlog
 
-One `BACKLOG.md` per project root, fixed format, edited only through the harvest engine `claude-harvest` (in `~/.local/bin`) so the Quota Harvest widget and the harvester always agree.
+One `BACKLOG.md` per project root, fixed format, edited only through the harvest engine `claude-harvest` (in `~/.local/bin`) so the Harvest Season widget and the harvester always agree.
 
-The Quota Harvest widget in the menu bar shows every project's queue and launches the harvest a set number of hours before the weekly reset (or on demand). Each task runs in a fresh agent on its own `backlog/<slug>` branch, never pushed; the owner reviews and merges.
+The Harvest Season widget in the menu bar shows every project's queue and launches the harvest a set number of hours before the weekly reset (or on demand). Each task runs in a fresh agent on its own `backlog/<slug>` branch, never pushed; the owner reviews and merges.
 
 ## Adding a task
     claude-harvest add "<project root>" --status <open|proposed> --priority <1|2|3> --complexity <low|medium|high> --tokens <estimate> --title "<short title>" --details "<what to do, which files, and what counts as done>"

@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 ENGINE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harvest.py")
 # In the repository the prompts sit beside the engine's source (harvest/skills/…): test those, not whatever
 # copy happens to be installed. An installed engine has no such folder and falls back to its default.
-REPO_REFS = os.path.normpath(os.path.join(os.path.dirname(ENGINE), "..", "..", "skills", "harvest-quota", "references"))
+REPO_REFS = os.path.normpath(os.path.join(os.path.dirname(ENGINE), "..", "..", "skills", "harvest-season", "references"))
 if os.path.isdir(REPO_REFS):
     os.environ.setdefault("HARVEST_SKILL_REFS", REPO_REFS)
     os.environ.setdefault("HARVEST_TEMPLATE_DIR", os.path.join(REPO_REFS, "..", "..", "backlog"))
@@ -485,8 +485,8 @@ class Harvest(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("harvest", ENGINE)
         h = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(h)
-        self.assertEqual(h.transcript_path("abc", "/Users/x/Programs/quota-harvest"),
-                         os.path.expanduser("~/.claude/projects/-Users-x-Programs-quota-harvest/abc.jsonl"))
+        self.assertEqual(h.transcript_path("abc", "/Users/x/Programs/harvest-season"),
+                         os.path.expanduser("~/.claude/projects/-Users-x-Programs-harvest-season/abc.jsonl"))
         auto = h.build_prompt("auto", [], True)
         self.assertIn("AUTO mode", auto)
         self.assertIn("every queued (open) task", auto)
@@ -815,7 +815,7 @@ class Harvest(unittest.TestCase):
         self.assertFalse(os.path.exists(wt["path"]))
         log = subprocess.run(["git", "-C", self.repo, "log", "--format=%s", "main..backlog/long-work"],
                              capture_output=True, text=True).stdout.split("\n")
-        self.assertEqual(log[0], "WIP: stopped at a usage limit (quota harvest)", "uncommitted work is kept")
+        self.assertEqual(log[0], "WIP: stopped at a usage limit (Harvest Season)", "uncommitted work is kept")
         # The next attempt goes on from the same branch, with everything on it.
         again = self.run_engine("worktree", self.repo, "Long work")
         self.assertEqual(again["branch"], "backlog/long-work")

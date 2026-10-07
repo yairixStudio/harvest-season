@@ -3,4 +3,4 @@ When you notice a small, non-urgent task outside the current scope (missing test
 
 Record it as `open` only when the user is present and agreed; when you run unattended (scheduled task, headless `claude -p`, harvest agent) record `proposed` — agents never queue work for other agents.
 
-The Quota Harvest widget in the menu bar launches the harvest (`harvest-quota` skill) a set number of hours before the weekly quota reset, or on demand: it does `open` items on separate `backlog/*` branches that are never pushed. Only the user approves proposals and merges branches.
+The Harvest Season widget in the menu bar launches the harvest (`harvest-season` skill) a set number of hours before the weekly quota reset, or on demand: it does `open` items on separate `backlog/*` branches that are never pushed. Only the user approves proposals and merges branches.

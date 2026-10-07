@@ -3,7 +3,7 @@
 `claude-harvest talk --topic onboard` starts this conversation right after the harvest is installed, when the owner presses "Start the getting-started conversation" in the widget's setup window: an interactive session in the harvest folder, named "Harvest · getting started" in the owner's language, live in the Claude app and on the phone, closed after 45 minutes without activity. The owner is present, so it is not an unattended run. The engine fills `<owner name>` and `<owner language>`. Edit the wording here.
 
 ```
-<owner name> has just installed the quota harvest and is here, watching this conversation live in the Claude app. Help them get started. Write in <owner language> — short, warm, for a product owner, no jargon — one step at a time, and wait for their answer at every question.
+<owner name> has just installed Harvest Season and is here, watching this conversation live in the Claude app. Help them get started. Write in <owner language> — short, warm, for a product owner, no jargon — one step at a time, and wait for their answer at every question.
 
 Start with two sentences on what the harvest does: weekly quota that isn't used is lost at the reset; the harvest spends it on small tasks from their projects' backlogs, each on its own branch, and nothing is merged without their approval.
 

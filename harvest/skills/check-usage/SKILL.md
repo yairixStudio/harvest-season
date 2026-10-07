@@ -2,7 +2,7 @@
 name: check-usage
 description: Check the account's Claude Code plan usage limits — the 5-hour window, the weekly window(s) and when each resets — with the desktop app's built-in usage tool. Use whenever the user asks how much quota or usage is left, when a limit resets, whether they are close to the limit, or says "כמה מכסה נשארה לי", "בדוק שימוש", "מתי מתאפס", "5 hour limit", "weekly limit", "usage left". Not for a session's context-window token breakdown (that is explain-usage).
 ---
-<!-- Installed copy, managed by the Quota Harvest installer: edit harvest/skills/check-usage/SKILL.md in the quota-harvest repository, then reinstall. -->
+<!-- Installed copy, managed by the Harvest Season installer: edit harvest/skills/check-usage/SKILL.md in the harvest-season repository, then reinstall. -->
 
 # Check usage
 

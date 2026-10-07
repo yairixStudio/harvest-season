@@ -33,12 +33,13 @@ from datetime import datetime
 
 SRC = os.path.dirname(os.path.abspath(__file__))
 VERSION = 1
-BEGIN = ("<!-- claude-harvest:begin — managed by the Quota Harvest installer; "
-         "edit it in the quota-harvest repository (harvest/instructions/), then reinstall -->")
+# Only the marker before " —" finds a block, so a block written under an earlier wording is still replaced.
+BEGIN = ("<!-- claude-harvest:begin — managed by the Harvest Season installer; "
+         "edit it in the harvest-season repository (harvest/instructions/), then reinstall -->")
 END = "<!-- claude-harvest:end -->"
 LEGACY_HEADING = "## Backlog — small tasks for later"
 LANGUAGES = ("he", "en")
-SKILLS = ("backlog", "harvest-quota", "check-usage")
+SKILLS = ("backlog", "harvest-season", "check-usage")
 EXECUTABLE = ("bin/harvest.py", "bin/watch.command")
 
 
@@ -47,6 +48,7 @@ def home(*parts):
 
 
 HARVEST = home(".claude", "harvest")
+SKILLS_DIR = home(".claude", "skills")
 MANIFEST = os.path.join(HARVEST, "install-manifest.json")
 SETTINGS = os.path.join(HARVEST, "settings.json")
 LINK = home(".local", "bin", "claude-harvest")
@@ -76,6 +78,19 @@ def read_json(path, default):
             return json.load(f)
     except (OSError, ValueError):
         return default
+
+
+def prune_skill_folders(path):
+    """After a skill's file is removed: the folders it leaves empty, up to ~/.claude/skills (not
+    included) — so a skill a later version renamed or dropped leaves no empty folder behind. A folder
+    that still holds anything (a file edited by hand stays) stays with it."""
+    folder = os.path.dirname(path)
+    while folder.startswith(SKILLS_DIR + os.sep):
+        try:
+            os.rmdir(folder)
+        except OSError:
+            return
+        folder = os.path.dirname(folder)
 
 
 def write_bytes(path, data, mode=0o644):
@@ -239,12 +254,14 @@ def cmd_install(a):
         else:
             os.chmod(target, mode)
         manifest_files[target] = sha(data)
-    # A file an earlier version installed that this one no longer has goes — unless edited by hand.
+    # A file an earlier version installed that this one no longer has goes — unless edited by hand —
+    # and so does a skill folder it leaves empty (a renamed skill's old one).
     retired = []
     for path, digest in previous.items():
         if path not in manifest_files and os.path.exists(path) and sha(read(path, True)) == digest:
             backup(path)
             os.remove(path)
+            prune_skill_folders(path)
             retired.append(path)
     for b in p["blocks"]:
         if b["change"] != "none":
@@ -296,6 +313,7 @@ def cmd_uninstall(a):
             continue
         if sha(data) == digest or a.force:
             os.remove(path)
+            prune_skill_folders(path)
             removed.append(path)
         else:
             kept.append(path)

@@ -1,4 +1,4 @@
-# Quota Harvest
+# Harvest Season
 
 Spends Claude Code plan quota that would otherwise vanish at the weekly reset on small tasks from your projects.
 
@@ -11,13 +11,13 @@ After the install, in the setup window: **"Start the getting-started conversatio
 There is one queue. It runs by itself before the weekly reset, in pulses of one 5-hour window each (you choose how many, or "Auto"), or right away at a click.
 
 ## Where it lives
-- **The menu bar widget** (the `quota-harvest` repository) — the interface: usage bars, **Queue** / **Proposals** / **Waiting for you**, the pulses, "Run now", "Stop". Opens at login.
+- **The menu bar widget** (the `harvest-season` repository) — the interface: usage bars, **Queue** / **Proposals** / **Waiting for you**, the pulses, "Run now", "Stop". Opens at login.
 - **The engine** `bin/harvest.py` (on the command line: `claude-harvest`) — every deterministic step: reading and editing `BACKLOG.md`, budget, task choice, git worktrees and branches, calibration, status, the lock and recovery after a stop. Tests: `python3 bin/test_harvest.py`.
-- **The skills** in `~/.claude/skills/`: `harvest-quota` (the harvest itself), `backlog` (recording tasks), `check-usage` (checking quota).
+- **The skills** in `~/.claude/skills/`: `harvest-season` (the harvest itself), `backlog` (recording tasks), `check-usage` (checking quota).
 - **`~/.claude/CLAUDE.md`** and **`~/.codex/AGENTS.md`** — every Claude session, and Codex too, knows how to record tasks in the backlog.
 
 ## How a harvest runs
-1. The widget starts a coordinating session ("Quota harvest · …" in the harvest folder) — an interactive Claude Code session in a hidden terminal (`claude-harvest launch`, in the harvest folder — `workdir` in the settings), published through Remote Control — **you can watch it live in the Claude app and on your phone**, and write to it. The Mac stays awake until it ends.
+1. The widget starts a coordinating session ("Harvest Season · …" in the harvest folder) — an interactive Claude Code session in a hidden terminal (`claude-harvest launch`, in the harvest folder — `workdir` in the settings), published through Remote Control — **you can watch it live in the Claude app and on your phone**, and write to it. The Mac stays awake until it ends.
 2. The agent asks the engine: what is queued, how much quota is left, what fits. A task that can't finish before the reset doesn't start.
 3. Each task: **its own session inside its own project**, named "Harvest · <task title>" — it appears in the app under that project, with the project's CLAUDE.md and memory. It works in a worktree inside the project, on its own `backlog/<slug>` branch. The model follows the complexity (low → Sonnet, medium → Opus, high → Fable; from 85 % of Fable's own quota → Opus; change them in Settings → Models). When a model's own quota runs out mid-task, the session goes on with the fallback model; when the shared 5-hour or weekly limit does, the task stops, its work stays on its branch (a WIP commit) and the next attempt goes on from there — a pause, not a failure. No push, no merge.
 4. At the end: a report in `reports/`, and the task moves to "Waiting for you". An automatic run sends one summary email a week — only when an email is set up (`emailDigest`).
@@ -45,4 +45,4 @@ There is one queue. It runs by itself before the weekly reset, in pulses of one 
 - `reports/` — a report per run. `logs/` — each run's full log (the last 20).
 
 ## Without the mouse
-`kill -USR1 $(pgrep -x QuotaHarvest)` opens/closes the panel · `kill -USR2 …` runs the queue now or stops a run.
+`kill -USR1 $(pgrep -x HarvestSeason)` opens/closes the panel · `kill -USR2 …` runs the queue now or stops a run.

@@ -1,6 +1,6 @@
 # Backlog
 
-משימות קטנות ולא דחופות של הפרויקט. סוכן "קציר המכסה" (`harvest-quota`) מבצע משימות במצב `open` לפני האיפוס השבועי של מכסת קלוד, על ענף `backlog/*` נפרד, בלי push — ומחכה לאישור שלך למיזוג. הצעות (`proposed`) לא רצות בלי "כן" ממך.
+משימות קטנות ולא דחופות של הפרויקט. "עונת הקציר" (`harvest-season`) מבצעת משימות במצב `open` לפני האיפוס השבועי של מכסת קלוד, על ענף `backlog/*` נפרד, בלי push — ומחכה לאישור שלך למיזוג. הצעות (`proposed`) לא רצות בלי "כן" ממך.
 
 <!--
 Format: one task per "##" section, one "- key: value" per line. Keys in English, values in any language.

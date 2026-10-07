@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Quota-harvest engine: every deterministic step of the backlog harvest, shared by the widget and the harvest agent.
+"""Harvest Season engine: every deterministic step of the backlog harvest, shared by the widget and the harvest agent.
 
-The copy in ~/.claude/harvest/bin is installed from the quota-harvest repository (harvest/home/bin):
+The copy in ~/.claude/harvest/bin is installed from the harvest-season repository (harvest/home/bin):
 edit it there and reinstall (`./install`, or `python3 harvest/install.py install`) — the installer refuses to
 overwrite a copy edited in place."""
 
@@ -29,7 +29,7 @@ LOCK = os.path.join(HOME, ".lock")
 WORKTREES = os.path.join(HOME, "worktrees")
 LAUNCH = os.path.join(HOME, "launch.json")
 TASK_RESULTS = os.path.join(HOME, "task-results")
-SKILL_REFS = os.path.expanduser(os.environ.get("HARVEST_SKILL_REFS", "~/.claude/skills/harvest-quota/references"))
+SKILL_REFS = os.path.expanduser(os.environ.get("HARVEST_SKILL_REFS", "~/.claude/skills/harvest-season/references"))
 WORKTREE_PREFIX = "harvest-"
 HISTORY = os.path.join(HOME, "history.jsonl")
 TALK = os.path.join(HOME, "talk.json")
@@ -169,11 +169,11 @@ TEXT = {
     "onboard_name": {"he": "קציר · היכרות · %s", "en": "Harvest · getting started · %s"},
     "mode_auto": {"he": "אוטומטי", "en": "automatic"},
     "mode_manual": {"he": "ידני", "en": "manual"},
-    "run_name": {"he": "קציר מכסה · %s · %s", "en": "Quota harvest · %s · %s"},
+    "run_name": {"he": "עונת הקציר · %s · %s", "en": "Harvest Season · %s · %s"},
     "task_name": {"he": "קציר · %s", "en": "Harvest · %s"},
     "no_report": {"he": "הסשן נסגר בלי לדווח תוצאה", "en": "the session closed without reporting a result"},
     "scan_name": {"he": "קציר · סריקת הצעות", "en": "Harvest · proposal scan"},
-    "watch_title": {"he": "קציר מכסה — צפייה בשיחה %s\n%s\n", "en": "Quota harvest — watching %s\n%s\n"},
+    "watch_title": {"he": "עונת הקציר — צפייה בשיחה %s\n%s\n", "en": "Harvest Season — watching %s\n%s\n"},
     "no_transcript": {"he": "(עוד אין תמליל)", "en": "(no transcript yet)"},
     "run_ended": {"he": "\n— הריצה הסתיימה —", "en": "\n— the run has ended —"},
     "removed": {"he": "%s · הוסר על ידי הבעלים", "en": "%s · removed by the owner"},
@@ -503,7 +503,7 @@ def load_usage(inline=None):
         return (u, None) if u else (None, "usage-json has no 5-hour/weekly windows")
     u = read_json(USAGE, None)
     if not u:
-        return None, "usage.json missing (is the Quota Harvest widget running?)"
+        return None, "usage.json missing (is the Harvest Season widget running?)"
     fetched = parse_iso(u.get("fetchedAt"))
     if not fetched:
         return None, "usage.json has no fetchedAt"
@@ -1221,7 +1221,7 @@ def ensure_worktrees_ignored(repo):
     path = os.path.join(common, "info", "exclude")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
-        f.write("\n# Claude Code worktrees (quota harvest)\n.claude/worktrees/\n")
+        f.write("\n# Claude Code worktrees (Harvest Season)\n.claude/worktrees/\n")
 
 
 def worktree_dir(repo, name):
@@ -1288,9 +1288,9 @@ def snapshot_worktree(path):
         return False
     git(path, "add", "-A")
     who = [] if git(path, "config", "user.email").stdout.strip() else [
-        "-c", "user.name=Quota Harvest", "-c", "user.email=quota-harvest@localhost"]
+        "-c", "user.name=Harvest Season", "-c", "user.email=harvest-season@localhost"]
     return git(path, *(who + ["commit", "-q", "--no-verify", "-m",
-                              "WIP: stopped at a usage limit (quota harvest)"])).returncode == 0
+                              "WIP: stopped at a usage limit (Harvest Season)"])).returncode == 0
 
 
 def remove_worktree(repo, path):
@@ -1547,10 +1547,10 @@ def session_activity(transcript):
 
 
 def build_prompt(mode, only, test):
-    s = "Run the harvest-quota skill (invoke it with the Skill tool) in %s mode. " % mode.upper()
-    s += ("The Quota Harvest widget launched you unattended at the start of the harvest window before the weekly quota reset."
+    s = "Run the harvest-season skill (invoke it with the Skill tool) in %s mode. " % mode.upper()
+    s += ("The Harvest Season widget launched you unattended at the start of the harvest window before the weekly quota reset."
           if mode == "auto" else
-          "The Quota Harvest widget launched you unattended because the owner pressed \"run now\".")
+          "The Harvest Season widget launched you unattended because the owner pressed \"run now\".")
     if only:
         s += " Scope: only these tasks — pass each to every plan call as --only: " + " ".join('"%s"' % o for o in only) + "."
     else:
@@ -2135,7 +2135,7 @@ PROMPTS = {
     # Read by the coordinator itself (the skill says so), whole.
     "digest": {"file": "digest-email.md", "fills": [], "keeps": [], "whole": True},
     "continue": {"file": "continue-prompt.md", "fills": ["from model", "to model"], "keeps": [],
-                 "builtin": "[Quota harvest] The <from model> quota ran out in the middle of your work, so this session"
+                 "builtin": "[Harvest Season] The <from model> quota ran out in the middle of your work, so this session"
                             " goes on with <to model>. Continue exactly where you stopped (if you were changing files,"
                             " look at `git status` first) and finish as you were originally instructed."},
 }

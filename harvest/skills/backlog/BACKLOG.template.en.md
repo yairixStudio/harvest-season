@@ -1,6 +1,6 @@
 # Backlog
 
-Small, non-urgent tasks for this project. The quota harvest (`harvest-quota`) does the `open` ones before Claude's weekly quota resets, each on its own `backlog/*` branch, never pushed — and waits for your approval to merge. Proposals (`proposed`) don't run until you say yes.
+Small, non-urgent tasks for this project. Harvest Season (`harvest-season`) does the `open` ones before Claude's weekly quota resets, each on its own `backlog/*` branch, never pushed — and waits for your approval to merge. Proposals (`proposed`) don't run until you say yes.
 
 <!--
 Format: one task per "##" section, one "- key: value" per line. Keys in English, values in any language.
