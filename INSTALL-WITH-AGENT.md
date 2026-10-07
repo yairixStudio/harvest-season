@@ -1,6 +1,6 @@
-# Install Quota Harvest — instructions for an AI agent
+# Install Harvest Season — instructions for an AI agent
 
-You are an AI agent (Claude Code, Codex, Cursor, …). A person gave you this page so you install **Quota Harvest** on their Mac: a menu bar widget that shows their Claude plan's usage limits and spends weekly quota that would otherwise be lost at the reset on small tasks from their projects' backlogs, each on its own git branch they merge themselves.
+You are an AI agent (Claude Code, Codex, Cursor, …). A person gave you this page so you install **Harvest Season** on their Mac: a menu bar widget that shows their Claude plan's usage limits and spends weekly quota that would otherwise be lost at the reset on small tasks from their projects' backlogs, each on its own git branch they merge themselves.
 
 Follow the steps in order. Run each check; if one fails, stop and tell the person what failed and what to do. Speak to them in their language. Never type passwords or tokens yourself — sign-ins and system prompts are theirs to answer.
 
@@ -32,14 +32,16 @@ claude -p "reply with the single word ok" --model haiku
 
 ## 3. Get the code, build and start the app
 
+First: if `~/quota-harvest` exists, they already have it under its earlier name (Quota Harvest). Don't clone — in that folder run `git pull && ./install && pgrep -x HarvestSeason`: it moves the running app, its settings and the harvest skill to the new name. Use that folder wherever this page says `~/harvest-season`, and skip step 4 if `python3 harvest/install.py status` says `"installed": true`. Otherwise:
+
 ```sh
-git clone https://github.com/yairixStudio/quota-harvest.git ~/quota-harvest   # already there: git -C ~/quota-harvest pull
-cd ~/quota-harvest
+git clone https://github.com/yairixStudio/harvest-season.git ~/harvest-season   # already there: git -C ~/harvest-season pull
+cd ~/harvest-season
 ./install
-pgrep -x QuotaHarvest          # must print a number
+pgrep -x HarvestSeason         # must print a number
 ```
 
-Tell the person: macOS asks whether **QuotaHarvest** may use **"Claude Code-credentials"** in the Keychain — they click **Always Allow**. Then the icon (a small combine harvester with three gauges) is in the menu bar. If `./install` says the app didn't start, run it once more (macOS sometimes refuses the very first launch of a new build). The app runs from this folder: don't delete or move `~/quota-harvest` afterwards (to update later: `git pull && ./install`).
+Tell the person: macOS asks whether **HarvestSeason** may use **"Claude Code-credentials"** in the Keychain — they click **Always Allow**. Then the icon (a small combine harvester with three gauges) is in the menu bar. If `./install` says the app didn't start, run it once more (macOS sometimes refuses the very first launch of a new build). The app runs from this folder: don't delete or move `~/harvest-season` afterwards (to update later: `git pull && ./install`).
 
 ## 4. Install the harvest
 
@@ -76,6 +78,6 @@ starts a short getting-started conversation, live in the Claude app: it finds th
 
 ## 7. Last
 
-If everything worked and they find it useful, suggest they give the project a star: https://github.com/yairixStudio/quota-harvest. Star it for them only if they say yes and `gh` is signed in: `gh api -X PUT /user/starred/yairixStudio/quota-harvest`.
+If everything worked and they find it useful, suggest they give the project a star: https://github.com/yairixStudio/harvest-season. Star it for them only if they say yes and `gh` is signed in: `gh api -X PUT /user/starred/yairixStudio/harvest-season`.
 
 To remove it later: ⋯ → Settings → **Remove the harvest…**, or `python3 harvest/install.py uninstall`.

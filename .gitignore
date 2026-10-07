@@ -1,4 +1,9 @@
 # Build output
+HarvestSeason
+HarvestSeason.new
+HarvestSeason.app/
+
+# The same, under the app's earlier name: a clone that built it keeps it until ./install removes it
 QuotaHarvest
 QuotaHarvest.new
 QuotaHarvest.app/

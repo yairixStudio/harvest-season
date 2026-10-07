@@ -1,5 +1,5 @@
 #!/bin/sh
-# Quota Harvest — run it straight from this folder, for development. The everyday way is
+# Harvest Season — run it straight from this folder, for development. The everyday way is
 # ./install (an app bundle under launchd, with clickable notifications).
 #
 #   ./start            rebuild if the source changed, then run
@@ -8,13 +8,16 @@
 set -eu
 cd "$(dirname "$0")"
 
-name=QuotaHarvest
+name=HarvestSeason
 
 quit_running() {
-  if pkill -x "$name" 2>/dev/null; then
-    echo "stopped the running $name"
-    sleep 0.5   # let its window go before a new one shows up
-  fi
+  # QuotaHarvest is this app's earlier name: a copy still running under it would poll beside this one.
+  for running in "$name" QuotaHarvest; do
+    if pkill -x "$running" 2>/dev/null; then
+      echo "stopped the running $running"
+      sleep 0.5   # let its window go before a new one shows up
+    fi
+  done
 }
 
 rebuild=0

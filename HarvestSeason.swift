@@ -1,6 +1,6 @@
-// Quota Harvest — a menu bar (or floating) panel with the Claude Code usage
+// Harvest Season — a menu bar (or floating) panel with the Claude Code usage
 // limits (the 5-hour session, the all-models weekly and the model-scoped weekly) and
-// the owner's backlog quota harvester: the queued BACKLOG.md tasks across projects,
+// the owner's backlog harvest: the queued BACKLOG.md tasks across projects,
 // approvals, and a harvest that starts a chosen number of hours before the weekly
 // reset (or on demand), so quota that would lapse does queued work instead.
 //
@@ -11,7 +11,7 @@
 // keeps working when Claude Code hasn't run for a while.
 // Harvest data: every read and write goes through ~/.claude/harvest/bin/harvest.py.
 //
-// Build: swiftc -O -o QuotaHarvest QuotaHarvest.swift
+// Build: swiftc -O -o HarvestSeason HarvestSeason.swift
 // Run:   ./start   (right-click the panel for Refresh / Quit)
 
 import AppKit
@@ -440,6 +440,8 @@ var uiHebrew = UserDefaults.standard.string(forKey: "UILanguage").map { $0 == "h
 /// Set by a snapshot's `--he` / `--en`: the listing's language then leaves `uiHebrew` alone.
 var uiLanguageForced = false
 func L(_ he: String, _ en: String) -> String { uiHebrew ? he : en }
+/// The app's name in the UI language: the notifications' title, and the panel's before setup.
+var appName: String { L("עונת הקציר", "Harvest Season") }
 /// The harvest installer that ships with this widget: `harvest/install.py` in the app bundle's
 /// Resources (`./install` copies it there), or beside a bare binary run from the repository.
 var harvestInstaller: URL? {
@@ -1635,7 +1637,7 @@ struct PanelView: View {
     var setupInvitation: some View {
         VStack(alignment: .leading, spacing: 6) {
             Divider().padding(.vertical, 7)
-            Text(L("קציר מכסה", "Quota harvest")).font(.system(size: 12, weight: .semibold))
+            Text(appName).font(.system(size: 12, weight: .semibold))
             Text(L("מכסה שבועית שלא נוצלה הולכת לאיבוד באיפוס. הקציר מנצל אותה על משימות קטנות מהפרויקטים שלך — כל אחת בענף משלה, ורק אתה ממזג.",
                    "Weekly quota you don't use is lost at the reset. The harvest spends it on small tasks from your projects — each on its own branch, and only you merge."))
                 .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -2770,7 +2772,7 @@ struct HelpView: View {
 
     static let topics: [(title: String, lines: [String])] = [
         ("מה זה", [
-            "הווידג'ט מראה כמה ממכסת Claude כבר נוצלה, ומנהל את **הקציר**: ניצול של מכסה שבועית שהייתה הולכת לאיבוד באיפוס, על משימות קטנות מהבקלוג של הפרויקטים שלך.",
+            "**עונת הקציר** היא ווידג'ט שמראה כמה ממכסת Claude כבר נוצלה, ומנהל את **הקציר**: ניצול של מכסה שבועית שהייתה הולכת לאיבוד באיפוס, על משימות קטנות מהבקלוג של הפרויקטים שלך.",
             "כל פרויקט מחזיק קובץ `BACKLOG.md`. הווידג'ט רק מציג אותו ומפעיל את המנוע — הוא לא עורך אותו בעצמו.",
             "כל פתיחה של הווידג'ט מתחילה כשכל האזורים מקופלים: בכותרת של כל אחד רואים כמה יש בו, ולחיצה על הכותרת פותחת אותו.",
         ]),
@@ -2851,7 +2853,7 @@ struct HelpView: View {
 
     static let englishTopics: [(title: String, lines: [String])] = [
         ("What it is", [
-            "The widget shows how much of your Claude quota is already used, and runs the **harvest**: it spends weekly quota that would otherwise be lost at the reset on small tasks from your projects' backlogs.",
+            "**Harvest Season** is a widget that shows how much of your Claude quota is already used, and runs the **harvest**: it spends weekly quota that would otherwise be lost at the reset on small tasks from your projects' backlogs.",
             "Each project keeps a `BACKLOG.md` file. The widget only shows it and runs the engine — it never edits the file itself.",
             "Every time the widget opens, all its sections start folded: each one's header shows how much is in it, and a click on the header opens it.",
         ]),
@@ -2934,7 +2936,7 @@ struct HelpView: View {
 
     var content: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(T("איך הווידג'ט עובד", "How the widget works")).font(.system(size: 17, weight: .semibold))
+            Text(T("איך עונת הקציר עובדת", "How Harvest Season works")).font(.system(size: 17, weight: .semibold))
             ForEach(shownTopics, id: \.title) { topic in
                 VStack(alignment: .leading, spacing: 5) {
                     Text(topic.title).font(.system(size: 13, weight: .semibold))
@@ -3720,7 +3722,7 @@ struct SettingsView: View {
 // MARK: - Start at login
 
 /// "Start at login" is a LaunchAgent; whether its plist exists is the checkbox's state.
-let loginAgentLabel = "dev.quota-harvest.widget"
+let loginAgentLabel = "dev.harvest-season.widget"
 let loginAgentPlist = homeURL.appendingPathComponent("Library/LaunchAgents/\(loginAgentLabel).plist")
 
 /// This binary's absolute path, as launchd needs it: argv[0] when it's already absolute,
@@ -3762,8 +3764,9 @@ let maxPoll: TimeInterval = 1800
 
 /// `UserDefaults` key of the menu bar mode switch (on unless the user turned it off).
 let inMenuBarDefaultsKey = "InMenuBar"
-/// The floating panel's saved frame lives under this autosave name.
-let floatingFrameName = "QuotaHarvest"
+/// The floating panel's saved frame lives under this autosave name, the all-tasks window's under the other.
+let floatingFrameName = "HarvestSeason"
+let allTasksFrameName = "HarvestSeasonAllTasks"
 
 /// When the next usage poll may go out — plain bookkeeping without timers, so all the pacing
 /// rules sit in one place: one request out at a time, 30 s between attempts (manual ones too),
@@ -3951,8 +3954,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     var runSignal: DispatchSourceSignal?
 
     func applicationDidFinishLaunching(_ launch: Notification) {
-        migrateDefaults()
         let args = CommandLine.arguments
+        // ./install draws the icon with the new build while the earlier copy still runs: no settings
+        // move for that.
+        if let i = args.firstIndex(of: "--write-iconset"), i + 1 < args.count {
+            writeIconset(to: args[i + 1])
+            exit(0)
+        }
+        migrateDefaults()
         if let i = args.firstIndex(of: "--pretend-weekly-reset-in"), i + 1 < args.count,
            let minutes = Double(args[i + 1]) {
             pretendWeeklyReset = Date().addingTimeInterval(minutes * 60)
@@ -3971,10 +3980,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
                 }
             }
             return
-        }
-        if let i = args.firstIndex(of: "--write-iconset"), i + 1 < args.count {
-            writeIconset(to: args[i + 1])
-            exit(0)
         }
         if let i = args.firstIndex(of: "--snapshot-menubar"), i + 1 < args.count {
             snapshotMenuBar(to: args[i + 1])
@@ -4451,7 +4456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         let d = UserDefaults.standard, now = Date().timeIntervalSince1970
         guard now - d.double(forKey: "SignInNotifiedAt") > 12 * 3600 else { return }
         d.set(now, forKey: "SignInNotifiedAt")
-        notify(title: L("קציר מכסה", "Quota harvest"),
+        notify(title: appName,
                body: L("Claude Code לא מחובר — בלי זה אין מדדים והקציר לא ירוץ. לחץ כדי להתחבר.",
                        "Claude Code isn't signed in — without it there are no figures and the harvest won't run. Click to sign in."),
                category: "signin", id: "signin")
@@ -4516,7 +4521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             signInWatchUntil = Date().addingTimeInterval(15 * 60)
             return
         }
-        let script = FileManager.default.temporaryDirectory.appendingPathComponent("quota-harvest-sign-in.command")
+        let script = FileManager.default.temporaryDirectory.appendingPathComponent("harvest-season-sign-in.command")
         let quoted = shellQuoted(claude)
         let body = """
         #!/bin/zsh
@@ -4599,11 +4604,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         redrawStatusItem()
         registerNotificationCategories()
         if let window = helpWindow {
-            window.title = L("עזרה — קציר מכסה", "Help — Quota harvest")
+            window.title = L("עזרה — עונת הקציר", "Help — Harvest Season")
             (window.contentView as? NSHostingView<HelpView>)?.rootView = HelpView()
         }
         if let window = allTasksWindow {
-            window.title = L("כל המשימות — קציר מכסה", "All tasks — Quota harvest")
+            window.title = L("כל המשימות — עונת הקציר", "All tasks — Harvest Season")
             (window.contentView as? NSHostingView<AllTasksView>)?.rootView = AllTasksView(m: model, t: allTasksModel)
         }
     }
@@ -4694,7 +4699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
                 if digestMissing {
                     body += L(" · מייל הסיכום לא נשלח — פרטים בדוח", " · the summary email wasn't sent — details in the report")
                 }
-                if !self.panel.isVisible || digestMissing { notify(title: L("קציר מכסה", "Quota harvest"), body: body) }
+                if !self.panel.isVisible || digestMissing { notify(title: appName, body: body) }
                 self.flash(body)
                 // A run the owner started by hand ends where they can read it: the Claude app.
                 if self.model.listing.launch?.mode == "manual", self.model.lastRunInApp,
@@ -4814,14 +4819,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             // Once a cycle: the harvest is due but waits for power.
             if d.integer(forKey: "BatteryNotifiedCycle") != harvestCycle(raw) {
                 d.set(harvestCycle(raw), forKey: "BatteryNotifiedCycle")
-                notify(title: L("קציר מכסה", "Quota harvest"),
+                notify(title: appName,
                        body: L("הקציר מחכה: הסוללה על \(battery)%. חבר לחשמל והוא יתחיל.",
                                "The harvest is waiting: the battery is at \(battery)%. Plug in and it starts."))
             }
             return
         }
         if plan.followUp, lastRunCutOff() {
-            notify(title: L("קציר מכסה", "Quota harvest"),
+            notify(title: appName,
                    body: L("הריצה הקודמת נקטעה באמצע (למשל כשהמחשב נכנס לשינה). יש עוד זמן לפני האיפוס — הקציר ממשיך עכשיו.",
                            "The last run was cut off midway (the Mac went to sleep, say). There is still time before the reset — the harvest goes on now."))
             d.set(d.integer(forKey: "HarvestCycleRetries") + 1, forKey: "HarvestCycleRetries")
@@ -5025,7 +5030,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         uiHebrew = hebrew
         languageChanged()
         model.objectWillChange.send()
-        settingsWindow?.title = L("הגדרות — קציר מכסה", "Settings — Quota harvest")
+        settingsWindow?.title = L("הגדרות — עונת הקציר", "Settings — Harvest Season")
         if model.harvestInstalled { saveHarvestSettings(["language=" + (hebrew ? "he" : "en")]) }
     }
 
@@ -5158,12 +5163,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: AllTasksView.width, height: 640),
                                   styleMask: [.titled, .closable, .miniaturizable, .resizable],
                                   backing: .buffered, defer: false)
-            window.title = L("כל המשימות — קציר מכסה", "All tasks — Quota harvest")
+            window.title = L("כל המשימות — עונת הקציר", "All tasks — Harvest Season")
             window.isReleasedWhenClosed = false
             window.contentView = NSHostingView(rootView: AllTasksView(m: model, t: allTasksModel))
             window.contentMinSize = NSSize(width: 760, height: 420)
             window.center()
-            window.setFrameAutosaveName("QuotaHarvestAllTasks")
+            window.setFrameAutosaveName(allTasksFrameName)
             allTasksWindow = window
         }
         NSApp.activate(ignoringOtherApps: true)
@@ -5221,7 +5226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 640),
                                   styleMask: [.titled, .closable, .miniaturizable, .resizable],
                                   backing: .buffered, defer: false)
-            window.title = L("עזרה — קציר מכסה", "Help — Quota harvest")
+            window.title = L("עזרה — עונת הקציר", "Help — Harvest Season")
             window.isReleasedWhenClosed = false
             window.contentView = NSHostingView(rootView: HelpView())
             window.contentMinSize = NSSize(width: 460, height: 300)
@@ -5243,23 +5248,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
 
     // MARK: Reminder and conversation
 
-    /// The widget ran as a bare binary before it became an app bundle, so its
-    /// settings (menu bar mode, the harvest cycle, the panel's frame…) live in the
-    /// old domain; they're copied into the bundle's once.
-    /// Once, in the app bundle: settings saved under the names this app had before it was
-    /// Quota Harvest (its earlier bundle id, and the bare binary's domain) move over — the
-    /// switches, the language, the reminder's timing, and the floating panel's position.
+    /// Once, in the app bundle: the settings this app saved under its earlier names move over —
+    /// the switches, the language, the harvest cycle, the reminder's timing, and the windows'
+    /// positions. Newest first, and a key that is already set is never overwritten: Quota Harvest
+    /// (`dev.quota-harvest.widget`, the name before Harvest Season), then Claude Usage Widget (its
+    /// bundle id, and the domain of the bare binary it was before that).
+    /// Only an app bundle moves them: a bare build beside Info.plist takes on the bundle id, and a
+    /// snapshot run from the repository must neither write the owner's settings nor mark the move done.
     func migrateDefaults() {
-        guard let id = Bundle.main.bundleIdentifier, id != "QuotaHarvest" else { return }
+        guard Bundle.main.bundleURL.pathExtension == "app", Bundle.main.bundleIdentifier != nil else { return }
         let d = UserDefaults.standard
-        guard !d.bool(forKey: "MigratedToQuotaHarvest") else { return }
-        for old in ["com.empathy.claude-usage-widget", "ClaudeUsageWidget"] {
-            for (key, value) in d.persistentDomain(forName: old) ?? [:] {
-                let target = key == "NSWindow Frame ClaudeUsageWidget" ? "NSWindow Frame \(floatingFrameName)" : key
+        guard !d.bool(forKey: "MigratedToHarvestSeason") else { return }
+        // The saved windows under their earlier autosave names.
+        let renamed = ["NSWindow Frame QuotaHarvest": "NSWindow Frame \(floatingFrameName)",
+                       "NSWindow Frame QuotaHarvestAllTasks": "NSWindow Frame \(allTasksFrameName)",
+                       "NSWindow Frame ClaudeUsageWidget": "NSWindow Frame \(floatingFrameName)"]
+        for old in ["dev.quota-harvest.widget", "com.empathy.claude-usage-widget", "ClaudeUsageWidget"] {
+            // MigratedToQuotaHarvest is the earlier move's own marker: it stays behind.
+            for (key, value) in d.persistentDomain(forName: old) ?? [:] where key != "MigratedToQuotaHarvest" {
+                let target = renamed[key] ?? key
                 if d.object(forKey: target) == nil { d.set(value, forKey: target) }
             }
         }
-        d.set(true, forKey: "MigratedToQuotaHarvest")
+        d.set(true, forKey: "MigratedToHarvestSeason")
+        // These two were read at launch, before the move.
+        if !uiLanguageForced, let language = d.string(forKey: "UILanguage") { uiHebrew = language == "he" }
+        allTasksModel.filter = TaskFilter(rawValue: d.string(forKey: "AllTasksFilter") ?? "") ?? .all
     }
 
     func setupNotifications() {
@@ -5344,7 +5358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             what = what.isEmpty ? q : what + L(questions == 1 ? " ו" : " ו־", " and ") + q
         }
         let age = oldest >= 7 ? L("כבר יותר משבוע", "over a week") : L("\(oldest) ימים", "\(oldest) days")
-        notify(title: L("קציר מכסה", "Quota harvest"),
+        notify(title: appName,
                body: L("יש עבודה שעשיתי ועוד לא אישרת: \(what). הוותיק מחכה \(age). נדבר על זה?",
                        "There's work I did that you haven't approved yet: \(what). The oldest has waited \(age). Shall we talk it over?"),
                category: "waiting", id: "waiting")
@@ -5421,14 +5435,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         if talkPid > 0 { kill(-talkPid, SIGTERM) }
         flash(nil)
         if talkTopic == "onboard" {
-            openInClaude(folder: harvestWorkdir.path, prompt: L("קרא את ~/.claude/skills/harvest-quota/references/onboard-prompt.md "
+            openInClaude(folder: harvestWorkdir.path, prompt: L("קרא את ~/.claude/skills/harvest-season/references/onboard-prompt.md "
                 + "ופעל לפי ההנחיות שבו (את השם והשפה תמצא ב-claude-harvest settings): התקנתי עכשיו את הקציר.",
-                "Read ~/.claude/skills/harvest-quota/references/onboard-prompt.md "
+                "Read ~/.claude/skills/harvest-season/references/onboard-prompt.md "
                 + "and follow it (my name and language are in claude-harvest settings): I've just installed the harvest."))
         } else {
-            openInClaude(folder: harvestWorkdir.path, prompt: L("קרא את ~/.claude/skills/harvest-quota/references/talk-prompt.md "
+            openInClaude(folder: harvestWorkdir.path, prompt: L("קרא את ~/.claude/skills/harvest-season/references/talk-prompt.md "
                 + "ופעל לפי ההנחיות שבו: ביקשתי לשוחח על העבודה שהקציר השאיר לאישורי.",
-                "Read ~/.claude/skills/harvest-quota/references/talk-prompt.md "
+                "Read ~/.claude/skills/harvest-season/references/talk-prompt.md "
                 + "and follow its instructions: I asked to talk over the work the harvest left for my approval."))
         }
         if statusItem != nil { panel.orderOut(nil) }

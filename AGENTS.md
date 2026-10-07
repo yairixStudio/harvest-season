@@ -1,21 +1,21 @@
-# Working on Quota Harvest
+# Working on Harvest Season
 
 Rules for anyone changing this repository — people and coding agents. `CLAUDE.md` is a link to this file; edit this one. What the app does, in detail, is in `SPEC.md`: keep it true, and don't repeat it here.
 
 ## What is where
 
-- `QuotaHarvest.swift` — the whole macOS app, one file: AppKit for the window, the menu bar item and the plumbing, SwiftUI for everything inside the panel and the other windows. No Xcode project, no package manager, no dependencies — keep it that way.
+- `HarvestSeason.swift` — the whole macOS app, one file: AppKit for the window, the menu bar item and the plumbing, SwiftUI for everything inside the panel and the other windows. No Xcode project, no package manager, no dependencies — keep it that way.
 - `harvest/` — the harvest's other half, and its only source:
   - `home/bin/harvest.py` — the engine (Python, standard library only) and `test_harvest.py`
-  - `skills/` — the Claude Code skills `backlog`, `harvest-quota`, `check-usage` and their prompts
+  - `skills/` — the Claude Code skills `backlog`, `harvest-season`, `check-usage` and their prompts
   - `instructions/` — the "Backlog" sections that go into `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`
   - `install.py` — puts all of the above into the user's home and records a hash per file; `test_install.py`
-- `install` — builds `QuotaHarvest.app`, bundles `harvest/` into it, runs it under launchd (label `dev.quota-harvest.widget`). `start` — runs a bare build from this folder, for development.
+- `install` — builds `HarvestSeason.app`, bundles `harvest/` into it, runs it under launchd (label `dev.harvest-season.widget`); it also stops and removes the copy installed under an earlier name. `start` — runs a bare build from this folder, for development.
 - `lproj/` — the app's name per language. `docs/` — the README's pictures.
 
 ## The installed copies are not the source
 
-`~/.claude/harvest/bin`, `~/.claude/skills/{backlog,harvest-quota,check-usage}` and the marked blocks in `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` are copies the installer wrote. Never edit them: the next install sees the change as a conflict and stops. Change `harvest/` here, run the tests, then `./install` (it upgrades an installed harvest) or `python3 harvest/install.py install`.
+`~/.claude/harvest/bin`, `~/.claude/skills/{backlog,harvest-season,check-usage}` and the marked blocks in `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` are copies the installer wrote. Never edit them: the next install sees the change as a conflict and stops. Change `harvest/` here, run the tests, then `./install` (it upgrades an installed harvest) or `python3 harvest/install.py install`.
 
 Nothing personal goes into `harvest/`. Who the owner is — name, language, email, folder, models, projects without proposals — lives in `~/.claude/harvest/settings.json` (`claude-harvest settings`). Anything the engine writes for a person goes through its he/en table (`TEXT`, `tr()`); prompts use `<owner language>` / `<owner name>`.
 
@@ -23,11 +23,11 @@ Nothing personal goes into `harvest/`. Who the owner is — name, language, emai
 
 - The engine and the installer have tests; both must pass:
   `python3 harvest/home/bin/test_harvest.py` and `python3 harvest/test_install.py` (the latter only ever touches throwaway homes).
-- The app has no test suite. Build it with zero warnings (`swiftc -O -o QuotaHarvest QuotaHarvest.swift`) and look at it — the snapshot flags render a window into a PNG and exit, from saved data, without touching the running app or the network:
+- The app has no test suite. Build it with zero warnings (`swiftc -O -o HarvestSeason HarvestSeason.swift`) and look at it — the snapshot flags render a window into a PNG and exit, from saved data, without touching the running app or the network:
   `--snapshot <png> [--expand] [--not-installed] [--demo]` (the panel; `--demo` uses made-up data, as in `docs/`), `--snapshot-menubar`, `--snapshot-help`, `--snapshot-settings`, `--snapshot-setup [--review] [--done]`, `--snapshot-tasks [--filter <tab>] [--select <row>] [--demo]` (the all-tasks window); `--rejecting [all]` opens the reject form and `--confirming unqueue|clear` an inline question, in `--snapshot` and `--snapshot-tasks`; each takes `--light` and `--he` / `--en`. Open the images and read them.
 - Only one copy may run: two double the API polling and stack two panels. `./start` quits the previous bare build; the launchd copy is managed by `./install`.
-- A running app: `kill -USR1 $(pgrep -x QuotaHarvest)` shows or hides the panel; `kill -USR2 …` runs the queue now or stops a run.
-- `QuotaHarvest`, `QuotaHarvest.app` and `__pycache__` are build output — never commit them.
+- A running app: `kill -USR1 $(pgrep -x HarvestSeason)` shows or hides the panel; `kill -USR2 …` runs the queue now or stops a run.
+- `HarvestSeason`, `HarvestSeason.app` and `__pycache__` are build output — never commit them.
 
 ## How the code is written
 

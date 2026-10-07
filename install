@@ -1,20 +1,21 @@
 #!/bin/sh
-# Quota Harvest — build the app from this folder, and run it the way it runs every day:
+# Harvest Season — build the app from this folder, and run it the way it runs every day:
 # as a login item under launchd.
 #
 #   ./install
 #
-# It builds QuotaHarvest.app here (the harvest's installer rides inside it, for the setup
+# It builds HarvestSeason.app here (the harvest's installer rides inside it, for the setup
 # window), signs it for this Mac, upgrades a harvest that its installer put in place, and
 # (re)starts the launchd job. A copy that ran under an earlier name is stopped and its login
-# item removed. For a quick run from a terminal instead, see ./start.
+# item removed; once the new app runs, the earlier app goes too. For a quick run from a
+# terminal instead, see ./start.
 set -eu
 cd "$(dirname "$0")"
 
-name=QuotaHarvest
+name=HarvestSeason
 app="$PWD/$name.app"
 exe="$app/Contents/MacOS/$name"
-label=dev.quota-harvest.widget
+label=dev.harvest-season.widget
 domain="gui/$(id -u)"
 agent="$HOME/Library/LaunchAgents/$label.plist"
 
@@ -52,15 +53,18 @@ if python3 harvest/install.py status | grep -q '"installed": true'; then
   fi
 fi
 
-# 5. The login item. The same app under its earlier name goes first.
-for old in com.empathy.claude-usage-widget; do
+# 5. The login item. The same app under its earlier names goes first — stopped before the new
+#    one starts, so two copies never poll at once: Claude Usage Widget, then Quota Harvest
+#    (dev.quota-harvest.widget, QuotaHarvest.app), the name before Harvest Season.
+for old in com.empathy.claude-usage-widget dev.quota-harvest.widget; do
+  launchctl bootout "$domain/$old" 2>/dev/null || true
   if [ -f "$HOME/Library/LaunchAgents/$old.plist" ]; then
-    launchctl bootout "$domain/$old" 2>/dev/null || true
     rm -f "$HOME/Library/LaunchAgents/$old.plist"
     echo "removed the login item of the earlier name ($old)"
   fi
 done
 pkill -x ClaudeUsageWidget 2>/dev/null || true
+pkill -x QuotaHarvest 2>/dev/null || true   # the earlier name, run from its app or by ./start
 rm -rf ClaudeUsageWidget.app
 
 # launchd remembers the program a job was loaded with, so the job is rewritten and reloaded
@@ -94,9 +98,15 @@ for try in 1 2 3; do
   launchctl kickstart -k "$domain/$label" 2>/dev/null || true
   sleep 4
   if pgrep -x "$name" >/dev/null; then
-    echo "Quota Harvest is running (try $try)"
+    echo "Harvest Season is running (try $try)"
+    # 7. The app under its earlier name (Quota Harvest) and its bare builds go only now, once the
+    #    new one runs — until then it is the way back.
+    if [ -e QuotaHarvest.app ] || [ -e QuotaHarvest ] || [ -e QuotaHarvest.new ]; then
+      rm -rf QuotaHarvest.app QuotaHarvest QuotaHarvest.new
+      echo "removed the app of the earlier name (QuotaHarvest.app)"
+    fi
     exit 0
   fi
 done
-echo "Quota Harvest did not start — see: launchctl print $domain/$label" >&2
+echo "Harvest Season did not start — see: launchctl print $domain/$label" >&2
 exit 1

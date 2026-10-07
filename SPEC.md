@@ -1,6 +1,6 @@
-# Quota Harvest — what it does
+# Harvest Season — what it does
 
-The contract for the app's behavior: when behavior changes, this changes with it. Quota Harvest is a macOS menu bar panel for a Claude Code user. It shows the same usage figures as claude.ai's usage page for the signed-in account — the 5-hour window, the weekly limit across models, and the weekly limit of one model family (currently "Fable") — and runs the backlog harvest described under "Harvest".
+The contract for the app's behavior: when behavior changes, this changes with it. Harvest Season (in Hebrew עונת הקציר) is a macOS menu bar panel for a Claude Code user. It shows the same usage figures as claude.ai's usage page for the signed-in account — the 5-hour window, the weekly limit across models, and the weekly limit of one model family (currently "Fable") — and runs the backlog harvest described under "Harvest".
 
 ## Signing in with Claude Code's credentials
 
@@ -37,7 +37,7 @@ A borderless panel (`WidgetPanel`) that doesn't activate the app but can take ke
 
 Inside is SwiftUI (`PanelView`), in the UI language — `uiHebrew`: the harvest settings' language once a listing has it, else the app's own `UILanguage` setting, else the Mac's first preferred language. Hebrew runs right to left, English left to right; every string is `L(he, en)`. When the language changes, the panel follows, and `languageChanged` rebuilds what was made in the old language: the right-click menu, the dot's tooltip, the reminder's buttons, an open help window.
 
-The floating panel's position is saved under the autosave name `QuotaHarvest` (at first: the top-right of the main screen). Right-click: Refresh now · (from the menu bar) back to a floating widget · Quit.
+The floating panel's position is saved under the autosave name `HarvestSeason` (at first: the top-right of the main screen). Right-click: Refresh now · (from the menu bar) back to a floating widget · Quit.
 
 From top to bottom:
 
@@ -71,8 +71,8 @@ it unscrolled and exits.
 ### All tasks
 
 The header's table button, ⋯ → "כל המשימות…" and "כל המשימות בטבלה ←" under בוצעו open one
-ordinary window (titled "כל המשימות — קציר מכסה", closable, resizable, reused, brought to the front, its
-frame saved as `QuotaHarvestAllTasks`; the drop-down panel hides first in menu bar mode) with
+ordinary window (titled "כל המשימות — עונת הקציר", closable, resizable, reused, brought to the front, its
+frame saved as `HarvestSeasonAllTasks`; the drop-down panel hides first in menu bar mode) with
 `AllTasksView`: every task of every registered project in a SwiftUI `Table`, mirrored in Hebrew.
 
 - Data: while the window is visible, the panel's regular listing call is `list --all`, which adds
@@ -222,7 +222,7 @@ Launching a run: `harvest.py maintain`, then `harvest.py launch --mode <auto|man
 process group, PATH extended with `~/.local/bin` and Homebrew, output to
 `logs/launch-*.out`; `caffeinate -i -w <launcher pid>` keeps the Mac awake for
 exactly as long as the run lives. The engine's launcher starts an interactive
-`claude` (fixed `--session-id`, `--name "קציר מכסה · <dd.mm HH:mm> · <mode>"`,
+`claude` (fixed `--session-id`, `--name "עונת הקציר · <dd.mm HH:mm> · <mode>"`,
 `--permission-mode auto --model opus --effort medium --remote-control`) in a
 hidden pseudo-terminal in the harvest folder (`workdir` in `settings.json`,
 default `~/claude-harvest`; it must not sit inside a repository — the session
@@ -290,7 +290,7 @@ then. A model's own limit, with `switchMidTask`, closes the session (by signal: 
 whose choices include paid usage credits, so no keys are ever sent) and resumes it — `claude --resume <id>
 --model <fallback>` with the "continue" text — in the same worktree, conversation intact (at most 3
 switches). The shared 5-hour or weekly limit closes it at once: `run-task` records the outcome `paused` —
-uncommitted work committed as "WIP: stopped at a usage limit (quota harvest)", the `backlog/<slug>` branch
+uncommitted work committed as "WIP: stopped at a usage limit (Harvest Season)", the `backlog/<slug>` branch
 kept, the task back to open with "· paused at … · continues from <branch>" (no strike), and its next attempt
 reuses the branch. The coordinator's own limit waits for a running task to stop, then ends the run with
 `5h-full` / `weekly-full`, so the next pulse follows. The 45-minute idle close is a signal too.
@@ -305,7 +305,7 @@ for 15 min after "Sign in". While it's set: a red card under the usage rows ("Cl
 stops, when the figures shown were last updated, **התחבר** / **בדוק שוב**); the menu bar image gets a red "!"
 after the gauges and its tooltip says why; one notification (category `signin`, at most twice a day — a click
 starts signing in); the automatic harvest doesn't start (footer: "לא יתחיל — Claude Code לא מחובר") and "Run
-now" explains instead of launching. **התחבר** writes `quota-harvest-sign-in.command` to the temporary folder
+now" explains instead of launching. **התחבר** writes `harvest-season-sign-in.command` to the temporary folder
 (`claude auth login`, then `claude auth status --text`) and opens it in Terminal; with Claude Code missing it
 opens claude.com/claude-code. Back signed in, the card clears and a poll goes out at once. At launch the panel
 and gauges show usage.json's figures (their time in the card and the dot's tooltip) until a poll comes back —
@@ -376,6 +376,10 @@ marked blocks (`<!-- claude-harvest:begin … -->` … `<!-- claude-harvest:end 
 legacy unmarked "## Backlog — small tasks for later" section becomes the block) and
 writes `settings.json` (given values over existing ones) and
 `install-manifest.json` (sha256 per file). It never touches the harvest's state.
+A file an earlier version installed that this one no longer has is removed unless edited
+by hand, and so is the skill folder it leaves empty — that is how the harvest skill's
+earlier name (`harvest-quota`, now `harvest-season`) goes on upgrade. A block is found by its
+marker alone, so one written under an earlier wording is replaced like any other.
 `./install` upgrades a harvest the installer installed (not a hand-made one) and
 reports conflicts without writing.
 
@@ -405,12 +409,17 @@ owner's word — `harvest.py merge` (refuses when the checkout is on another
 branch, has uncommitted changes other than BACKLOG.md, or the branch conflicts),
 dropping a task, or `set-status … open --answer` for a blocked question.
 
-Notifications need the app bundle — `QuotaHarvest.app`, bundle id
-`dev.quota-harvest.widget`, named "Quota Harvest" / "קציר מכסה" by language (`lproj/`),
+Notifications need the app bundle — `HarvestSeason.app`, bundle id
+`dev.harvest-season.widget`, named "Harvest Season" / "עונת הקציר" by language (`lproj/`),
 `LSUIElement` — which `./install` builds, signs ad hoc, registers and points the
-launch agent at. Once, `migrateDefaults` carries over the settings saved under the
-app's earlier names (an earlier bundle id and the bare binary's domain), the
-floating position included. The permission is re-read every tick. A bare binary
+launch agent at. macOS keeps the notification permission per bundle id, so a new name
+asks for it again. Once, and only inside the app bundle (a bare build beside `Info.plist`
+takes on the bundle id, and a snapshot must not move or mark anything), `migrateDefaults`
+carries over the settings saved under the app's earlier names, newest first and never
+over a key already set: Quota Harvest's `dev.quota-harvest.widget` (the name before
+Harvest Season), then Claude Usage Widget's bundle id and its bare binary's domain — the
+floating panel's and the all-tasks window's frames moved to their new autosave names.
+`--write-iconset` exits before it. The permission is re-read every tick. A bare binary
 (`./start`, snapshots) never touches `UNUserNotificationCenter` and posts
 through osascript instead.
 
@@ -440,7 +449,7 @@ Slow on purpose: the figures change over hours, and the usage endpoint answers 4
 
 ## Start at login
 
-The switch (in Settings) is on when `~/Library/LaunchAgents/dev.quota-harvest.widget.plist` exists. Turning it on writes that file — `RunAtLoad` true, `ProgramArguments` the app's absolute path — without loading it (loading would start a second copy right away), so it takes effect at the next login. Turning it off unloads the job, as far as that works, and deletes the file. `./install` writes the same job and starts it; it also removes the login item the app had under its earlier name.
+The switch (in Settings) is on when `~/Library/LaunchAgents/dev.harvest-season.widget.plist` exists. Turning it on writes that file — `RunAtLoad` true, `ProgramArguments` the app's absolute path — without loading it (loading would start a second copy right away), so it takes effect at the next login. Turning it off unloads the job, as far as that works, and deletes the file. `./install` writes the same job and starts it. Before that it stops the copies that ran under the app's earlier names and removes their login items (`dev.quota-harvest.widget`, `com.empathy.claude-usage-widget`); once the new app runs, it deletes the earlier `QuotaHarvest.app` and bare builds from the folder (until then they are the way back). `./start` also stops a copy running under the earlier name.
 
 ## Out of scope
 

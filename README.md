@@ -1,10 +1,10 @@
-# Quota Harvest
+# Harvest Season
 
 A macOS menu bar widget for [Claude Code](https://claude.com/claude-code). It shows your plan's usage limits — the 5-hour window, the weekly limit and the per-model weekly limit — and spends the weekly quota you would otherwise lose at the reset on small tasks from your projects: each one on its own git branch, merged only when you say so.
 
 In Hebrew or English. [עברית](README.he.md)
 
-![Quota Harvest](docs/panel.png)
+![Harvest Season](docs/panel.png)
 
 ## What it does
 
@@ -25,13 +25,13 @@ In Hebrew or English. [עברית](README.he.md)
 
 ## Install
 
-**With your AI agent:** give it this link and let it do the rest — https://github.com/yairixStudio/quota-harvest/blob/main/INSTALL-WITH-AGENT.md
+**With your AI agent:** give it this link and let it do the rest — https://github.com/yairixStudio/harvest-season/blob/main/INSTALL-WITH-AGENT.md
 
 **By hand:**
 
 ```sh
-git clone https://github.com/yairixStudio/quota-harvest.git
-cd quota-harvest
+git clone https://github.com/yairixStudio/harvest-season.git
+cd harvest-season
 ./install
 ```
 
@@ -45,6 +45,8 @@ Then click **Set up the harvest…** in the panel. Setup asks for your name, the
 
 Anything it replaces is backed up first. At the end it offers a short getting-started conversation in the Claude app: it finds the projects you've worked on with Claude Code, asks which ones to use, reads them without changing anything, and records a few first tasks as proposals.
 
+**Updating from Quota Harvest** (this app's earlier name): in the folder you installed it from, `git pull && ./install`. It stops the old app and removes its login item, carries its settings over, and moves the harvest skill to its new name (`harvest-season`); your queue, history and branches stay as they are. macOS asks once more whether the app may send notifications.
+
 ## Using it
 
 - **Queue** — approved tasks, top first, with each one's estimated share of your weekly quota. They run by priority unless you drag them into your own order. ▶ runs one now; ⊖ takes it out of the queue (or all of them at once).
@@ -57,7 +59,7 @@ Anything it replaces is backed up first. At the end it offers a short getting-st
 
 ## How it works
 
-- The widget is a single Swift file (`QuotaHarvest.swift`, AppKit + SwiftUI, no dependencies). It reads the usage from Anthropic's API with your Claude Code sign-in, every 5 minutes at most.
+- The widget is a single Swift file (`HarvestSeason.swift`, AppKit + SwiftUI, no dependencies). It reads the usage from Anthropic's API with your Claude Code sign-in, every 5 minutes at most.
 - The harvest's logic is a Python engine (`harvest/home/bin/harvest.py`, standard library only) that owns the backlog files, the budget, git worktrees and branches, and the run's state. Claude Code sessions call it through the skills in `harvest/skills/`.
 - `harvest/install.py` installs the engine, the skills and the instructions into your home folder and records a hash per file, so an update never overwrites something edited by hand, and removal takes out exactly what it put in.
 - Each task runs as its own Claude Code session inside its project, in a git worktree, on its own branch.

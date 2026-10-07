@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>dev.quota-harvest.widget</string>
+	<string>dev.harvest-season.widget</string>
 	<key>CFBundleName</key>
-	<string>Quota Harvest</string>
+	<string>Harvest Season</string>
 	<key>CFBundleDisplayName</key>
-	<string>Quota Harvest</string>
+	<string>Harvest Season</string>
 	<key>CFBundleExecutable</key>
-	<string>QuotaHarvest</string>
+	<string>HarvestSeason</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleLocalizations</key>
