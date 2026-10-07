@@ -43,7 +43,7 @@ From top to bottom:
 
 1. The header: "Claude", the account line, the live dot, the table button (all tasks — see "All tasks"; only while the harvest is installed), ↻ (it spins until both the figures and the listing are back — at least 0.8 s, at most 15 s), and the ⋯ menu: Settings…, All tasks… (installed only), open the harvest folder, watch the run in Terminal, Help ("עזרה — איך זה עובד"), Quit.
 2. The usage rows — 5 hours, weekly, the model's weekly (labeled as the API names it) — and under them one quiet line with the 5-hour and weekly reset times, to the minute (the API's times wobble around it).
-3. The harvest's sections, each collapsible, open or closed as last left — see "Harvest".
+3. The harvest's sections, each collapsible — all closed whenever the panel opens (each drop-down from the menu bar, `kill -USR1`, the floating panel at launch or on switching to it), so it opens on the counts; the footer's schedule too. The panel is sized closed before it shows. See "Harvest".
 4. The footer: the harvest's schedule and "run now", or the run in progress with Stop.
 
 A usage row is a label, a bar and a whole percentage. The bar is blue below 70 %, orange from 70 %, red from 90 %. With a known reset time its tooltip says when (`מתאפס <day> HH:mm` / `resets <day> HH:mm`); without data it shows "–" and an empty bar.

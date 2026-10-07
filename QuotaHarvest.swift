@@ -1263,27 +1263,20 @@ final class WidgetModel: ObservableObject {
     @Published var startAtLogin = false
     @Published var inMenuBar = false
     @Published var now = Date()
-    /// Off for snapshots, so rendering a preview never changes the owner's layout.
-    var persistsLayout = true
-    @Published var queueOpen = UserDefaults.standard.object(forKey: "QueueOpen") as? Bool ?? true {
-        didSet { remember(queueOpen, "QueueOpen") }
-    }
-    @Published var proposalsOpen = UserDefaults.standard.bool(forKey: "ProposalsOpen") {
-        didSet { remember(proposalsOpen, "ProposalsOpen") }
-    }
-    @Published var needsOpen = UserDefaults.standard.object(forKey: "NeedsOpen") as? Bool ?? true {
-        didSet { remember(needsOpen, "NeedsOpen") }
-    }
-    @Published var scheduleOpen = UserDefaults.standard.bool(forKey: "ScheduleOpen") {
-        didSet { remember(scheduleOpen, "ScheduleOpen") }
-    }
-    @Published var doneOpen = UserDefaults.standard.bool(forKey: "DoneOpen") {
-        didSet { remember(doneOpen, "DoneOpen") }
-    }
+    /// The panel's collapsible parts. All closed whenever the panel opens (`collapseAll`): the owner
+    /// sees the counts first and opens what they want.
+    @Published var queueOpen = false
+    @Published var proposalsOpen = false
+    @Published var needsOpen = false
+    @Published var scheduleOpen = false
+    @Published var doneOpen = false
     weak var actions: WidgetActions?
 
-    private func remember(_ open: Bool, _ key: String) {
-        if persistsLayout { UserDefaults.standard.set(open, forKey: key) }
+    func collapseAll() {
+        for open in [\WidgetModel.queueOpen, \.proposalsOpen, \.needsOpen, \.scheduleOpen, \.doneOpen]
+        where self[keyPath: open] {
+            self[keyPath: open] = false
+        }
     }
 
     var harvestActive: Bool { running || detachedRun || externalRun }
@@ -2542,6 +2535,7 @@ struct HelpView: View {
         ("מה זה", [
             "הווידג'ט מראה כמה ממכסת Claude כבר נוצלה, ומנהל את **הקציר**: ניצול של מכסה שבועית שהייתה הולכת לאיבוד באיפוס, על משימות קטנות מהבקלוג של הפרויקטים שלך.",
             "כל פרויקט מחזיק קובץ `BACKLOG.md`. הווידג'ט רק מציג אותו ומפעיל את המנוע — הוא לא עורך אותו בעצמו.",
+            "כל פתיחה של הווידג'ט מתחילה כשכל האזורים מקופלים: בכותרת של כל אחד רואים כמה יש בו, ולחיצה על הכותרת פותחת אותו.",
         ]),
         ("המדדים למעלה", [
             "**5 ש׳** — חלון של חמש שעות. **שבועי** — כל המודלים. השורה השלישית — מכסה שבועית של מודל מסוים (למשל Fable).",
@@ -2620,6 +2614,7 @@ struct HelpView: View {
         ("What it is", [
             "The widget shows how much of your Claude quota is already used, and runs the **harvest**: it spends weekly quota that would otherwise be lost at the reset on small tasks from your projects' backlogs.",
             "Each project keeps a `BACKLOG.md` file. The widget only shows it and runs the engine — it never edits the file itself.",
+            "Every time the widget opens, all its sections start folded: each one's header shows how much is in it, and a click on the header opens it.",
         ]),
         ("The meters at the top", [
             "**5h** — the five-hour window. **Weekly** — all models. The third row — the weekly quota of one particular model (for example Fable).",
@@ -3798,6 +3793,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             } else if self.panel.isVisible {
                 self.panel.orderOut(nil)
             } else {
+                self.collapsePanel()
                 self.panel.makeKeyAndOrderFront(nil)
             }
         }
@@ -3923,6 +3919,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         panel.setFrameAutosaveName(on ? floatingFrameName : "")
     }
 
+    /// Every opening starts with all sections closed — sized to that before it shows, so it doesn't
+    /// appear at the old height and then shrink.
+    func collapsePanel() {
+        model.collapseAll()
+        hostingView?.layoutSubtreeIfNeeded()
+        fitPanelToContent()
+    }
+
     /// Keeps the top edge fixed, so the panel grows and shrinks downward from
     /// the menu bar as sections open and close.
     func fitPanelToContent() {
@@ -3946,6 +3950,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         guard inMenuBar else {
             hideStatusItem()
             autosaveFloatingFrame(true)
+            collapsePanel()
             panel.orderFrontRegardless()
             return
         }
@@ -3997,6 +4002,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     /// screen's edges — or closes it when it's open.
     func toggleDropDown() {
         guard !panel.isVisible else { panel.orderOut(nil); return }
+        collapsePanel()
         if let itemWindow = statusItem?.button?.window {
             let anchor = itemWindow.frame
             let width = panel.frame.width
@@ -5346,7 +5352,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     func snapshotAllTasks(to path: String) {
         let args = CommandLine.arguments
         forceSnapshotLanguage()
-        model.persistsLayout = false
         allTasksModel.persistsLayout = false
         if let i = args.firstIndex(of: "--filter"), i + 1 < args.count, let f = TaskFilter(rawValue: args[i + 1]) {
             allTasksModel.filter = f
@@ -5423,7 +5428,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         model.harvestInstalled = FileManager.default.fileExists(atPath: harvestEngine.path)
             && !CommandLine.arguments.contains("--not-installed")
         model.dotColor = .systemGreen
-        model.persistsLayout = false
         if expandAll {
             model.queueOpen = true
             model.proposalsOpen = true
