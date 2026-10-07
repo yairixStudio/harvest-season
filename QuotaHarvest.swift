@@ -1185,6 +1185,7 @@ protocol WidgetActions: AnyObject {
     func stopHarvest()
     func setQueued(_ task: HTask, _ queued: Bool)
     func openNeed(_ task: HTask)
+    func rejectWaiting(_ task: HTask)
     func setConfig(_ config: HarvestConfig)
     func toggleStartAtLogin(_ on: Bool)
     func setMenuBar(_ on: Bool)
@@ -1537,7 +1538,7 @@ struct PanelView: View {
             EmptyLine(text: L("אין מה לבדוק", "Nothing to review"))
         } else {
             ByProject(tasks: m.listing.needsYou) { t in
-                NeedRow(task: t) { m.actions?.openNeed(t) }
+                NeedRow(task: t, onOpen: { m.actions?.openNeed(t) }, onReject: { m.actions?.rejectWaiting(t) })
             }
             Button(L("לשיחה עם קלוד על כל אלה ←", "Talk these over with Claude →")) { m.actions?.talk() }
                 .buttonStyle(.link).font(.system(size: 11)).padding(.top, 4)
@@ -2103,30 +2104,46 @@ struct TaskRow: View {
     }
 }
 
+/// Something that waits for the owner: a click opens the review (or the question) in the Claude app;
+/// ✕ at the far end is the owner's "no" — not merged, the task dropped, its branch archived.
 struct NeedRow: View {
     let task: HTask
     let onOpen: () -> Void
+    var onReject: (() -> Void)? = nil
 
     var body: some View {
-        Button(action: onOpen) {
-            HStack(spacing: 6) {
-                Image(systemName: task.status == "blocked" ? "questionmark.circle" : "arrow.triangle.branch")
-                    .font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 12)
-                Text(task.title).lineLimit(2).truncationMode(.tail).fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Text(age).font(.system(size: 11)).monospacedDigit()
-                    .foregroundStyle((task.ageDays ?? 0) >= 14 ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.secondary))
-                Image(systemName: "arrow.up.forward.app").font(.system(size: 10)).foregroundStyle(Color.accentColor)
+        // Two buttons side by side — a button inside the row's own label wouldn't get its clicks.
+        HStack(spacing: 6) {
+            Button(action: onOpen) {
+                HStack(spacing: 6) {
+                    Image(systemName: task.status == "blocked" ? "questionmark.circle" : "arrow.triangle.branch")
+                        .font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 12)
+                    Text(task.title).lineLimit(2).truncationMode(.tail).fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(age).font(.system(size: 11)).monospacedDigit()
+                        .foregroundStyle((task.ageDays ?? 0) >= 14 ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.secondary))
+                    Image(systemName: "arrow.up.forward.app").font(.system(size: 10)).foregroundStyle(Color.accentColor)
+                }
+                .padding(.vertical, 3)
+                .frame(minHeight: 24)
+                .contentShape(Rectangle())
             }
-            .padding(.vertical, 3)
-            .frame(minHeight: 24)
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .modifier(HoverHighlight())
+            .help(task.status == "blocked"
+                  ? L("חסום: ", "Blocked: ") + (task.question ?? "")
+                  : L("פתח סשן בקלוד שמציג את השינוי וממזג באישורך",
+                      "Open a Claude session that shows the change and merges it with your approval"))
+            if let onReject = onReject {
+                Button(action: onReject) { Image(systemName: "xmark.circle").font(.system(size: 12)) }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                    .frame(width: TaskRow.iconColumn)
+                    .help(task.status == "blocked"
+                          ? L("דחה — המשימה לא תתבצע ועוברת ל\"הוסרו\"", "Reject — the task won't be done and moves to Removed")
+                          : L("דחה — לא למזג. הענף עובר לארכיון (לא נמחק), והמשימה ל\"הוסרו\"",
+                              "Reject — don't merge. The branch is archived (not deleted), the task moves to Removed"))
+            }
         }
-        .buttonStyle(.plain)
-        .help(task.status == "blocked"
-              ? L("חסום: ", "Blocked: ") + (task.question ?? "")
-              : L("פתח סשן בקלוד שמציג את השינוי וממזג באישורך",
-                  "Open a Claude session that shows the change and merges it with your approval"))
     }
 
     var age: String {
@@ -2261,9 +2278,11 @@ func taskActions(_ t: HTask, _ actions: WidgetActions?) -> [TaskAction] {
         out.append(TaskAction(title: L("מחק את ההצעה", "Delete the proposal"), icon: "trash") { actions?.removeProposal(t) })
     case "blocked":
         out.append(TaskAction(title: L("לענות על השאלה", "Answer the question"), icon: "questionmark.bubble") { actions?.openNeed(t) })
+        out.append(TaskAction(title: L("דחה את המשימה", "Reject the task"), icon: "xmark.circle") { actions?.rejectWaiting(t) })
     case "done":
         if t.branchState == "unmerged" {
             out.append(TaskAction(title: L("לבדיקה ולמיזוג", "Review and merge"), icon: "arrow.triangle.branch") { actions?.openNeed(t) })
+            out.append(TaskAction(title: L("דחה — לא למזג", "Reject — don't merge"), icon: "xmark.circle") { actions?.rejectWaiting(t) })
         }
         if t.sessionId != nil {
             out.append(TaskAction(title: L("פתח את הסשן שביצע", "Open the session that did it"), icon: "arrow.up.forward.app") { actions?.openDone(t) })
@@ -2548,6 +2567,7 @@ struct HelpView: View {
             "עבודה שהקציר גמר ומחכה לך: ענף עם שינויים שעוד לא מוזג, או שאלה שהסוכן נתקע עליה. ליד כל שורה — כמה זמן היא מחכה (כתום אחרי 14 יום).",
             "הסמלים: **ענף** — שינוי גמור שעוד לא מוזג. **סימן שאלה** — שאלה שהסוכן נתקע עליה. **חץ יוצא מריבוע** — נפתח באפליקציית Claude.",
             "**לחיצה על שורה** פותחת סשן באפליקציית Claude שמראה מה השתנה, וממזג רק אם תאשר. בשאלה — עונים לו שם.",
+            "**✕** בסוף שורה = **דחייה**: השינוי לא ימוזג (או שהמשימה החסומה לא תתבצע). אחרי אישור — ואפשר לכתוב למה — המשימה עוברת ל\"הוסרו\", והענף נשמר בארכיון ולא נמחק.",
             "**\"לשיחה עם קלוד על כל אלה\"** בתחתית — שיחה אחת שעוברת על הכול וממליצה על כל פריט.",
             "כשמשהו מחכה יומיים ויותר מגיעה תזכורת (בין 10:00 ל-21:00). \"מחר\" דוחה אותה ביום. ענף שלא נגעת בו 35 יום עובר לארכיון — לא נמחק.",
         ]),
@@ -2561,7 +2581,7 @@ struct HelpView: View {
             "**כפתור הטבלה** בראש הווידג'ט (או **כל המשימות…** בתפריט ⋯, או \"כל המשימות בטבלה\" מתחת ל\"בוצעו\") פותח חלון עם כל המשימות מכל הפרויקטים, בטבלה אחת.",
             "למעלה: לשוניות עם מספרים — הכל, בתור, הצעות, מחכה לך, בוצעו, הוסרו (\"הכל\" הוא כל מה שלא הוסר) — חיפוש, ו\"**גם מה שנוקה**\" שמראה גם משימות שניקית מ\"בוצעו\".",
             "העמודות: מצב (במשימה שבתור — גם המקום שלה בתור), משימה, פרויקט, עדיפות, מורכבות, עלות משוערת, מתי נוספה, עדכון אחרון וענף. לחיצה על כותרת עמודה ממיינת לפיה.",
-            "**בחירת שורה** מראה למטה את הפרטים ואת מה שאפשר לעשות: להכניס לתור או להוציא, למחוק הצעה, לבדיקה ולמיזוג, לפתוח את הסשן שביצע, לנקות או להחזיר ל\"בוצעו\", ולפתוח את BACKLOG.md. אותן פעולות בלחיצה ימנית; לחיצה כפולה פותחת את הבדיקה או את הסשן. להריץ — רק מהווידג'ט.",
+            "**בחירת שורה** מראה למטה את הפרטים ואת מה שאפשר לעשות: להכניס לתור או להוציא, למחוק הצעה, לבדיקה ולמיזוג או לדחות, לפתוח את הסשן שביצע, לנקות או להחזיר ל\"בוצעו\", ולפתוח את BACKLOG.md. אותן פעולות בלחיצה ימנית; לחיצה כפולה פותחת את הבדיקה או את הסשן. להריץ — רק מהווידג'ט.",
         ]),
         ("קציר (בתחתית)", [
             "ספירה לאחור עד שהקציר האוטומטי מתחיל — רק כשהמתג \"אוטומטי\" דלוק. הוא רץ ב**פעימות**: כל פעימה היא חלון של 5 שעות, והאחרונה נגמרת לפני האיפוס השבועי. כמה פעימות — בוחרים בשורה (1–6), או \"אוטומטי\": כמה שצריך כדי לנצל את מה שנשאר מהשבוע על מה שבתור.",
@@ -2625,6 +2645,7 @@ struct HelpView: View {
             "Work the harvest finished that is waiting for you: a branch with changes not merged yet, or a question the agent got stuck on. Next to each row — how long it has waited (orange after 14 days).",
             "The icons: **a branch** — finished changes not merged yet. **A question mark** — a question the agent got stuck on. **An arrow out of a square** — opens in the Claude app.",
             "**Clicking a row** opens a session in the Claude app that shows what changed, and merges only if you approve. For a question — you answer it there.",
+            "**✕** at the end of a row = **rejecting** it: the change won't be merged (or the blocked task won't be done). After you confirm — you can say why — the task moves to Removed, and its branch is kept in the archive, not deleted.",
             "**\"Talk these over with Claude\"** at the bottom — one conversation that goes through everything and recommends what to do with each item.",
             "When something has waited two days or more, a reminder comes (between 10:00 and 21:00). \"Tomorrow\" puts it off by a day. A branch you haven't touched for 35 days is archived — not deleted.",
         ]),
@@ -2638,7 +2659,7 @@ struct HelpView: View {
             "**The table button** at the top of the widget (or **All tasks…** in the ⋯ menu, or \"All tasks in a table\" under Done) opens a window with every task of every project in one table.",
             "At the top: tabs with counts — All, Queue, Proposals, Waiting, Done, Removed (\"All\" is everything not removed) — a search, and **\"Show cleared\"**, which also shows the tasks you cleared from Done.",
             "The columns: status (for a queued task, also its place in the queue), task, project, priority, complexity, estimated cost, when it was added, the last update and the branch. Clicking a column's title sorts by it.",
-            "**Selecting a row** shows its details below, with what can be done: put it in the queue or take it out, delete a proposal, review and merge, open the session that did it, clear it from Done or bring it back, and open BACKLOG.md. The same actions are on a right-click; a double-click opens the review or the session. Running happens only from the widget.",
+            "**Selecting a row** shows its details below, with what can be done: put it in the queue or take it out, delete a proposal, review and merge or reject, open the session that did it, clear it from Done or bring it back, and open BACKLOG.md. The same actions are on a right-click; a double-click opens the review or the session. Running happens only from the widget.",
         ]),
         ("Harvest (at the bottom)", [
             "A countdown to the start of the automatic harvest — only while the \"automatic\" switch is on. It runs in **pulses**: each pulse is one 5-hour window, and the last one ends before the weekly reset. How many — you choose in the row (1–6), or \"Auto\": as many as it takes to spend what's left of the week on what's queued.",
@@ -4801,6 +4822,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
 
     func restoreDone(_ task: HTask) {
         runEngine(["clear-done", task.project, task.title, "--undo"]) { [weak self] _ in self?.refreshListing() }
+    }
+
+    /// ✕ on something waiting for the owner (and "דחה" in the all-tasks window): after a confirmation with an
+    /// optional reason, `reject` — the task is dropped and an unmerged branch archived, never merged.
+    func rejectWaiting(_ task: HTask) {
+        let blocked = task.status == "blocked"
+        let alert = NSAlert()
+        alert.messageText = blocked ? L("לוותר על \"\(task.title)\"?", "Give up on \"\(task.title)\"?")
+            : L("לא למזג את \"\(task.title)\"?", "Don't merge \"\(task.title)\"?")
+        alert.informativeText = blocked
+            ? L("המשימה לא תתבצע ועוברת ל\"הוסרו\" ב\"כל המשימות\".", "The task won't be done; it moves to Removed in \"All tasks\".")
+            : L("השינוי לא ימוזג. הענף נשמר בארכיון (backlog-archive/…) ולא נמחק, והמשימה עוברת ל\"הוסרו\".",
+                "The change won't be merged. Its branch is kept in the archive (backlog-archive/…), not deleted, and the task moves to Removed.")
+        let reason = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 22))
+        reason.placeholderString = L("למה? (לא חובה — נשמר במשימה)", "Why? (optional — kept with the task)")
+        alert.accessoryView = reason
+        alert.addButton(withTitle: L("דחה", "Reject"))
+        alert.addButton(withTitle: L("ביטול", "Cancel"))
+        alert.window.initialFirstResponder = reason
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { model.objectWillChange.send(); return }
+        var l = model.listing
+        l.needsYou.removeAll { $0 == task }
+        l.done.removeAll { $0.id == task.id && $0.branchState == "unmerged" }
+        model.listing = l
+        var args = ["reject", task.project, task.title]
+        let why = reason.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !why.isEmpty { args += ["--reason", why] }
+        runEngine(args) { [weak self] data in
+            guard let self else { return }
+            let reply = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            if reply?["ok"] as? Bool != true {
+                // Said in a window of its own: the reject may have come from the all-tasks window, with the panel closed.
+                let failed = NSAlert()
+                failed.messageText = L("\"\(task.title)\" לא נדחתה", "\"\(task.title)\" wasn't rejected")
+                failed.informativeText = reply?["inTheWay"] as? String == "checkout-branch"
+                    ? L("הענף שלה פתוח עכשיו בפרויקט. חזור לענף הראשי ונסה שוב.", "Its branch is checked out in the project. Switch back to the main branch and try again.")
+                    : (reply?["error"] as? String) ?? L("המנוע לא ענה.", "The engine didn't answer.")
+                NSApp.activate(ignoringOtherApps: true)
+                failed.runModal()
+            }
+            self.refreshListing()
+        }
     }
 
     /// "נקה הכל" under the done list, after a confirmation that says nothing but the list changes.

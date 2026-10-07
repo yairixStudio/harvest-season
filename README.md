@@ -49,7 +49,7 @@ Anything it replaces is backed up first. At the end it offers a short getting-st
 
 - **Queue** — approved tasks, top first, with each one's estimated share of your weekly quota. They run by priority unless you drag them into your own order. ▶ runs one now; ⊖ takes it out of the queue.
 - **Proposals** — ⊕ to approve, the trash can to delete, ⋯ next to a project for "no proposals from this project".
-- **Waiting for you** — finished branches and questions; a click opens a Claude session that walks you through the change.
+- **Waiting for you** — finished branches and questions; a click opens a Claude session that walks you through the change, ✕ rejects it (not merged, the branch archived).
 - **Done** — the last 30 days; a click opens the session that did the task, the trash can (or **Clear all**) tidies the list.
 - The **table button** at the top — **All tasks**: every task of every project in one window, with tabs, search, sortable columns, and each task's details and actions.
 - **Harvest** (bottom) — the countdown to the next automatic run, **Run now**, and the schedule.

@@ -268,6 +268,35 @@ class Harvest(unittest.TestCase):
         subprocess.run(["git", "-C", path, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "edit " + name],
                        check=True)
 
+    def test_the_owner_rejects_a_branch_instead_of_merging(self):
+        branch = self.finished_branch("Rename the helper")
+        self.run_engine("reject", self.repo, "Rename the helper", env=dict(self.env, HARVEST_UNATTENDED="1"), code=2)
+        subprocess.run(["git", "-C", self.repo, "checkout", "-q", branch], check=True)
+        out = self.run_engine("reject", self.repo, "Rename the helper", code=2)
+        self.assertEqual(out["inTheWay"], "checkout-branch")  # its branch is out: nothing moves
+        subprocess.run(["git", "-C", self.repo, "checkout", "-q", "main"], check=True)
+        out = self.run_engine("reject", self.repo, "Rename the helper", "--reason", "לא צריך את זה")
+        self.assertEqual((out["was"], out["archivedBranch"]), ("done", "backlog-archive/rename-the-helper"))
+        branches = subprocess.run(["git", "-C", self.repo, "branch", "--format=%(refname:short)"],
+                                  capture_output=True, text=True).stdout.split()
+        self.assertIn("backlog-archive/rename-the-helper", branches)  # kept, not merged
+        self.assertNotIn(branch, branches)
+        listing = self.run_engine("list", "--all")
+        self.assertEqual((listing["needsYou"], listing["done"]), ([], []))
+        task = [t for t in listing["all"] if t["title"] == "Rename the helper"][0]
+        self.assertEqual(task["status"], "dropped")
+        self.assertIn("לא צריך את זה", task["result"])
+        self.assertIn("backlog-archive/rename-the-helper", task["result"])
+        self.run_engine("reject", self.repo, "Rename the helper", code=2)  # nothing waits any more
+
+    def test_the_owner_rejects_a_blocked_task(self):
+        self.add("Pick a license")
+        self.run_engine("set-status", self.repo, "Pick a license", "blocked", "--result", "2026-10-01 · MIT or GPL?")
+        self.assertEqual(len(self.run_engine("list")["needsYou"]), 1)
+        out = self.run_engine("reject", self.repo, "Pick a license")
+        self.assertEqual((out["was"], out["archivedBranch"]), ("blocked", None))
+        self.assertEqual(self.run_engine("list")["needsYou"], [])
+
     def test_brief_and_merge(self):
         branch = self.finished_branch("Add a file")
         # BACKLOG.md tracked and edited by the engine is not the owner's work in the way.

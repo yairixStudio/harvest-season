@@ -178,6 +178,7 @@ TEXT = {
     "run_ended": {"he": "\n— הריצה הסתיימה —", "en": "\n— the run has ended —"},
     "removed": {"he": "%s · הוסר על ידי הבעלים", "en": "%s · removed by the owner"},
     "no_proposals": {"he": "%s · הוסר — בלי הצעות לפרויקט הזה", "en": "%s · removed — no proposals for this project"},
+    "rejected": {"he": "%s · נדחה על ידי הבעלים", "en": "%s · rejected by the owner"},
 }
 # A failed task's result starts with this marker in either language; a second failure blocks it.
 FAILED_MARKERS = (" · נכשל", " · failed")
@@ -1830,6 +1831,50 @@ def cmd_merge(a):
     emit({"ok": True, "project": repo, "title": v["title"], "branch": branch, "base": base, "head": head})
 
 
+def waiting_task(repo, title):
+    """The task under this title that waits for the owner: done with an unmerged harvest branch, or blocked.
+    A title can come back as a new task once the old one is done, so it's the section in that state."""
+    lines, tasks = parse_backlog(repo)
+    if lines is None:
+        fail("no BACKLOG.md in " + repo)
+    r = ratio()
+    for t in reversed(tasks):
+        if t["title"] == title.strip():
+            v = task_view(repo, t, r)
+            if v["status"] == "blocked" or (v["status"] == "done" and v.get("branchState") == "unmerged"):
+                return lines, t, v
+    fail("nothing waits for the owner under this title: " + title, project=repo)
+
+
+def cmd_reject(a):
+    """The owner's "no" to what waits for them: a finished branch they won't merge, or a blocked task they won't
+    pursue. The task becomes dropped, its result keeping what was done (so it isn't proposed again), and an
+    unmerged harvest branch moves to backlog-archive/ — kept, not merged, not deleted. Refuses while that branch
+    is checked out. Only the owner decides: never from an unattended run."""
+    if os.environ.get("HARVEST_UNATTENDED"):
+        fail("only the owner rejects work")
+    repo = os.path.abspath(a.project)
+    lines, t, v = waiting_task(repo, a.title)
+    result = v.get("result", "")
+    found = BRANCH_RE.search(result)
+    branch = v.get("branch") or (found.group(1) if found else None)
+    archived = None
+    if branch and branch.startswith("backlog/") and branch_exists(repo, branch):
+        if git(repo, "branch", "--show-current").stdout.strip() == branch:
+            fail("the branch is checked out in the project — switch back to %s first" % base_branch(repo),
+                 branch=branch, inTheWay="checkout-branch")
+        archived = branch.replace("backlog/", "backlog-archive/", 1)
+        if branch_exists(repo, archived):
+            archived += "-" + today()
+        mv = git(repo, "branch", "-m", branch, archived)
+        if mv.returncode != 0:
+            fail("could not archive the branch: " + (mv.stderr or mv.stdout).strip()[:300], branch=branch)
+        result = result.replace(branch, archived)
+    note = tr("rejected", today()) + (" · " + " ".join(a.reason.split()) if a.reason else "")
+    write_fields(repo, lines, t, {"status": "dropped", "result": note + (" · " + result if result else "")})
+    emit({"ok": True, "project": repo, "title": v["title"], "was": v["status"], "archivedBranch": archived})
+
+
 TALK_TOPICS = {"waiting": ("talk_name", "talk-prompt.md"), "onboard": ("onboard_name", "onboard-prompt.md")}
 
 
@@ -2303,6 +2348,11 @@ def main():
     p = sub.add_parser("merge")
     p.add_argument("project"); p.add_argument("title")
     p.set_defaults(fn=cmd_merge)
+
+    p = sub.add_parser("reject")
+    p.add_argument("project"); p.add_argument("title")
+    p.add_argument("--reason", help="why, in the owner's words — kept in the task's result")
+    p.set_defaults(fn=cmd_reject)
 
     p = sub.add_parser("discover")
     p.add_argument("--limit", type=int, default=20)

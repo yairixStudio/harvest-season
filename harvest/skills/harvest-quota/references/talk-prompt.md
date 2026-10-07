@@ -15,8 +15,8 @@ The owner said yes to the quota harvest's reminder: work the harvest did is wait
 
 3. Act only on the owner's explicit reply in this conversation, one step at a time, with a short line after each:
    - merge: `claude-harvest merge "<project>" "<title>"`. It refuses when the owner's checkout is on another branch, has uncommitted changes, or the branch conflicts — then say what is in the way and don't work around it. After merges in a project that has quick tests, run them once and report.
-   - drop: `claude-harvest set-status "<project>" "<title>" dropped`, then `git -C "<project>" branch -D <branch>`.
-   - a blocked question: `claude-harvest set-status "<project>" "<title>" open --answer "<the owner's answer>"` puts the task back in the queue with the answer for the next agent; or `done` / `dropped` when the owner says so.
+   - drop (don't merge): `claude-harvest reject "<project>" "<title>" --reason "<the owner's reason, if they gave one>"`. The task becomes dropped and its branch moves to `backlog-archive/` — kept, never merged. It refuses while the branch is checked out; say so.
+   - a blocked question: `claude-harvest set-status "<project>" "<title>" open --answer "<the owner's answer>"` puts the task back in the queue with the answer for the next agent; `done` when the owner says it's done; `claude-harvest reject` when they don't want it.
    - a branch that conflicts: offer to update it. Do that only in a separate worktree of the branch (`git -C "<project>" worktree add <temporary folder> <branch>`), never in the owner's checkout; commit there, then remove the worktree.
    - queue or pause proposals when asked: `claude-harvest set-status "<project>" "<title>" open|proposed`.
 

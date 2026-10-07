@@ -90,7 +90,8 @@ frame saved as `QuotaHarvestAllTasks`; the drop-down panel hides first in menu b
   result's date, else since added), branch (icon and name, its state in the tooltip).
 - Under the table, the selected task: status, title, project, its details, then the question (blocked),
   what was done (done) or the last note, and its actions — take out of the queue / put in the queue,
-  delete a proposal, review and merge or answer the question (`openNeed`), open the session that did it,
+  delete a proposal, review and merge or answer the question (`openNeed`), reject (blocked, and done
+  with an unmerged branch — `rejectWaiting`, as the panel's ✕), open the session that did it,
   clear from or back to the Done list, open BACKLOG.md. The same actions on a right-click; a double-click
   opens the review (or answer) or the session. No run controls: running stays in the panel.
 - `--snapshot-tasks <png> [--filter <tab>] [--select <row>] [--cleared] [--demo] [--light] [--he|--en]`
@@ -153,7 +154,13 @@ open or a harvest runs, else every 2 min):
   merged into the project's main branch, with their age (orange at 14+ days).
   Clicking opens `claude://code/new?folder=<project>&q=<prompt>`: a new desktop
   session that reviews and, on approval, merges the branch (or resolves the
-  blocking question).
+  blocking question). ✕ at the far end of a row (beside the row's button) is the owner's "no": a
+  confirmation with an optional reason (`NSAlert` with a text field), then `reject <project> <title>
+  [--reason …]` — the task becomes `dropped` (result: "<date> · rejected by the owner · reason · the old
+  result"), an unmerged `backlog/*` branch is renamed to `backlog-archive/*` (kept, never merged, never
+  deleted). The engine refuses while that branch is checked out (`inTheWay: checkout-branch`) and in
+  unattended runs; a refusal is said in an alert of its own, since the reject may come from the all-tasks
+  window. The talk session's prompt uses the same command for "don't merge".
 - **בוצעו** — `done` tasks of the last 30 days (at most 40), newest first under
   היום / אתמול / השבוע / קודם: title, project, and an icon for the branch (blue
   branch = waiting for review, green check = merged, archive box = archived,
