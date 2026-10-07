@@ -50,7 +50,8 @@ Anything it replaces is backed up first. At the end it offers a short getting-st
 - **Queue** — approved tasks, top first, with each one's estimated share of your weekly quota. They run by priority unless you drag them into your own order. ▶ runs one now; ⊖ takes it out of the queue.
 - **Proposals** — ⊕ to approve, the trash can to delete, ⋯ next to a project for "no proposals from this project".
 - **Waiting for you** — finished branches and questions; a click opens a Claude session that walks you through the change.
-- **Done** — the last 30 days; a click opens the session that did the task.
+- **Done** — the last 30 days; a click opens the session that did the task, the trash can (or **Clear all**) tidies the list.
+- The **table button** at the top — **All tasks**: every task of every project in one window, with tabs, search, sortable columns, and each task's details and actions.
 - **Harvest** (bottom) — the countdown to the next automatic run, **Run now**, and the schedule.
 - ⋯ → **Settings…** — five tabs: **General** (language, start at login, menu bar or floating, your details), **Harvest** (automatic runs, pulses, how much of each limit is kept free for you), **Models** (a model per task size, when and to what to switch), **Projects** (which may get proposals) and **Texts** (every instruction the harvest gives its agents, editable, with the default a click away). ⋯ → **Help** explains every part of the panel.
 

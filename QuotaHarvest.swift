@@ -514,7 +514,19 @@ struct HTask: Decodable, Identifiable, Equatable {
     let estimate: HEstimate?
     /// In the queue: placed by the owner's drag rather than by the automatic order.
     let placed: Bool?
+    let added: String?
+    let result: String?
+    /// The task's section line in its BACKLOG.md — unique, where a title may not be (a done task's
+    /// title can come back as a new one).
+    let line: Int?
+    /// A done task the owner cleared from the done list (`clear-done`).
+    let cleared: Bool?
     var id: String { project + "::" + title }
+}
+
+/// `harvest.py list --all`: every task of every registered project, for the all-tasks window.
+struct HAllListing: Decodable {
+    var all: [HTask]?
 }
 
 struct HRun: Decodable, Equatable {
@@ -1181,6 +1193,10 @@ protocol WidgetActions: AnyObject {
     func watchTerminal()
     func openLastRun()
     func openDone(_ task: HTask)
+    func clearDone(_ task: HTask)
+    func restoreDone(_ task: HTask)
+    func clearAllDone()
+    func showAllTasks()
     func talk()
     func showHelp()
     func showSetup()
@@ -1332,6 +1348,13 @@ struct PanelView: View {
             }
             Spacer(minLength: 4)
             Circle().fill(Color(nsColor: m.dotColor)).frame(width: 7, height: 7).help(m.dotTip)
+            if m.harvestInstalled {
+                Button { m.actions?.showAllTasks() } label: {
+                    Image(systemName: "tablecells").font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .help(L("כל המשימות — טבלה מפורטת", "All tasks — a detailed table"))
+            }
             Button { m.actions?.refreshNow() } label: {
                 Image(systemName: "arrow.clockwise").font(.system(size: 11, weight: .medium))
                     .symbolEffect(.rotate, isActive: m.refreshing)
@@ -1339,6 +1362,9 @@ struct PanelView: View {
             .buttonStyle(.plain).foregroundStyle(.secondary).help(L("רענן עכשיו", "Refresh now"))
             Menu {
                 Button(L("הגדרות…", "Settings…")) { m.actions?.showSettings() }
+                if m.harvestInstalled {
+                    Button(L("כל המשימות…", "All tasks…")) { m.actions?.showAllTasks() }
+                }
                 Divider()
                 Button(L("פתח את תיקיית הקציר", "Open the harvest folder")) { m.actions?.openHarvestFolder() }
                 Button(L("צפה בריצה בטרמינל", "Watch the run in Terminal")) { m.actions?.watchTerminal() }
@@ -1494,8 +1520,15 @@ struct PanelView: View {
             EmptyLine(text: L("עוד לא בוצעו משימות", "No tasks done yet"))
         } else {
             ByDay(tasks: m.listing.done) { t in
-                DoneRow(task: t) { m.actions?.openDone(t) }
+                DoneRow(task: t, onOpen: { m.actions?.openDone(t) }, onClear: { m.actions?.clearDone(t) })
             }
+            HStack(spacing: 14) {
+                Button(L("נקה הכל", "Clear all")) { m.actions?.clearAllDone() }
+                    .help(L("מוריד את כולן מהרשימה; הענפים והרישום ב-BACKLOG.md נשארים",
+                            "Takes them all off the list; branches and the BACKLOG.md entries stay"))
+                Button(L("כל המשימות בטבלה ←", "All tasks in a table →")) { m.actions?.showAllTasks() }
+            }
+            .buttonStyle(.link).font(.system(size: 11)).padding(.top, 4)
         }
     }
 
@@ -1898,27 +1931,38 @@ struct ByDay<Row: View>: View {
 }
 
 /// A finished task: whether its branch waits for review or was merged. A click
-/// opens the conversation that did it.
+/// opens the conversation that did it; the trash can at the far end clears it from the list.
 struct DoneRow: View {
     let task: HTask
     let onOpen: () -> Void
+    var onClear: (() -> Void)? = nil
 
     var body: some View {
-        Button(action: onOpen) {
-            HStack(spacing: 6) {
-                Image(systemName: icon).font(.system(size: 10)).foregroundStyle(tint).frame(width: 12)
-                Text(task.title).lineLimit(2).truncationMode(.tail).fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Text(task.projectName).font(.system(size: 11)).foregroundStyle(.tertiary).lineLimit(1)
-                    .frame(maxWidth: 90, alignment: .trailing)
+        // Two buttons side by side — a button inside the row's own label wouldn't get its clicks.
+        HStack(spacing: 6) {
+            Button(action: onOpen) {
+                HStack(spacing: 6) {
+                    Image(systemName: icon).font(.system(size: 10)).foregroundStyle(tint).frame(width: 12)
+                    Text(task.title).lineLimit(2).truncationMode(.tail).fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(task.projectName).font(.system(size: 11)).foregroundStyle(.tertiary).lineLimit(1)
+                        .frame(maxWidth: 90, alignment: .trailing)
+                }
+                .padding(.vertical, 3)
+                .frame(minHeight: 24)
+                .contentShape(Rectangle())
             }
-            .padding(.vertical, 3)
-            .frame(minHeight: 24)
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .modifier(HoverHighlight())
+            .help(tooltip)
+            if let onClear = onClear {
+                Button(action: onClear) { Image(systemName: "trash").font(.system(size: 10)) }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                    .frame(width: TaskRow.iconColumn)
+                    .help(L("נקה מהרשימה — הענף והרישום ב-BACKLOG.md נשארים, ואפשר להחזיר מ\"כל המשימות\"",
+                            "Clear it from the list — the branch and the BACKLOG.md entry stay, and \"All tasks\" can bring it back"))
+            }
         }
-        .buttonStyle(.plain)
-        .modifier(HoverHighlight())
-        .help(tooltip)
     }
 
     var icon: String {
@@ -2094,6 +2138,374 @@ struct NeedRow: View {
     }
 }
 
+// MARK: All tasks
+
+/// Which tasks the all-tasks window shows. "All" leaves out the removed ones, which have a tab of their own.
+enum TaskFilter: String, CaseIterable, Identifiable {
+    case all, queue, proposals, waiting, done, dropped
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .all: return L("הכל", "All")
+        case .queue: return L("בתור", "Queue")
+        case .proposals: return L("הצעות", "Proposals")
+        case .waiting: return L("מחכה לך", "Waiting")
+        case .done: return L("בוצעו", "Done")
+        case .dropped: return L("הוסרו", "Removed")
+        }
+    }
+
+    func includes(_ t: HTask) -> Bool {
+        switch self {
+        case .all: return t.status != "dropped"
+        case .queue: return t.status == "open"
+        case .proposals: return t.status == "proposed"
+        case .waiting: return t.status == "blocked" || (t.status == "done" && t.branchState == "unmerged")
+        case .done: return t.status == "done"
+        case .dropped: return t.status == "dropped"
+        }
+    }
+}
+
+/// Where a task stands, as the table's first column says it: its order (what needs the owner first),
+/// a word and a color.
+func taskStage(_ t: HTask) -> (order: Int, label: String, color: Color) {
+    switch t.status {
+    case "blocked": return (0, L("שאלה אליך", "Question for you"), .orange)
+    case "done" where t.branchState == "unmerged": return (0, L("מחכה למיזוג", "Awaiting merge"), .orange)
+    case "open": return (1, L("בתור", "Queued"), .accentColor)
+    case "proposed": return (2, L("הצעה", "Proposal"), .purple)
+    case "done": return (3, t.cleared == true ? L("בוצעה · נוקתה", "Done · cleared") : L("בוצעה", "Done"), .green)
+    default: return (4, L("הוסרה", "Removed"), .gray)
+    }
+}
+
+/// One task as a table row: every sortable value is plain (a table can't sort by an optional).
+struct TaskLine: Identifiable {
+    let task: HTask
+    /// Its place in the queue's run order; Int.max for a task that isn't queued.
+    let runOrder: Int
+
+    static func key(_ t: HTask) -> String { t.project + "#" + (t.line.map(String.init) ?? t.title) }
+    var id: String { Self.key(task) }
+    var stage: Int { taskStage(task).order }
+    var title: String { task.title }
+    var project: String { task.projectName }
+    var priority: Int { task.priority }
+    var size: Int { ["low": 0, "medium": 1, "high": 2][task.complexity] ?? 1 }
+    var pct: Double { ["open", "proposed", "blocked"].contains(task.status) ? task.pct : -1 }
+    var added: String { task.added ?? "" }
+    var age: Int { task.ageDays ?? Int.max }
+    var branch: String { task.branch ?? "" }
+}
+
+final class AllTasksModel: ObservableObject {
+    @Published var tasks: [HTask] = []
+    /// Run order of the queued tasks (`HTask.id` → place), from the listing.
+    @Published var runOrder: [String: Int] = [:]
+    @Published var loaded = false
+    @Published var updated: Date?
+    @Published var filter = TaskFilter(rawValue: UserDefaults.standard.string(forKey: "AllTasksFilter") ?? "") ?? .all {
+        didSet { if persistsLayout { UserDefaults.standard.set(filter.rawValue, forKey: "AllTasksFilter") } }
+    }
+    @Published var search = ""
+    @Published var showCleared = false
+    @Published var selection: String?
+    @Published var sortOrder = [KeyPathComparator(\TaskLine.stage), KeyPathComparator(\TaskLine.runOrder),
+                                KeyPathComparator(\TaskLine.age)]
+    /// Off for snapshots, so rendering a preview never changes the owner's choice of tab.
+    var persistsLayout = true
+
+    func update(_ all: [HTask], queue: [HTask]) {
+        let order = Dictionary(queue.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
+        if all != tasks { tasks = all }
+        if order != runOrder { runOrder = order }
+        loaded = true
+        updated = Date()
+    }
+
+    func shown(_ f: TaskFilter, _ t: HTask) -> Bool { f.includes(t) && (showCleared || t.cleared != true) }
+
+    func count(_ f: TaskFilter) -> Int { tasks.filter { shown(f, $0) }.count }
+
+    var rows: [TaskLine] {
+        let q = search.trimmingCharacters(in: .whitespaces)
+        return tasks
+            .filter { shown(filter, $0) }
+            .filter { q.isEmpty || $0.title.localizedCaseInsensitiveContains(q) || $0.projectName.localizedCaseInsensitiveContains(q)
+                || ($0.details ?? "").localizedCaseInsensitiveContains(q) || ($0.result ?? "").localizedCaseInsensitiveContains(q) }
+            .map { TaskLine(task: $0, runOrder: $0.status == "open" ? runOrder[$0.id] ?? Int.max : Int.max) }
+            .sorted(using: sortOrder)
+    }
+
+    var selected: HTask? { tasks.first { TaskLine.key($0) == selection } }
+}
+
+/// What can be done with a task from the all-tasks window — the same actions as the panel's, without
+/// starting a run.
+struct TaskAction: Identifiable {
+    let title: String
+    let icon: String
+    let run: () -> Void
+    var id: String { title }
+}
+
+func taskActions(_ t: HTask, _ actions: WidgetActions?) -> [TaskAction] {
+    var out: [TaskAction] = []
+    switch t.status {
+    case "open":
+        out.append(TaskAction(title: L("הוצא מהתור", "Take out of the queue"), icon: "minus.circle") { actions?.setQueued(t, false) })
+    case "proposed":
+        out.append(TaskAction(title: L("הכנס לתור", "Put in the queue"), icon: "plus.circle") { actions?.setQueued(t, true) })
+        out.append(TaskAction(title: L("מחק את ההצעה", "Delete the proposal"), icon: "trash") { actions?.removeProposal(t) })
+    case "blocked":
+        out.append(TaskAction(title: L("לענות על השאלה", "Answer the question"), icon: "questionmark.bubble") { actions?.openNeed(t) })
+    case "done":
+        if t.branchState == "unmerged" {
+            out.append(TaskAction(title: L("לבדיקה ולמיזוג", "Review and merge"), icon: "arrow.triangle.branch") { actions?.openNeed(t) })
+        }
+        if t.sessionId != nil {
+            out.append(TaskAction(title: L("פתח את הסשן שביצע", "Open the session that did it"), icon: "arrow.up.forward.app") { actions?.openDone(t) })
+        }
+        out.append(t.cleared == true
+            ? TaskAction(title: L("החזר לרשימת \"בוצעו\"", "Back to the Done list"), icon: "arrow.uturn.backward") { actions?.restoreDone(t) }
+            : TaskAction(title: L("נקה מרשימת \"בוצעו\"", "Clear from the Done list"), icon: "trash") { actions?.clearDone(t) })
+    default:
+        break
+    }
+    out.append(TaskAction(title: L("פתח את BACKLOG.md", "Open BACKLOG.md"), icon: "doc.text") {
+        NSWorkspace.shared.open(URL(fileURLWithPath: t.project).appendingPathComponent("BACKLOG.md"))
+    })
+    return out
+}
+
+/// "30.09" this year, "30.09.25" before it, from the engine's YYYY-MM-DD.
+func shortDate(_ iso: String?) -> String {
+    let p = (iso ?? "").split(separator: "-").map(String.init)
+    guard p.count == 3 else { return "" }
+    let thisYear = String(Calendar.current.component(.year, from: Date()))
+    return p[0] == thisYear ? "\(p[2]).\(p[1])" : "\(p[2]).\(p[1]).\(p[0].suffix(2))"
+}
+
+func daysAgo(_ days: Int?) -> String {
+    switch days {
+    case nil: return ""
+    case 0?: return L("היום", "today")
+    case 1?: return L("אתמול", "yesterday")
+    case let d?: return L("לפני \(d) ימים", "\(d) days ago")
+    }
+}
+
+struct StageBadge: View {
+    let task: HTask
+    /// A queued task's place in the run order.
+    var place: Int? = nil
+    var body: some View {
+        let s = taskStage(task)
+        HStack(spacing: 5) {
+            Circle().fill(s.color).frame(width: 7, height: 7)
+            Text(place.map { s.label + " · \($0)" } ?? s.label).foregroundStyle(task.cleared == true || task.status == "dropped" ? .secondary : .primary)
+        }
+    }
+}
+
+/// The panel's table button and ⋯ → "כל המשימות…": every task of every registered project in one
+/// window — filters with counts, a search, sortable columns, and the selected task's details and actions.
+struct AllTasksView: View {
+    @ObservedObject var m: WidgetModel
+    @ObservedObject var t: AllTasksModel
+    /// Stored, so a language change counts as a change to this view.
+    var hebrew = uiHebrew
+
+    static let width: CGFloat = 1100
+
+    var body: some View {
+        VStack(spacing: 0) {
+            toolbar.padding(EdgeInsets(top: 12, leading: 14, bottom: 10, trailing: 14))
+            table
+            Divider()
+            details.frame(height: 150, alignment: .top)
+        }
+        .font(.system(size: 12))
+        .environment(\.layoutDirection, hebrew ? .rightToLeft : .leftToRight)
+    }
+
+    var toolbar: some View {
+        HStack(spacing: 12) {
+            Picker("", selection: $t.filter) {
+                ForEach(TaskFilter.allCases) { f in Text("\(f.title) \(t.count(f))").tag(f) }
+            }
+            .pickerStyle(.segmented).labelsHidden().fixedSize()
+            Spacer(minLength: 8)
+            Toggle(L("גם מה שנוקה", "Show cleared"), isOn: $t.showCleared).toggleStyle(.checkbox).fixedSize()
+                .help(L("משימות שבוצעו וניקית מרשימת \"בוצעו\" בווידג'ט", "Done tasks you cleared from the widget's Done list"))
+            HStack(spacing: 4) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.tertiary)
+                TextField(L("חיפוש", "Search"), text: $t.search).textFieldStyle(.plain).frame(width: 130)
+                if !t.search.isEmpty {
+                    Button { t.search = "" } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain).foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 7).padding(.vertical, 4)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
+            Button { m.actions?.refreshNow() } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.plain).foregroundStyle(.secondary).help(L("רענן", "Refresh"))
+        }
+    }
+
+    var table: some View {
+        let rows = t.rows
+        return Table(rows, selection: $t.selection, sortOrder: $t.sortOrder) {
+            TableColumn(L("מצב", "Status"), value: \TaskLine.stage) { r in
+                StageBadge(task: r.task, place: r.runOrder == Int.max ? nil : r.runOrder + 1)
+            }
+            .width(min: 90, ideal: 110)
+            TableColumn(L("משימה", "Task"), value: \TaskLine.title) { r in
+                Text(r.title).lineLimit(1).help(r.title)
+            }
+            .width(min: 150, ideal: 230)
+            TableColumn(L("פרויקט", "Project"), value: \TaskLine.project) { r in
+                Text(r.project).lineLimit(1).foregroundStyle(.secondary).help(r.task.project)
+            }
+            .width(min: 70, ideal: 110)
+            TableColumn(L("עדיפות", "Priority"), value: \TaskLine.priority) { r in
+                Text(priorityText(r.priority)).foregroundStyle(r.priority == 1 ? .primary : .secondary)
+            }
+            .width(min: 46, ideal: 54)
+            TableColumn(L("מורכבות", "Complexity"), value: \TaskLine.size) { r in
+                Text(sizeText(r.task.complexity)).foregroundStyle(.secondary)
+            }
+            .width(min: 46, ideal: 70)
+            TableColumn(L("עלות", "Cost"), value: \TaskLine.pct) { r in
+                Text(r.pct < 0 ? "" : pctText(r.pct)).monospacedDigit().foregroundStyle(.secondary)
+                    .help(L("כ־\(r.task.tokens / 1000) אלף טוקנים", "~\(r.task.tokens / 1000)K tokens"))
+            }
+            .width(min: 44, ideal: 56)
+            TableColumn(L("נוספה", "Added"), value: \TaskLine.added) { r in
+                Text(shortDate(r.task.added)).monospacedDigit().foregroundStyle(.secondary)
+            }
+            .width(min: 40, ideal: 48)
+            TableColumn(L("עדכון", "Updated"), value: \TaskLine.age) { r in
+                Text(daysAgo(r.task.ageDays)).foregroundStyle(.secondary)
+            }
+            .width(min: 56, ideal: 78)
+            TableColumn(L("ענף", "Branch"), value: \TaskLine.branch) { r in
+                if let b = r.task.branch {
+                    HStack(spacing: 4) {
+                        Image(systemName: branchIcon(r.task.branchState)).font(.system(size: 10))
+                            .foregroundStyle(r.task.branchState == "merged" ? Color.green : r.task.branchState == "unmerged" ? Color.accentColor : Color.secondary)
+                        Text(b).font(.system(size: 11, design: .monospaced)).lineLimit(1).truncationMode(.middle)
+                            .foregroundStyle(.secondary)
+                    }
+                    .help(branchNote(r.task.branchState))
+                }
+            }
+            .width(min: 80, ideal: 120)
+        }
+        .contextMenu(forSelectionType: String.self) { ids in
+            if let id = ids.first, let task = t.tasks.first(where: { TaskLine.key($0) == id }) {
+                ForEach(taskActions(task, m.actions)) { a in
+                    Button { a.run() } label: { Label(a.title, systemImage: a.icon) }
+                }
+            }
+        } primaryAction: { ids in
+            // A double-click does the row's main thing: the review, the answer, or the session.
+            if let id = ids.first, let task = t.tasks.first(where: { TaskLine.key($0) == id }),
+               task.status == "blocked" || task.status == "done" {
+                task.status == "done" && task.branchState != "unmerged" ? m.actions?.openDone(task) : m.actions?.openNeed(task)
+            }
+        }
+        .overlay {
+            if !t.loaded {
+                ProgressView().controlSize(.small)
+            } else if rows.isEmpty {
+                Text(t.search.isEmpty ? L("אין כאן משימות", "No tasks here") : L("אין משימות שמתאימות לחיפוש", "No tasks match the search"))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    @ViewBuilder var details: some View {
+        if let task = t.selected {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    StageBadge(task: task, place: task.status == "open" ? t.runOrder[task.id].map { $0 + 1 } : nil).font(.system(size: 11))
+                    Text(task.title).font(.system(size: 13, weight: .semibold)).lineLimit(2).textSelection(.enabled)
+                    Spacer(minLength: 8)
+                    Text(task.projectName).foregroundStyle(.secondary).help(task.project)
+                }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 5) {
+                        if let d = task.details, !d.isEmpty { field(L("מה לעשות", "What to do"), d) }
+                        if task.status == "blocked", let q = task.question, !q.isEmpty {
+                            field(L("השאלה", "The question"), q)
+                        } else if task.status == "done", let s = task.summary, !s.isEmpty {
+                            field(L("מה נעשה", "What was done"), s)
+                        } else if let r = task.result, !r.isEmpty {
+                            field(L("הערה אחרונה", "Last note"), r)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                HStack(spacing: 8) {
+                    ForEach(taskActions(task, m.actions)) { a in
+                        Button { a.run() } label: { Label(a.title, systemImage: a.icon) }.controlSize(.small)
+                    }
+                    Spacer()
+                }
+            }
+            .padding(EdgeInsets(top: 10, leading: 14, bottom: 10, trailing: 14))
+        } else {
+            VStack(spacing: 4) {
+                Text(L("בחר שורה — כאן יופיעו הפרטים והפעולות", "Select a row — its details and actions show here"))
+                    .foregroundStyle(.tertiary)
+                if let u = t.updated {
+                    Text(L("\(t.tasks.count) משימות בכל הפרויקטים · עודכן ", "\(t.tasks.count) tasks across your projects · updated ")
+                         + formatTime(u, "HH:mm"))
+                        .font(.system(size: 11)).foregroundStyle(.tertiary)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    func field(_ label: String, _ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label).foregroundStyle(.secondary).frame(width: 80, alignment: .leading)
+            Text(text).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    func priorityText(_ p: Int) -> String {
+        p <= 1 ? L("גבוהה", "High") : p == 2 ? L("רגילה", "Normal") : L("נמוכה", "Low")
+    }
+
+    func sizeText(_ c: String) -> String {
+        c == "low" ? L("נמוכה", "Low") : c == "high" ? L("גבוהה", "High") : L("בינונית", "Medium")
+    }
+
+    func branchIcon(_ state: String?) -> String {
+        switch state {
+        case "unmerged": return "arrow.triangle.branch"
+        case "merged": return "checkmark.circle.fill"
+        case "archived": return "archivebox"
+        default: return "questionmark.circle"
+        }
+    }
+
+    func branchNote(_ state: String?) -> String {
+        switch state {
+        case "unmerged": return L("מחכה לבדיקה ולמיזוג שלך", "Waiting for your review and merge")
+        case "merged": return L("מוזג", "Merged")
+        case "archived": return L("בארכיון", "Archived")
+        default: return L("הענף כבר לא קיים", "The branch is gone")
+        }
+    }
+}
+
 // MARK: Help
 
 /// ⋯ → "עזרה": what every part of the panel means, in plain words for the owner — `topics` in
@@ -2143,6 +2555,13 @@ struct HelpView: View {
             "מה שהושלם ב-30 הימים האחרונים: היום, אתמול, השבוע, קודם.",
             "הסמל: **ענף כחול** — מחכה לבדיקה שלך. **וי ירוק** — מוזג. **קופסה** — עבר לארכיון. **וי רגיל** — בוצע בלי ענף של קציר.",
             "**לחיצה על שורה** פותחת באפליקציית Claude את הסשן שעשה את העבודה.",
+            "**פח** בסוף שורה מנקה אותה מהרשימה, ו\"**נקה הכל**\" בתחתית מנקה את כולן (אחרי אישור). זה רק מסדר את הרשימה: הענף, \"מחכה לך\" והרישום ב-BACKLOG.md נשארים, ומחלון \"כל המשימות\" אפשר להחזיר כל אחת.",
+        ]),
+        ("כל המשימות", [
+            "**כפתור הטבלה** בראש הווידג'ט (או **כל המשימות…** בתפריט ⋯, או \"כל המשימות בטבלה\" מתחת ל\"בוצעו\") פותח חלון עם כל המשימות מכל הפרויקטים, בטבלה אחת.",
+            "למעלה: לשוניות עם מספרים — הכל, בתור, הצעות, מחכה לך, בוצעו, הוסרו (\"הכל\" הוא כל מה שלא הוסר) — חיפוש, ו\"**גם מה שנוקה**\" שמראה גם משימות שניקית מ\"בוצעו\".",
+            "העמודות: מצב (במשימה שבתור — גם המקום שלה בתור), משימה, פרויקט, עדיפות, מורכבות, עלות משוערת, מתי נוספה, עדכון אחרון וענף. לחיצה על כותרת עמודה ממיינת לפיה.",
+            "**בחירת שורה** מראה למטה את הפרטים ואת מה שאפשר לעשות: להכניס לתור או להוציא, למחוק הצעה, לבדיקה ולמיזוג, לפתוח את הסשן שביצע, לנקות או להחזיר ל\"בוצעו\", ולפתוח את BACKLOG.md. אותן פעולות בלחיצה ימנית; לחיצה כפולה פותחת את הבדיקה או את הסשן. להריץ — רק מהווידג'ט.",
         ]),
         ("קציר (בתחתית)", [
             "ספירה לאחור עד שהקציר האוטומטי מתחיל — רק כשהמתג \"אוטומטי\" דלוק. הוא רץ ב**פעימות**: כל פעימה היא חלון של 5 שעות, והאחרונה נגמרת לפני האיפוס השבועי. כמה פעימות — בוחרים בשורה (1–6), או \"אוטומטי\": כמה שצריך כדי לנצל את מה שנשאר מהשבוע על מה שבתור.",
@@ -2155,7 +2574,7 @@ struct HelpView: View {
             "אחרי ריצה: שורת \"קציר אחרון\" — לחיצה פותחת את כל השיחה של הריצה.",
         ]),
         ("התפריט ⋯", [
-            "**הגדרות…** · **פתח את תיקיית הקציר** (דוחות ולוגים) · **צפה בריצה בטרמינל** · **עזרה** — המסך הזה · **צא מהווידג'ט**.",
+            "**הגדרות…** · **כל המשימות…** — הטבלה · **פתח את תיקיית הקציר** (דוחות ולוגים) · **צפה בריצה בטרמינל** · **עזרה** — המסך הזה · **צא מהווידג'ט**.",
         ]),
         ("הגדרות", [
             "חמש לשוניות בראש החלון.",
@@ -2213,6 +2632,13 @@ struct HelpView: View {
             "What was completed in the last 30 days: today, yesterday, this week, earlier.",
             "The icon: **blue branch** — waiting for your review. **Green check** — merged. **Box** — archived. **Plain check** — done without a harvest branch.",
             "**Clicking a row** opens the session that did the work in the Claude app.",
+            "**The trash can** at the end of a row clears it from the list, and **\"Clear all\"** at the bottom clears them all (after you confirm). It only tidies the list: the branch, \"Waiting for you\" and the BACKLOG.md entry stay, and the \"All tasks\" window can bring any of them back.",
+        ]),
+        ("All tasks", [
+            "**The table button** at the top of the widget (or **All tasks…** in the ⋯ menu, or \"All tasks in a table\" under Done) opens a window with every task of every project in one table.",
+            "At the top: tabs with counts — All, Queue, Proposals, Waiting, Done, Removed (\"All\" is everything not removed) — a search, and **\"Show cleared\"**, which also shows the tasks you cleared from Done.",
+            "The columns: status (for a queued task, also its place in the queue), task, project, priority, complexity, estimated cost, when it was added, the last update and the branch. Clicking a column's title sorts by it.",
+            "**Selecting a row** shows its details below, with what can be done: put it in the queue or take it out, delete a proposal, review and merge, open the session that did it, clear it from Done or bring it back, and open BACKLOG.md. The same actions are on a right-click; a double-click opens the review or the session. Running happens only from the widget.",
         ]),
         ("Harvest (at the bottom)", [
             "A countdown to the start of the automatic harvest — only while the \"automatic\" switch is on. It runs in **pulses**: each pulse is one 5-hour window, and the last one ends before the weekly reset. How many — you choose in the row (1–6), or \"Auto\": as many as it takes to spend what's left of the week on what's queued.",
@@ -2225,7 +2651,7 @@ struct HelpView: View {
             "After a run: the \"Last harvest\" line — a click opens the run's whole conversation.",
         ]),
         ("The ⋯ menu", [
-            "**Settings…** · **Open the harvest folder** (reports and logs) · **Watch the run in Terminal** · **Help** — this screen · **Quit the widget**.",
+            "**Settings…** · **All tasks…** — the table · **Open the harvest folder** (reports and logs) · **Watch the run in Terminal** · **Help** — this screen · **Quit the widget**.",
         ]),
         ("Settings", [
             "Five tabs at the top of the window.",
@@ -3258,6 +3684,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     let setupModel = SetupModel()
     var settingsWindow: NSWindow?
     let settingsModel = SettingsModel()
+    var allTasksWindow: NSWindow?
+    let allTasksModel = AllTasksModel()
     /// Which conversation `talk` is starting: "waiting" (the review) or "onboard".
     var talkTopic = "waiting"
     /// `kill -USR1 <pid>` toggles the panel; `kill -USR2 <pid>` runs the whole
@@ -3305,6 +3733,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         }
         if let i = args.firstIndex(of: "--snapshot-help"), i + 1 < args.count {
             snapshotHelp(to: args[i + 1])
+            return
+        }
+        if let i = args.firstIndex(of: "--snapshot-tasks"), i + 1 < args.count {
+            snapshotAllTasks(to: args[i + 1])
             return
         }
         if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
@@ -3854,11 +4286,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     func refreshListing(then: (() -> Void)? = nil) {
         let installed = FileManager.default.fileExists(atPath: harvestEngine.path)
         if model.harvestInstalled != installed { model.harvestInstalled = installed }
-        runEngine(["list"]) { [weak self] data in
+        // While the all-tasks window is open the same call brings every task too — one engine run, not two.
+        let withAll = allTasksWindow?.isVisible == true
+        runEngine(withAll ? ["list", "--all"] : ["list"]) { [weak self] data in
             guard let self else { return }
             if let data = data, let listing = try? JSONDecoder().decode(HListing.self, from: data) {
                 let wasHebrew = uiHebrew
                 if listing != self.model.listing { self.model.listing = listing }
+                if withAll, let all = (try? JSONDecoder().decode(HAllListing.self, from: data))?.all {
+                    self.allTasksModel.update(all, queue: listing.queue)
+                }
                 if uiHebrew != wasHebrew { self.languageChanged() }
                 // A launcher still alive from a previous widget instance is still ours to
                 // watch and stop; any other live lock is a run started elsewhere (a desktop
@@ -3896,6 +4333,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         if let window = helpWindow {
             window.title = L("עזרה — קציר מכסה", "Help — Quota harvest")
             (window.contentView as? NSHostingView<HelpView>)?.rootView = HelpView()
+        }
+        if let window = allTasksWindow {
+            window.title = L("כל המשימות — קציר מכסה", "All tasks — Quota harvest")
+            (window.contentView as? NSHostingView<AllTasksView>)?.rootView = AllTasksView(m: model, t: allTasksModel)
         }
     }
 
@@ -4349,6 +4790,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         runEngine(["set-status", task.project, task.title, "dropped"]) { [weak self] _ in self?.refreshListing() }
     }
 
+    /// A done row's trash can: off the list at once. The task stays in BACKLOG.md (`- cleared:`), with its
+    /// branch; the all-tasks window brings it back.
+    func clearDone(_ task: HTask) {
+        var l = model.listing
+        l.done.removeAll { $0 == task }
+        model.listing = l
+        runEngine(["clear-done", task.project, task.title]) { [weak self] _ in self?.refreshListing() }
+    }
+
+    func restoreDone(_ task: HTask) {
+        runEngine(["clear-done", task.project, task.title, "--undo"]) { [weak self] _ in self?.refreshListing() }
+    }
+
+    /// "נקה הכל" under the done list, after a confirmation that says nothing but the list changes.
+    func clearAllDone() {
+        let count = model.listing.done.count
+        guard count > 0 else { return }
+        let alert = NSAlert()
+        alert.messageText = L("לנקות את \(count) המשימות מ\"בוצעו\"?", "Clear the \(count) tasks from Done?")
+        alert.informativeText = L("הן יורדות רק מהרשימה: הענפים, \"מחכה לך\" והרישום ב-BACKLOG.md נשארים. אפשר להחזיר כל אחת מ\"כל המשימות\".",
+                                  "They only leave the list: branches, \"Waiting for you\" and the BACKLOG.md entries stay. \"All tasks\" can bring any of them back.")
+        alert.addButton(withTitle: L("נקה", "Clear"))
+        alert.addButton(withTitle: L("ביטול", "Cancel"))
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { model.objectWillChange.send(); return }
+        var l = model.listing
+        l.done = []
+        model.listing = l
+        runEngine(["clear-done", "--all"]) { [weak self] _ in self?.refreshListing() }
+    }
+
+    /// The panel's table button and ⋯ → "כל המשימות…": one window, reused, brought to the front, where it
+    /// was last left. Filled by the listing, which asks for every task while the window is open.
+    func showAllTasks() {
+        if statusItem != nil { panel.orderOut(nil) }
+        if allTasksWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: AllTasksView.width, height: 640),
+                                  styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                                  backing: .buffered, defer: false)
+            window.title = L("כל המשימות — קציר מכסה", "All tasks — Quota harvest")
+            window.isReleasedWhenClosed = false
+            window.contentView = NSHostingView(rootView: AllTasksView(m: model, t: allTasksModel))
+            window.contentMinSize = NSSize(width: 760, height: 420)
+            window.center()
+            window.setFrameAutosaveName("QuotaHarvestAllTasks")
+            allTasksWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        allTasksWindow?.makeKeyAndOrderFront(nil)
+        refreshListing()
+    }
+
     /// Proposals for a project off (after a confirmation that says what goes) or back on.
     func setProposals(project: String, name: String, on: Bool) {
         if !on {
@@ -4781,6 +5274,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         forceSnapshotLanguage()
         renderSnapshot(NSHostingView(rootView: HelpView(scrolls: false)
             .background(Color(nsColor: .windowBackgroundColor))), width: 460, to: path)
+    }
+
+    /// `--snapshot-tasks <png> [--filter all|queue|proposals|waiting|done|dropped] [--select <row>] [--cleared]
+    /// [--demo] [--light] [--he|--en]`: the all-tasks window at its opening size, from `list --all` (or the
+    /// demo data) — and exits.
+    func snapshotAllTasks(to path: String) {
+        let args = CommandLine.arguments
+        forceSnapshotLanguage()
+        model.persistsLayout = false
+        allTasksModel.persistsLayout = false
+        if let i = args.firstIndex(of: "--filter"), i + 1 < args.count, let f = TaskFilter(rawValue: args[i + 1]) {
+            allTasksModel.filter = f
+        }
+        allTasksModel.showCleared = args.contains("--cleared")
+        let render = {
+            if let i = args.firstIndex(of: "--select"), i + 1 < args.count, let n = Int(args[i + 1]) {
+                let rows = self.allTasksModel.rows
+                if rows.indices.contains(n) { self.allTasksModel.selection = rows[n].id }
+            }
+            self.renderSnapshot(NSHostingView(rootView: AllTasksView(m: self.model, t: self.allTasksModel)
+                .frame(width: AllTasksView.width, height: 640)
+                .background(Color(nsColor: .windowBackgroundColor))), width: AllTasksView.width, to: path)
+        }
+        if args.contains("--demo") {
+            loadDemo()
+            let l = model.listing
+            var seen = Set<String>()
+            let all = (l.queue + l.proposals + l.needsYou + l.done).filter { seen.insert($0.id).inserted }
+            allTasksModel.update(all, queue: l.queue)
+            DispatchQueue.main.async(execute: render)
+            return
+        }
+        runEngine(["list", "--all"]) { data in
+            if let data = data, let listing = try? JSONDecoder().decode(HListing.self, from: data) {
+                self.model.listing = listing
+                self.allTasksModel.update((try? JSONDecoder().decode(HAllListing.self, from: data))?.all ?? [],
+                                          queue: listing.queue)
+            }
+            render()
+        }
     }
 
     /// `--snapshot <png> [--expand] [--light] [--he|--en]`: renders the panel from the

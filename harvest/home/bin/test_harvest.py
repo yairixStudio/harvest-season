@@ -217,6 +217,39 @@ class Harvest(unittest.TestCase):
         self.assertEqual(self.run_engine("list")["done"][0]["sessionId"], sid)
         self.run_engine("link-session", self.repo, "Old task", "not-a-session", code=2)
 
+    def test_the_owner_clears_the_done_list(self):
+        for title in ("First", "Second", "Third"):
+            self.add(title)
+            self.run_engine("set-status", self.repo, title, "done", "--result", "בוצע")
+        self.run_engine("clear-done", self.repo, "First")
+        listing = self.run_engine("list", "--all")
+        self.assertEqual(sorted(t["title"] for t in listing["done"]), ["Second", "Third"])
+        cleared = [t for t in listing["all"] if t["title"] == "First"]
+        self.assertTrue(cleared[0]["cleared"])
+        self.assertNotIn("all", self.run_engine("list"))
+        with open(os.path.join(self.repo, "BACKLOG.md"), encoding="utf-8") as f:
+            self.assertIn("- cleared: " + datetime.now().strftime("%Y-%m-%d"), f.read())
+        self.run_engine("clear-done", self.repo, "First", code=2)  # nothing left to clear under that title
+        self.run_engine("clear-done", self.repo, "First", "--undo")
+        self.assertEqual(len(self.run_engine("list")["done"]), 3)
+        out = self.run_engine("clear-done", "--all")
+        self.assertEqual(len(out["cleared"]), 3)
+        self.assertEqual(self.run_engine("list")["done"], [])
+        self.run_engine("clear-done", "--all", "--undo", code=2)
+        self.run_engine("clear-done", code=2)
+        # Only the owner tidies the list.
+        self.run_engine("clear-done", self.repo, "First", "--undo", env=dict(self.env, HARVEST_UNATTENDED="1"), code=2)
+
+    def test_clearing_picks_the_done_task_of_a_repeated_title(self):
+        self.add("Fix the build")
+        self.run_engine("set-status", self.repo, "Fix the build", "done", "--result", "בוצע")
+        self.add("Fix the build")  # the same title again, now open
+        self.run_engine("clear-done", self.repo, "Fix the build")
+        tasks = [t for t in self.run_engine("list", "--all")["all"] if t["title"] == "Fix the build"]
+        self.assertEqual(sorted((t["status"], t["cleared"]) for t in tasks), [("done", True), ("open", False)])
+        self.assertNotEqual(tasks[0]["line"], tasks[1]["line"])
+        self.assertEqual(len(self.run_engine("list")["queue"]), 1)
+
     def finished_branch(self, title, name="added.txt", content="change\n"):
         """A done task whose harvest branch waits for the owner."""
         self.add(title)

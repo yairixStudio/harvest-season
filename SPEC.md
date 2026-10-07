@@ -41,7 +41,7 @@ The floating panel's position is saved under the autosave name `QuotaHarvest` (a
 
 From top to bottom:
 
-1. The header: "Claude", the account line, the live dot, ↻ (it spins until both the figures and the listing are back — at least 0.8 s, at most 15 s), and the ⋯ menu: Settings…, open the harvest folder, watch the run in Terminal, Help ("עזרה — איך זה עובד"), Quit.
+1. The header: "Claude", the account line, the live dot, the table button (all tasks — see "All tasks"; only while the harvest is installed), ↻ (it spins until both the figures and the listing are back — at least 0.8 s, at most 15 s), and the ⋯ menu: Settings…, All tasks… (installed only), open the harvest folder, watch the run in Terminal, Help ("עזרה — איך זה עובד"), Quit.
 2. The usage rows — 5 hours, weekly, the model's weekly (labeled as the API names it) — and under them one quiet line with the 5-hour and weekly reset times, to the minute (the API's times wobble around it).
 3. The harvest's sections, each collapsible, open or closed as last left — see "Harvest".
 4. The footer: the harvest's schedule and "run now", or the run in progress with Stop.
@@ -67,6 +67,34 @@ backlog. `HelpView.topics` (Hebrew) and `HelpView.englishTopics` (English, the s
 topics line for line) are the text; they must describe the panel as it is, so every
 behavior change updates both. `--snapshot-help <png> [--light] [--he|--en]` renders
 it unscrolled and exits.
+
+### All tasks
+
+The header's table button, ⋯ → "כל המשימות…" and "כל המשימות בטבלה ←" under בוצעו open one
+ordinary window (titled "כל המשימות — קציר מכסה", closable, resizable, reused, brought to the front, its
+frame saved as `QuotaHarvestAllTasks`; the drop-down panel hides first in menu bar mode) with
+`AllTasksView`: every task of every registered project in a SwiftUI `Table`, mirrored in Hebrew.
+
+- Data: while the window is visible, the panel's regular listing call is `list --all`, which adds
+  `all` — every task with its `line` (its section in BACKLOG.md; rows are keyed project + line, since a
+  done title can come back as a new task), `cleared`, `added`, `result` and, for done tasks, `sessionId`.
+  One engine run feeds both; nothing extra runs while the window is closed.
+- Above the table: a segmented filter with counts — הכל (everything not dropped) · בתור · הצעות ·
+  מחכה לך (blocked, and done with an unmerged branch) · בוצעו · הוסרו (dropped) — kept in
+  `UserDefaults` (`AllTasksFilter`); "גם מה שנוקה" (cleared done tasks are hidden until it is on);
+  a search over title, project, details and result; ↻.
+- Columns, each sortable (default: status, then run order, then newest): status (a colored dot and a
+  word — question for you / awaiting merge, orange; queued with its place in the run order, accent;
+  proposal, purple; done, green, "· cleared" when cleared; removed, gray), task, project, priority,
+  complexity, estimated cost (open, proposed and blocked only), added (dd.MM), updated (days since the
+  result's date, else since added), branch (icon and name, its state in the tooltip).
+- Under the table, the selected task: status, title, project, its details, then the question (blocked),
+  what was done (done) or the last note, and its actions — take out of the queue / put in the queue,
+  delete a proposal, review and merge or answer the question (`openNeed`), open the session that did it,
+  clear from or back to the Done list, open BACKLOG.md. The same actions on a right-click; a double-click
+  opens the review (or answer) or the session. No run controls: running stays in the panel.
+- `--snapshot-tasks <png> [--filter <tab>] [--select <row>] [--cleared] [--demo] [--light] [--he|--en]`
+  renders it at its opening size (1100 × 640) and exits.
 
 ## In the menu bar, or floating
 
@@ -139,6 +167,12 @@ open or a harvest runs, else every 2 min):
   `local_…` id (a desktop session's id can differ from its CLI id, and importing
   it again would copy it); any other is imported first. A task with no session
   falls back to its branch's review session. Header: "N היום · total".
+  Each row has a trash can at the far end (beside the row's own button, never inside it):
+  `clear-done <project> <title>` — off the list at once; the engine writes `- cleared: <date>` on the
+  task's done section in BACKLOG.md, and leaves the branch, history and מחכה לך alone. Under the list,
+  "נקה הכל" (a confirmation with the count, then `clear-done --all`, which clears exactly what the done
+  list shows) and "כל המשימות בטבלה ←", which opens the all-tasks window. `--undo` (from that
+  window) brings one back. Refused in unattended runs: only the owner tidies the list.
 - Rows give titles up to two lines. Projects are grouped by name, in a fixed order, so a group never moves
   when one of its tasks leaves the list; the proposals' ⋯ sits right after the project's name. Above the
   queue and the proposals one muted line says what the % is (estimated token cost, of the weekly quota); a

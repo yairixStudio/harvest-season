@@ -565,6 +565,11 @@ def find_task(repo, title):
 
 def set_fields(repo, title, updates):
     lines, t = find_task(repo, title)
+    write_fields(repo, lines, t, updates)
+
+
+def write_fields(repo, lines, t, updates):
+    """Sets `updates` in the task section `t` of the parsed BACKLOG.md `lines` and writes the file."""
     insert_at = max([t["line"]] + list(t["lines"].values())) + 1
     for key, value in updates.items():
         text = "- %s: %s" % (key, value) if value != "" else "- %s:" % key
@@ -588,6 +593,7 @@ def task_view(repo, t, r):
         "complexity": complexity, "tokens": tokens, "pct": round(tokens / float(r["weekly"]), 2),
         "estimate": parts,
         "details": f.get("details", ""), "added": f.get("added", ""), "result": result,
+        "line": t["line"], "cleared": bool(f.get("cleared")),
     }
     date = DATE_RE.search(result) or DATE_RE.search(v["added"])
     if date:
@@ -761,6 +767,14 @@ def all_tasks(r):
 
 # ---------- commands ----------
 
+def done_list(tasks):
+    """The widget's done list: done tasks of the last DONE_LIST_DAYS days the owner hasn't cleared,
+    newest first, at most DONE_LIST_MAX."""
+    done = [t for t in tasks if t["status"] == "done" and not t["cleared"] and t.get("ageDays", 0) <= DONE_LIST_DAYS]
+    done.sort(key=lambda t: t.get("ageDays", 0))
+    return done[:DONE_LIST_MAX]
+
+
 def cmd_list(a):
     r = ratio()
     tasks, infos = all_tasks(r)
@@ -769,28 +783,57 @@ def cmd_list(a):
     for h in history():
         if h.get("sessionId"):
             sessions[(h.get("project"), h.get("title"))] = h["sessionId"]
-    done = []
     for t in tasks:
-        if t["status"] == "done" and t.get("ageDays", 0) <= DONE_LIST_DAYS:
+        if t["status"] == "done":
             t["sessionId"] = sessions.get((t["project"], t["title"]))
-            done.append(t)
-    done.sort(key=lambda t: t.get("ageDays", 0))
     lk = read_lock()
     placed = set(manual_order())
-    emit({
+    extra = {"all": tasks} if a.all else {}
+    emit(dict(extra, **{
         "now": iso(now()),
         "projects": infos,
         "queue": [dict(t, placed=task_key(t) in placed) for t in ordered_queue([t for t in tasks if t["status"] == "open"])],
         "proposals": sorted([t for t in tasks if t["status"] == "proposed"], key=by_priority),
         "needsYou": [t for t in tasks if t["status"] == "blocked"
                      or (t["status"] == "done" and t.get("branchState") == "unmerged")],
-        "done": done[:DONE_LIST_MAX],
+        "done": done_list(tasks),
         "ratio": r, "config": config(), "status": status(),
         "lock": dict(lk, live=lock_is_live(lk)) if lk else None,
         "usage": read_json(USAGE, None),
         "launch": read_json(LAUNCH, None),
         "settings": dict(settings(), configured=os.path.exists(SETTINGS)),
-    })
+    }))
+
+
+def clear_done(repo, title, undo=False):
+    """Marks one done task cleared from the done list (or brings it back). The section is the done one
+    with this title — a title can come back as a new task once the old one is done."""
+    lines, tasks = parse_backlog(repo)
+    if lines is None:
+        fail("no BACKLOG.md in " + repo)
+    matches = [t for t in tasks if t["title"] == title.strip() and t["fields"].get("status") == "done"
+               and bool(t["fields"].get("cleared")) == undo]
+    if not matches:
+        fail(("no cleared done task: " if undo else "no done task to clear: ") + title, project=repo)
+    write_fields(repo, lines, matches[-1], {"cleared": "" if undo else today()})
+    return {"project": repo, "title": matches[-1]["title"]}
+
+
+def cmd_clear_done(a):
+    """Clears done tasks from the widget's done list: `- cleared: <date>` on the task, which stays in
+    BACKLOG.md (`--undo` brings it back). Branches, history and "waiting for you" are untouched. Only the
+    owner tidies the list: never from an unattended run."""
+    if os.environ.get("HARVEST_UNATTENDED"):
+        fail("only the owner clears the done list")
+    if a.all:
+        if a.project or a.title or a.undo:
+            fail("--all takes no project, title or --undo")
+        cleared = [clear_done(t["project"], t["title"]) for t in done_list(all_tasks(ratio())[0])]
+    elif a.project and a.title:
+        cleared = [clear_done(os.path.abspath(a.project), a.title, a.undo)]
+    else:
+        fail("give a project and a title, or --all")
+    emit({"ok": True, "undo": bool(a.undo), "cleared": cleared})
 
 
 def cmd_settings(a):
@@ -2222,7 +2265,14 @@ def describe_event(line):
 def main():
     ap = argparse.ArgumentParser(prog="harvest.py", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("list").set_defaults(fn=cmd_list)
+    p = sub.add_parser("list")
+    p.add_argument("--all", action="store_true", help="also every task of every project, under \"all\"")
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("clear-done")
+    p.add_argument("project", nargs="?"); p.add_argument("title", nargs="?")
+    p.add_argument("--undo", action="store_true"); p.add_argument("--all", action="store_true")
+    p.set_defaults(fn=cmd_clear_done)
 
     p = sub.add_parser("queue-order")
     p.add_argument("keys", nargs="*", metavar="PROJECT::TITLE")
