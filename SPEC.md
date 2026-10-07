@@ -94,7 +94,8 @@ frame saved as `QuotaHarvestAllTasks`; the drop-down panel hides first in menu b
   with an unmerged branch — the same `RejectForm`, in place of the details), open the session that did it,
   clear from or back to the Done list, open BACKLOG.md. The same actions on a right-click; a double-click
   opens the review (or answer) or the session. No run controls: running stays in the panel.
-- On the מחכה לך tab, "דחה את כולן" beside the tabs opens the form for everything that waits.
+- On the מחכה לך tab, "דחה את כולן" beside the tabs opens the form for everything that waits; on the בתור
+  tab, "הוצא את כולן מהתור" asks inline in the details, then `queue-clear`.
 - `--snapshot-tasks <png> [--filter <tab>] [--select <row>] [--cleared] [--demo] [--light] [--he|--en]`
   renders it at its opening size (1100 × 640) and exits.
 
@@ -138,7 +139,10 @@ open or a harvest runs, else every 2 min):
   an accent line — `WidgetModel.queueDropTarget`) onto another row to land above it, or
   below the last to go last; the whole new order is sent at once. "↺ Back to the automatic
   order" (shown while any task is `placed`) runs `queue-order --reset`. Refused in
-  unattended runs. More than 8 rows scroll in 220 pt. Each row: title, cost as % of the weekly
+  unattended runs. More than 8 rows scroll in 220 pt (`ScrollingList`, like the other lists — the system
+  scroller covered the ⊖ buttons). "⊖ הוצא הכל מהתור" under the list asks inline (`ConfirmLine`: the count,
+  "הוצא" / "ביטול") and runs `queue-clear`: every open task becomes `proposed` and the owner's order is
+  forgotten; refused in unattended runs. Each row: title, cost as % of the weekly
   quota (the engine's estimate ÷ its calibrated tokens-per-point; the estimate is
   turns × (the project's starting context + growth) — measured per project from its
   sessions, predicted from its CLAUDE.md size until then; the tooltip shows both parts), ▶ to run only that
@@ -191,7 +195,7 @@ open or a harvest runs, else every 2 min):
   when one of its tasks leaves the list; the proposals' ⋯ sits right after the project's name. Above the
   queue and the proposals one muted line says what the % is (estimated token cost, of the weekly quota); a
   task's % has the token estimate in its tooltip.
-- Lists of more than 7 tasks (בוצעו: 8) scroll inside a 280 pt (240 pt) frame — `ScrollingList`: the
+- Lists of more than 7 tasks (בוצעו and בתור: 8) scroll inside a 280 pt (בוצעו 240, בתור 220) frame — `ScrollingList`: the
   system scroller is hidden (it always sits on the right, over the rows' buttons) and a slim indicator is
   drawn in a 10 pt gutter of its own at the trailing edge — right in English, left in Hebrew.
 

@@ -1198,6 +1198,7 @@ protocol WidgetActions: AnyObject {
     func clearDone(_ task: HTask)
     func restoreDone(_ task: HTask)
     func clearAllDone()
+    func unqueueAll()
     func showAllTasks()
     func talk()
     func showHelp()
@@ -1275,6 +1276,8 @@ final class WidgetModel: ObservableObject {
     @Published var rejecting: String?
     /// "נקה הכל" under the done list, asking before it clears.
     @Published var confirmingClear = false
+    /// "הוצא הכל מהתור" under the queue, asking before it empties it.
+    @Published var confirmingUnqueue = false
     /// Why the last reject didn't go through, shown under the waiting list (and in the all-tasks window)
     /// until the next try or a dismiss.
     @Published var rejectProblem: String?
@@ -1287,6 +1290,7 @@ final class WidgetModel: ObservableObject {
         }
         if rejecting != nil { rejecting = nil }
         if confirmingClear { confirmingClear = false }
+        if confirmingUnqueue { confirmingUnqueue = false }
     }
 
     var harvestActive: Bool { running || detachedRun || externalRun }
@@ -1440,8 +1444,9 @@ struct PanelView: View {
             EmptyLine(text: L("התור ריק — ⊕ ליד הצעה מכניס אותה לתור", "The queue is empty — ⊕ next to a proposal puts it in"))
         } else {
             PctCaption()
+            // The list's own slim scroller, in a gutter of its own: the system one sat over the ⊖ buttons.
             if m.listing.queue.count > 8 {
-                ScrollView { orderedQueue }.frame(height: 220)
+                ScrollingList(height: 220) { orderedQueue }
             } else {
                 orderedQueue
             }
@@ -1450,6 +1455,16 @@ struct PanelView: View {
                     m.actions?.resetQueueOrder()
                 }
                 .buttonStyle(.link).font(.system(size: 11)).padding(.top, 3)
+            }
+            if m.confirmingUnqueue {
+                ConfirmLine(text: L("להוציא את כל ה־\(m.listing.queue.count) מהתור? הן חוזרות להצעות ולא ירוצו עד שתחזיר אותן.",
+                                    "Take all \(m.listing.queue.count) out of the queue? They go back to the proposals and won't run until you queue them again."),
+                            action: L("הוצא", "Take out"), onConfirm: { m.actions?.unqueueAll() },
+                            onCancel: { m.confirmingUnqueue = false })
+            } else {
+                Button(L("⊖ הוצא הכל מהתור", "⊖ Take everything out of the queue")) { m.confirmingUnqueue = true }
+                    .buttonStyle(.link).font(.system(size: 11)).padding(.top, 3)
+                    .help(L("כל המשימות חוזרות להצעות; ⊕ ליד הצעה מחזיר אותה", "Every task goes back to the proposals; ⊕ next to one brings it back"))
             }
         }
     }
@@ -1527,15 +1542,10 @@ struct PanelView: View {
                 DoneRow(task: t, onOpen: { m.actions?.openDone(t) }, onClear: { m.actions?.clearDone(t) })
             }
             if m.confirmingClear {
-                HStack(spacing: 8) {
-                    Text(L("לנקות את \(m.listing.done.count) מהרשימה? הענפים נשארים.",
-                           "Clear all \(m.listing.done.count) from the list? Branches stay."))
-                        .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 4)
-                    Button(L("נקה", "Clear")) { m.actions?.clearAllDone() }.controlSize(.small)
-                    Button(L("ביטול", "Cancel")) { m.confirmingClear = false }.controlSize(.small)
-                }
-                .padding(.top, 4)
+                ConfirmLine(text: L("לנקות את \(m.listing.done.count) מהרשימה? הענפים נשארים.",
+                                    "Clear all \(m.listing.done.count) from the list? Branches stay."),
+                            action: L("נקה", "Clear"), onConfirm: { m.actions?.clearAllDone() },
+                            onCancel: { m.confirmingClear = false })
             } else {
                 HStack(spacing: 14) {
                     Button(L("נקה הכל", "Clear all")) { m.confirmingClear = true }
@@ -2236,6 +2246,24 @@ struct RejectForm: View {
     }
 }
 
+/// A bulk action's question, in place of the link that asked it — no modal alert.
+struct ConfirmLine: View {
+    let text: String
+    let action: String
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(text).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action, action: onConfirm).controlSize(.small)
+            Button(L("ביטול", "Cancel"), action: onCancel).controlSize(.small)
+        }
+        .padding(.top, 4)
+    }
+}
+
 /// Why something the owner asked for didn't happen — stays until dismissed or the next try.
 struct ProblemLine: View {
     let text: String
@@ -2378,10 +2406,15 @@ final class AllTasksModel: ObservableObject {
     @Published var search = ""
     @Published var showCleared = false
     @Published var selection: String? {
-        didSet { if rejecting != nil && rejecting != selection { rejecting = nil } }
+        didSet {
+            if rejecting != nil && rejecting != selection { rejecting = nil }
+            if confirmingUnqueue && selection != nil { confirmingUnqueue = false }
+        }
     }
     /// The reject form in the details: a row's key, or "all" for everything that waits.
     @Published var rejecting: String?
+    /// "הוצא את כולן מהתור" on the queue tab, asking in the details before it empties the queue.
+    @Published var confirmingUnqueue = false
     @Published var sortOrder = [KeyPathComparator(\TaskLine.stage), KeyPathComparator(\TaskLine.runOrder),
                                 KeyPathComparator(\TaskLine.age)]
     /// Off for snapshots, so rendering a preview never changes the owner's choice of tab.
@@ -2509,6 +2542,11 @@ struct AllTasksView: View {
                 ForEach(TaskFilter.allCases) { f in Text("\(f.title) \(t.count(f))").tag(f) }
             }
             .pickerStyle(.segmented).labelsHidden().fixedSize()
+            if t.filter == .queue && !m.listing.queue.isEmpty {
+                Button(L("הוצא את כולן מהתור", "Take them all out")) { t.selection = nil; t.confirmingUnqueue = true }
+                    .controlSize(.small)
+                    .help(L("כל המשימות חוזרות להצעות; \"הכנס לתור\" מחזיר כל אחת", "Every task goes back to the proposals; \"Put in the queue\" brings each back"))
+            }
             if t.filter == .waiting && !m.listing.needsYou.isEmpty {
                 Button(L("דחה את כולן", "Reject them all")) { t.selection = nil; t.rejecting = "all" }
                     .controlSize(.small)
@@ -2616,7 +2654,14 @@ struct AllTasksView: View {
                 ProblemLine(text: problem) { m.rejectProblem = nil }
                     .padding(EdgeInsets(top: 4, leading: 14, bottom: 0, trailing: 14))
             }
-            if t.rejecting == "all" {
+            if t.confirmingUnqueue {
+                ConfirmLine(text: L("להוציא את כל ה־\(m.listing.queue.count) מהתור? הן חוזרות להצעות ולא ירוצו עד שתחזיר אותן.",
+                                    "Take all \(m.listing.queue.count) out of the queue? They go back to the proposals and won't run until you queue them again."),
+                            action: L("הוצא", "Take out"),
+                            onConfirm: { t.confirmingUnqueue = false; m.actions?.unqueueAll() },
+                            onCancel: { t.confirmingUnqueue = false })
+                    .padding(EdgeInsets(top: 10, leading: 14, bottom: 10, trailing: 14))
+            } else if t.rejecting == "all" {
                 RejectForm(blocked: false, count: m.listing.needsYou.count,
                            onReject: { m.actions?.rejectAllWaiting(reason: $0) },
                            onCancel: { t.rejecting = nil })
@@ -2742,6 +2787,7 @@ struct HelpView: View {
             "בכותרת: כמה משימות, וכמה אחוזים כולן יחד.",
             "**הסדר ברשימה הוא סדר הביצוע** — העליונה רצה ראשונה. בלי התערבות שלך הסדר הוא לפי חשיבות, ובאותה חשיבות הגדולה קודם.",
             "**גרירה:** תופסים משימה ומשחררים על משימה אחרת — היא נוחתת מעליה; מתחת לאחרונה — היא עוברת לסוף. **\"חזרה לסדר האוטומטי\"** מבטל את מה שגררת.",
+            "**\"⊖ הוצא הכל מהתור\"** מתחת לרשימה — כל המשימות חוזרות להצעות בבת אחת (אחרי שאלה קצרה במקום), ו־⊕ מחזיר כל אחת.",
         ]),
         ("הצעות", [
             "משימות שעוד לא אישרת: רעיונות שסוכן רשם כשעבד לבד, או משימות שהשהית. הן לא ירוצו.",
@@ -2768,7 +2814,7 @@ struct HelpView: View {
             "**כפתור הטבלה** בראש הווידג'ט (או **כל המשימות…** בתפריט ⋯, או \"כל המשימות בטבלה\" מתחת ל\"בוצעו\") פותח חלון עם כל המשימות מכל הפרויקטים, בטבלה אחת.",
             "למעלה: לשוניות עם מספרים — הכל, בתור, הצעות, מחכה לך, בוצעו, הוסרו (\"הכל\" הוא כל מה שלא הוסר) — חיפוש, ו\"**גם מה שנוקה**\" שמראה גם משימות שניקית מ\"בוצעו\".",
             "העמודות: מצב (במשימה שבתור — גם המקום שלה בתור), משימה, פרויקט, עדיפות, מורכבות, עלות משוערת, מתי נוספה, עדכון אחרון וענף. לחיצה על כותרת עמודה ממיינת לפיה.",
-            "**בחירת שורה** מראה למטה את הפרטים ואת מה שאפשר לעשות: להכניס לתור או להוציא, למחוק הצעה, לבדיקה ולמיזוג או לדחות, לפתוח את הסשן שביצע, לנקות או להחזיר ל\"בוצעו\", ולפתוח את BACKLOG.md. אותן פעולות בלחיצה ימנית; לחיצה כפולה פותחת את הבדיקה או את הסשן. דחייה פותחת את אותו טופס סיבות כמו בווידג'ט, ובלשונית \"מחכה לך\" יש גם \"דחה את כולן\". להריץ — רק מהווידג'ט.",
+            "**בחירת שורה** מראה למטה את הפרטים ואת מה שאפשר לעשות: להכניס לתור או להוציא, למחוק הצעה, לבדיקה ולמיזוג או לדחות, לפתוח את הסשן שביצע, לנקות או להחזיר ל\"בוצעו\", ולפתוח את BACKLOG.md. אותן פעולות בלחיצה ימנית; לחיצה כפולה פותחת את הבדיקה או את הסשן. דחייה פותחת את אותו טופס סיבות כמו בווידג'ט, בלשונית \"מחכה לך\" יש גם \"דחה את כולן\", ובלשונית \"בתור\" — \"הוצא את כולן מהתור\". להריץ — רק מהווידג'ט.",
         ]),
         ("קציר (בתחתית)", [
             "ספירה לאחור עד שהקציר האוטומטי מתחיל — רק כשהמתג \"אוטומטי\" דלוק. הוא רץ ב**פעימות**: כל פעימה היא חלון של 5 שעות, והאחרונה נגמרת לפני האיפוס השבועי. כמה פעימות — בוחרים בשורה (1–6), או \"אוטומטי\": כמה שצריך כדי לנצל את מה שנשאר מהשבוע על מה שבתור.",
@@ -2822,6 +2868,7 @@ struct HelpView: View {
             "In the header: how many tasks, and how many percent they come to together.",
             "**The list's order is the order they run in** — the top one runs first. Left alone, it's by priority, and within a priority the bigger task first.",
             "**Dragging:** grab a task and drop it on another one — it lands above it; below the last one — it goes last. **\"Back to the automatic order\"** undoes what you dragged.",
+            "**\"⊖ Take everything out of the queue\"** under the list — every task goes back to the proposals at once (after a short question in place), and ⊕ brings each one back.",
         ]),
         ("Proposals", [
             "Tasks you haven't approved yet: ideas an agent noted while working on its own, or tasks you paused. They don't run.",
@@ -2848,7 +2895,7 @@ struct HelpView: View {
             "**The table button** at the top of the widget (or **All tasks…** in the ⋯ menu, or \"All tasks in a table\" under Done) opens a window with every task of every project in one table.",
             "At the top: tabs with counts — All, Queue, Proposals, Waiting, Done, Removed (\"All\" is everything not removed) — a search, and **\"Show cleared\"**, which also shows the tasks you cleared from Done.",
             "The columns: status (for a queued task, also its place in the queue), task, project, priority, complexity, estimated cost, when it was added, the last update and the branch. Clicking a column's title sorts by it.",
-            "**Selecting a row** shows its details below, with what can be done: put it in the queue or take it out, delete a proposal, review and merge or reject, open the session that did it, clear it from Done or bring it back, and open BACKLOG.md. The same actions are on a right-click; a double-click opens the review or the session. Rejecting opens the same reasons form as in the widget, and the Waiting tab also has \"Reject them all\". Running happens only from the widget.",
+            "**Selecting a row** shows its details below, with what can be done: put it in the queue or take it out, delete a proposal, review and merge or reject, open the session that did it, clear it from Done or bring it back, and open BACKLOG.md. The same actions are on a right-click; a double-click opens the review or the session. Rejecting opens the same reasons form as in the widget, the Waiting tab also has \"Reject them all\", and the Queue tab \"Take them all out\". Running happens only from the widget.",
         ]),
         ("Harvest (at the bottom)", [
             "A countdown to the start of the automatic harvest — only while the \"automatic\" switch is on. It runs in **pulses**: each pulse is one 5-hour window, and the last one ends before the weekly reset. How many — you choose in the row (1–6), or \"Auto\": as many as it takes to spend what's left of the week on what's queued.",
@@ -5076,6 +5123,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         return what + ((reply?["error"] as? String) ?? L("המנוע לא ענה.", "the engine didn't answer."))
     }
 
+    /// "הוצא הכל מהתור", once its inline question is answered: every queued task back to the proposals.
+    func unqueueAll() {
+        model.confirmingUnqueue = false
+        allTasksModel.confirmingUnqueue = false
+        guard !model.listing.queue.isEmpty else { return }
+        var l = model.listing
+        l.proposals = l.queue + l.proposals
+        l.queue = []
+        model.listing = l
+        runEngine(["queue-clear"]) { [weak self] _ in self?.refreshListing() }
+    }
+
     /// "נקה הכל" under the done list, once its inline question is answered.
     func clearAllDone() {
         model.confirmingClear = false
@@ -5646,8 +5705,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     }
 
     /// `--rejecting [all]` on the snapshots: the reject form open — under the first waiting row, or for all.
+    /// `--confirming unqueue|clear`: the inline question of "הוצא הכל מהתור" / "נקה הכל".
     func snapshotForms() {
         let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--confirming"), i + 1 < args.count {
+            model.confirmingUnqueue = args[i + 1] == "unqueue"
+            model.confirmingClear = args[i + 1] == "clear"
+            allTasksModel.confirmingUnqueue = args[i + 1] == "unqueue"
+        }
         guard let i = args.firstIndex(of: "--rejecting") else { return }
         let all = i + 1 < args.count && args[i + 1] == "all"
         model.rejecting = all ? "all" : model.listing.needsYou.first?.id

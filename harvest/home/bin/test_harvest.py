@@ -115,6 +115,24 @@ class Harvest(unittest.TestCase):
         self.usage(reset_in_h=0.2)
         self.assertEqual(self.run_engine("plan")["reason"], "cutoff-near")
 
+    def test_the_owner_empties_the_queue(self):
+        self.add("One")
+        self.add("Two")
+        self.add("An idea", status="proposed")
+        self.run_engine("set-status", self.repo, "Two", "done", "--result", "בוצע")
+        self.add("Two")  # the same title again, queued: only this one moves
+        other = self.make_repo("beta")
+        self.run_engine("add", other, "--title", "Three", "--details", "x", "--complexity", "low")
+        self.run_engine("queue-order", self.repo + "::Two", self.repo + "::One")
+        self.run_engine("queue-clear", env=dict(self.env, HARVEST_UNATTENDED="1"), code=2)
+        out = self.run_engine("queue-clear")
+        self.assertEqual(sorted(x["title"] for x in out["unqueued"]), ["One", "Three", "Two"])
+        listing = self.run_engine("list", "--all")
+        self.assertEqual(listing["queue"], [])
+        self.assertEqual(sorted(t["title"] for t in listing["proposals"]), ["An idea", "One", "Three", "Two"])
+        self.assertEqual([t["status"] for t in listing["all"] if t["title"] == "Two"], ["done", "proposed"])
+        self.assertFalse(os.path.exists(os.path.join(self.home, "queue-order.json")))
+
     def test_the_owner_can_order_the_queue(self):
         self.add("Urgent big", tokens=90000)
         self.run_engine("set-status", self.repo, "Urgent big", "open")

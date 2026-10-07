@@ -926,6 +926,27 @@ def cmd_queue_order(a):
           "queue": [task_key(t) for t in ordered_queue([t for t in tasks if t["status"] == "open"])]})
 
 
+def cmd_queue_clear(a):
+    """Empties the queue in one step: every queued (open) task goes back to the proposals, where it waits until
+    the owner queues it again, and the owner's dragged order goes with it. Only the owner: never from an
+    unattended run."""
+    if os.environ.get("HARVEST_UNATTENDED"):
+        fail("only the owner empties the queue")
+    moved = []
+    for repo in projects():
+        # One section at a time from a fresh read: adding a missing status line moves the lines below it.
+        while True:
+            lines, tasks = parse_backlog(repo)
+            t = next((t for t in tasks if (t["fields"].get("status") or "open") == "open"), None)
+            if t is None:
+                break
+            write_fields(repo, lines, t, {"status": "proposed"})
+            moved.append({"project": repo, "title": t["title"]})
+    if os.path.exists(QUEUE_ORDER):
+        os.remove(QUEUE_ORDER)
+    emit({"ok": True, "unqueued": moved})
+
+
 def cmd_set_status(a):
     repo = os.path.abspath(a.project)
     if a.status not in STATUSES:
@@ -2353,6 +2374,8 @@ def main():
     p.add_argument("keys", nargs="*", metavar="PROJECT::TITLE")
     p.add_argument("--reset", action="store_true")
     p.set_defaults(fn=cmd_queue_order)
+
+    sub.add_parser("queue-clear").set_defaults(fn=cmd_queue_clear)
 
     p = sub.add_parser("proposals")
     p.add_argument("project"); p.add_argument("state", choices=("on", "off"))
