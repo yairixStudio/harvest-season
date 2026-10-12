@@ -6,9 +6,9 @@
 //
 // Where the numbers come from: the signed-in Claude Code login (the Keychain first,
 // then ~/.claude/.credentials.json) authorizes a GET of the usage endpoint behind
-// claude.ai's usage settings page. A login that is about to lapse is renewed with
-// Claude Code's own refresh grant and saved back where it was found, so the widget
-// keeps working when Claude Code hasn't run for a while.
+// claude.ai's usage settings page. The widget only reads that login and never renews it:
+// renewing rotates the refresh token, and every running `claude` still holding the old one
+// would then be signed out. Claude Code renews it; the next poll picks the new token up.
 // Harvest data: every read and write goes through ~/.claude/harvest/bin/harvest.py.
 //
 // Build: swiftc -O -o HarvestSeason HarvestSeason.swift
@@ -17,6 +17,7 @@
 import AppKit
 import Combine
 import IOKit.ps
+import OSLog
 import SwiftUI
 import UserNotifications
 
@@ -39,6 +40,9 @@ typealias PollResult = Result<Usage, Error>
 enum PollFailure: Error {
     /// No stored login could be read.
     case signedOut
+    /// The stored access token's `expiresAt` has passed: it waits for Claude Code to renew it.
+    /// Nothing was sent.
+    case tokenLapsed
     /// The endpoint answered with this status — neither 200 nor 429.
     case status(Int)
     /// 429, with the wait the server's `Retry-After` asked for when it sent one.
@@ -72,10 +76,9 @@ private let securityDeadline: TimeInterval = 10
 /// Which of the two places a login was read from — the only place it is ever written back to.
 enum LoginStore { case keychain, file }
 
-/// Claude Code's stored login, kept as the whole decoded object: a renewal writes all of it
-/// back, so the fields this widget never reads (scopes, subscription type, …) survive as they are.
+/// Claude Code's stored login, as decoded. Read-only: the widget never writes it back.
 struct StoredLogin {
-    var json: [String: Any]
+    let json: [String: Any]
     let store: LoginStore
     /// `nestedOAuthKey`, or nil for the old top-level layout.
     let oauthKey: String?
@@ -86,39 +89,30 @@ struct StoredLogin {
         return json[key] as? [String: Any] ?? [:]
     }
     var accessToken: String? { oauthFields["accessToken"] as? String }
-    var refreshToken: String? { oauthFields["refreshToken"] as? String }
     /// When the access token lapses, in epoch seconds (Claude Code stores milliseconds).
     var expirySeconds: Double? { jsonNumber(oauthFields["expiresAt"]).map { $0 / 1000 } }
 
-    /// Due for renewal: the access token has lapsed, or will within `renewalMargin`. A login
-    /// without `expiresAt` is never renewed ahead of time — only after a refused poll.
-    func renewalDue(now: Date = Date()) -> Bool {
+    /// The access token has lapsed. A login without `expiresAt` never counts as lapsed.
+    func lapsed(now: Date = Date()) -> Bool {
         guard let expiry = expirySeconds else { return false }
-        return now.timeIntervalSince1970 >= expiry - renewalMargin
+        return now.timeIntervalSince1970 >= expiry
     }
 }
 
 /// The one place `/usr/bin/security` is spawned. Returns its output when it exits with 0 within
 /// `securityDeadline`, else nil. Past the deadline it is asked to quit, and killed 2 s later if it
-/// hasn't (at most 14 s in all). `stdinText`, when given, is written to its standard input, which
-/// is then closed — `security -i` reads commands until end of input.
-private func callSecurityTool(_ arguments: [String], stdinText: String? = nil) -> Data? {
+/// hasn't (at most 14 s in all).
+private func callSecurityTool(_ arguments: [String]) -> Data? {
     let tool = Process()
     tool.executableURL = URL(fileURLWithPath: "/usr/bin/security")
     tool.arguments = arguments
     let output = Pipe()
     tool.standardOutput = output
     tool.standardError = Pipe()
-    let input = stdinText == nil ? nil : Pipe()
-    if let input { tool.standardInput = input }
     // Set before launch, so even a process that exits at once is seen to exit.
     let exited = DispatchSemaphore(value: 0)
     tool.terminationHandler = { _ in exited.signal() }
     do { try tool.run() } catch { return nil }
-    if let writer = input?.fileHandleForWriting {
-        if let bytes = stdinText?.data(using: .utf8) { writer.write(bytes) }
-        writer.closeFile()   // even when there was nothing to write, or `security` waits forever
-    }
     guard exited.wait(timeout: .now() + securityDeadline) == .success else {
         tool.terminate()
         if exited.wait(timeout: .now() + 2) == .timedOut {
@@ -158,111 +152,23 @@ func loadStoredLogin() -> StoredLogin? {
     return parseStoredLogin(found.text, store: found.store)
 }
 
-// MARK: - Token refresh
+// MARK: - Sign-in log
 
-/// The OAuth token endpoint and client that issued Claude Code's login. The refresh grant is
-/// the only request the refresh token ever goes into; neither token is logged, shown, or put in
-/// an argument list.
-private let tokenEndpoint = URL(string: "https://console.anthropic.com/v1/oauth/token")!
-private let claudeCodeClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+/// What happens to the sign-in, in the macOS unified log — never a token, only times and
+/// states. Read it with:
+/// `log show --last 3d --predicate 'subsystem == "dev.harvest-season.widget" && category == "signin"'`
+let signInLog = Logger(subsystem: "dev.harvest-season.widget", category: "signin")
 
-/// Renew this long before `expiresAt`, so the token doesn't lapse between the check and the poll.
-private let renewalMargin: TimeInterval = 60
+/// The last `expiresAt` seen, so a change — Claude Code renewed the login — is logged once.
+private var lastSeenExpiry: Double?
 
-/// At most one renewal attempt a minute: a dead refresh token (revoked, signed out elsewhere)
-/// must not turn polling into a stream of token requests. Used only on the fetch path, which
-/// has one request out at a time.
-private let renewalSpacing: TimeInterval = 60
-private var lastRenewalAttempt = Date.distantPast
-
-/// A successful refresh grant's answer.
-struct RenewedTokens {
-    let accessToken: String
-    let refreshToken: String?
-    let expiresIn: Double?
-}
-
-/// Reads the token endpoint's reply: a 200 whose JSON body carries a non-empty `access_token`,
-/// plus `refresh_token` and `expires_in` when present. Anything else is nil.
-func readRenewalReply(status: Int, body: Data?) -> RenewedTokens? {
-    guard status == 200, let body,
-          let reply = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
-          let access = reply["access_token"] as? String, !access.isEmpty else { return nil }
-    return RenewedTokens(accessToken: access, refreshToken: reply["refresh_token"] as? String,
-                         expiresIn: jsonNumber(reply["expires_in"]))
-}
-
-/// The stored login JSON with a renewal folded in. Only three fields change: `accessToken`;
-/// `refreshToken`, replaced by the rotated one (the old one stays only when the reply had none,
-/// or an empty one); `expiresAt`, set to `now + expiresIn` in epoch milliseconds when the reply
-/// gave a lifetime. Every other key, at either level, is left exactly as it was. Pure — no I/O.
-func mergeRenewal(_ tokens: RenewedTokens, into json: [String: Any], oauthKey: String?, now: Date) -> [String: Any] {
-    var fields = oauthKey.map { json[$0] as? [String: Any] ?? [:] } ?? json
-    fields["accessToken"] = tokens.accessToken
-    if let rotated = tokens.refreshToken, !rotated.isEmpty { fields["refreshToken"] = rotated }
-    if let lifetime = tokens.expiresIn { fields["expiresAt"] = Int((now.timeIntervalSince1970 + lifetime) * 1000) }
-    guard let key = oauthKey else { return fields }
-    var merged = json
-    merged[key] = fields
-    return merged
-}
-
-/// Posts the refresh grant and waits for the answer — 15 s for the request, 20 s at most in all.
-/// Blocking: background queue only.
-private func requestRenewal(refreshToken: String) -> RenewedTokens? {
-    var grant = URLRequest(url: tokenEndpoint, timeoutInterval: 15)
-    grant.httpMethod = "POST"
-    grant.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    grant.httpBody = try? JSONSerialization.data(withJSONObject: [
-        "grant_type": "refresh_token", "refresh_token": refreshToken, "client_id": claudeCodeClientID,
-    ])
-    var answer: RenewedTokens?
-    let answered = DispatchSemaphore(value: 0)
-    URLSession.shared.dataTask(with: grant) { body, response, _ in
-        answer = readRenewalReply(status: (response as? HTTPURLResponse)?.statusCode ?? 0, body: body)
-        answered.signal()
-    }.resume()
-    _ = answered.wait(timeout: .now() + 20)
-    return answer
-}
-
-/// Trades the stored refresh token for a new access token, saves the result back to the store it
-/// came from and returns it. Nil when the last attempt was under a minute ago, there is no
-/// refresh token, or the grant failed — the caller then carries on with the old token and the
-/// normal error path (the red dot) reports what happens. Blocking: background queue only.
-func renewLogin(_ login: StoredLogin) -> StoredLogin? {
-    guard Date().timeIntervalSince(lastRenewalAttempt) >= renewalSpacing,
-          let refreshToken = login.refreshToken, !refreshToken.isEmpty else { return nil }
-    lastRenewalAttempt = Date()
-    guard let tokens = requestRenewal(refreshToken: refreshToken) else { return nil }
-    var renewed = login
-    renewed.json = mergeRenewal(tokens, into: login.json, oauthKey: login.oauthKey, now: Date())
-    saveLogin(renewed)
-    return renewed
-}
-
-/// The `security -i` command that updates (or creates) the login item with `json`. Inside the
-/// double quotes a backslash and a quote must be escaped; the tokens are base64url, so both occur
-/// only in the JSON's own syntax.
-func keychainUpdateCommand(json: String, account: String) -> String {
-    let quoted = [("\\", "\\\\"), ("\"", "\\\"")].reduce(json) { $0.replacingOccurrences(of: $1.0, with: $1.1) }
-    return "add-generic-password -U -a \"\(account)\" -s \"\(loginKeychainService)\" -w \"\(quoted)\"\n"
-}
-
-/// Writes a renewed login back to where it was read from — never to the other store. The grant
-/// rotates the refresh token and voids the old one, so without this write Claude Code itself
-/// would find its login dead.
-func saveLogin(_ login: StoredLogin) {
-    guard let bytes = try? JSONSerialization.data(withJSONObject: login.json, options: [.sortedKeys, .withoutEscapingSlashes]),
-          let text = String(data: bytes, encoding: .utf8) else { return }
-    switch login.store {
-    case .keychain:
-        // On stdin, not as arguments: the login never shows up in a process list (`ps`).
-        _ = callSecurityTool(["-i"], stdinText: keychainUpdateCommand(json: text, account: NSUserName()))
-    case .file:
-        try? bytes.write(to: loginFileURL, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: loginFileURL.path)
+/// Logs a renewal by Claude Code (the stored expiry moved) and a token found lapsed.
+private func noteLogin(_ login: StoredLogin) {
+    let expiry = login.expirySeconds
+    if let expiry, let before = lastSeenExpiry, expiry != before {
+        signInLog.notice("Claude Code renewed the login; it now lapses at \(Date(timeIntervalSince1970: expiry), privacy: .public)")
     }
+    lastSeenExpiry = expiry
 }
 
 // MARK: - Fetch + parse
@@ -332,7 +238,7 @@ func decodeUsage(_ body: Data) -> Usage? {
     return anyLimit ? usage : nil
 }
 
-/// Where the fetch path's blocking work (the Keychain, a renewal) runs.
+/// Where the fetch path's blocking work (the Keychain) runs.
 private let fetchQueue = DispatchQueue.global(qos: .utility)
 
 /// The only two places the access token may be sent — both on api.anthropic.com.
@@ -372,30 +278,28 @@ private func getUsage(token: String, completion: @escaping (PollResult) -> Void)
     }.resume()
 }
 
-/// Polls usage with the stored login, renewed first when it is about to lapse — so most polls
-/// never meet a 401. A failed renewal isn't fatal: the poll still goes out with the stored token.
-/// If the endpoint turns the token down anyway (401/403: it went stale some other way), the login
-/// is renewed once more and the poll retried once; the renewal's one-a-minute gate means this
-/// can't loop. Completes on the main queue.
+/// Polls usage with the stored login, read fresh each time. A token past its `expiresAt` isn't
+/// sent at all — it waits for Claude Code to renew it. A 401/403 is logged with how long the
+/// token still had, since a refused token that hadn't lapsed means the login was revoked.
+/// Completes on the main queue.
 func fetchUsage(completion: @escaping (PollResult) -> Void) {
     fetchQueue.async {
-        guard let stored = loadStoredLogin(), let storedToken = stored.accessToken else {
+        guard let login = loadStoredLogin(), let token = login.accessToken else {
+            signInLog.notice("No stored Claude Code login could be read")
             DispatchQueue.main.async { completion(.failure(PollFailure.signedOut)) }
             return
         }
-        let login = (stored.renewalDue() ? renewLogin(stored) : nil) ?? stored
-        getUsage(token: login.accessToken ?? storedToken) { first in
-            guard case .failure(PollFailure.status(let code)) = first, code == 401 || code == 403 else {
-                completion(first)
-                return
+        noteLogin(login)
+        if login.lapsed() {
+            DispatchQueue.main.async { completion(.failure(PollFailure.tokenLapsed)) }
+            return
+        }
+        getUsage(token: token) { result in
+            if case .failure(PollFailure.status(let code)) = result, code == 401 || code == 403 {
+                let left = login.expirySeconds.map { Int(($0 - Date().timeIntervalSince1970) / 60) }
+                signInLog.error("Usage endpoint refused the token (\(code, privacy: .public)); minutes before it lapses: \(left.map(String.init) ?? "unknown", privacy: .public)")
             }
-            fetchQueue.async {
-                guard let renewed = renewLogin(login), let token = renewed.accessToken else {
-                    DispatchQueue.main.async { completion(first) }
-                    return
-                }
-                getUsage(token: token, completion: completion)
-            }
+            completion(result)
         }
     }
 }
@@ -2779,7 +2683,7 @@ struct HelpView: View {
         ("המדדים למעלה", [
             "**5 ש׳** — חלון של חמש שעות. **שבועי** — כל המודלים. השורה השלישית — מכסה שבועית של מודל מסוים (למשל Fable).",
             "כחול עד 70%, כתום מ-70%, אדום מ-90%. מתחת: מתי כל מכסה מתאפסת.",
-            "הנקודה הצבעונית: **ירוק** — מחובר. **צהוב** — יש תקלה והווידג'ט מנסה שוב לבד. **אדום** — צריך אותך. ↻ מרענן עכשיו.",
+            "הנקודה הצבעונית: **ירוק** — מחובר. **צהוב** — יש תקלה והווידג'ט מנסה שוב לבד, או שהוא מחכה ש-Claude Code יחדש את ההתחברות (זה קורה לבד כשמשתמשים ב-Claude Code). **אדום** — צריך אותך. ↻ מרענן עכשיו.",
             "**כש-Claude Code לא מחובר** (או לא מותקן) מופיע מתחת למדדים כרטיס אדום: מה זה עוצר (אין מדדים עדכניים, הקציר לא ירוץ), ממתי המספרים שמוצגים, **התחבר** — פותח טרמינל עם ההתחברות, שנגמרת בדפדפן — ו**בדוק שוב**. בשורת התפריט מופיע \"!\" אדום, ומגיעה התראה אחת שלחיצה עליה מתחילה להתחבר. כשההתחברות מצליחה, הכרטיס נעלם לבד.",
         ]),
         ("בתור", [
@@ -2860,7 +2764,7 @@ struct HelpView: View {
         ("The meters at the top", [
             "**5h** — the five-hour window. **Weekly** — all models. The third row — the weekly quota of one particular model (for example Fable).",
             "Blue below 70%, orange from 70%, red from 90%. Underneath: when each quota resets.",
-            "The colored dot: **green** — connected. **Yellow** — something went wrong and the widget is retrying on its own. **Red** — it needs you. ↻ refreshes now.",
+            "The colored dot: **green** — connected. **Yellow** — something went wrong and the widget is retrying on its own, or it is waiting for Claude Code to renew the sign-in (that happens by itself whenever you use Claude Code). **Red** — it needs you. ↻ refreshes now.",
             "**When Claude Code isn't signed in** (or isn't installed), a red card appears under the meters: what that stops (no fresh figures, no harvest), how old the figures shown are, **Sign in** — opens Terminal with the sign-in, which finishes in the browser — and **Check again**. The menu bar icon gets a red \"!\", and one notification comes; clicking it starts signing in. Once you're signed in, the card goes away by itself.",
         ]),
         ("Queue", [
@@ -3804,10 +3708,10 @@ struct PollPacing {
         return .send
     }
 
-    enum Outcome { case fetched, failed, throttled(retryAfter: TimeInterval?) }
+    enum Outcome { case fetched, waiting, failed, throttled(retryAfter: TimeInterval?) }
 
     /// Books how an attempt ended and returns the wait until the next poll: `basePoll` after
-    /// numbers came back; after a failure, twice the last wait, up to `maxPoll`; after a 429, the
+    /// numbers came back, or while a lapsed token waits for Claude Code; after a failure, twice the last wait, up to `maxPoll`; after a 429, the
     /// server's `Retry-After` (else that doubled wait) kept within basePoll…maxPoll — and held as a
     /// cool-off.
     mutating func finish(_ outcome: Outcome, now: Date) -> TimeInterval {
@@ -3817,6 +3721,8 @@ struct PollPacing {
         case .fetched:
             wait = basePoll
             coolOffUntil = nil
+        case .waiting:
+            wait = basePoll
         case .failed:
             wait = doubled
         case .throttled(let retryAfter):
@@ -4398,7 +4304,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         setStatus(.systemGreen, L("מחובר", "Connected"))
         updateAutoPlan()
         // Launched with a lapsed token, the profile fetch came back empty; now that a poll got
-        // through (after a renewal), fill in the account line.
+        // through (Claude Code renewed it), fill in the account line.
         if model.userLine.trimmingCharacters(in: .whitespaces).isEmpty { refreshUserLine() }
     }
 
@@ -4410,6 +4316,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             setStatus(.systemRed, L("לא מחובר — \"התחבר\" בפאנל", "Not signed in — \"Sign in\" in the panel"))
             pollProblem = .signedOut
             updateSignIn()
+        case PollFailure.tokenLapsed:
+            setStatus(.systemYellow, L("ממתין ש-Claude Code יחדש את ההתחברות", "Waiting for Claude Code to renew the sign-in"))
+            pollProblem = nil
+            updateSignIn()
+            return .waiting
         case PollFailure.status(let code) where code == 401 || code == 403:
             setStatus(.systemRed, L("ההתחברות פגה — \"התחבר\" בפאנל", "Sign-in expired — \"Sign in\" in the panel"))
             pollProblem = .expired
@@ -4441,6 +4352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             : pollProblem ?? (cliSignedIn == false ? .signedOut : nil)
         guard problem != model.signIn else { return }
         let wasFine = model.signIn == nil
+        signInLog.notice("Sign-in card: \(problem.map { "\($0)" } ?? "cleared", privacy: .public)")
         model.signIn = problem
         redrawStatusItem()
         updateAutoPlan()
@@ -4498,6 +4410,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
                 guard let self else { return }
                 self.cliChecking = false
                 let cameBack = self.cliSignedIn == false && signedIn == true
+                if let signedIn, signedIn != self.cliSignedIn {
+                    signInLog.notice("claude auth status: loggedIn \(signedIn, privacy: .public)")
+                }
                 if signedIn != nil { self.cliSignedIn = signedIn }
                 self.updateSignIn()
                 // Signed in again: fetch the figures now rather than at the next scheduled poll.

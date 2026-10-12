@@ -32,7 +32,7 @@ Nothing personal goes into `harvest/`. Who the owner is — name, language, emai
 ## How the code is written
 
 - The panel's content is SwiftUI (`PanelView`, inside the AppKit `WidgetPanel`). Everything it shows lives in `WidgetModel`, and the panel re-measures itself after every change — new UI state goes in the model, not in a view's `@State`.
-- One file, under its `// MARK:` sections (data, sign-in, renewal, fetching, harvest, views, start at login, app). Add to the section a thing belongs to.
+- One file, under its `// MARK:` sections (data, sign-in, sign-in log, fetching, harvest, views, start at login, app). Add to the section a thing belongs to.
 - The Swift side never reads or edits `BACKLOG.md`, the status or the calibration — it asks the engine (`runEngine`) and shows the JSON. It writes only `usage.json` and `config.json`.
 - One place for each sensitive job: `callSecurityTool` is the only code that runs `/usr/bin/security`; `authorizedGET` is the only code that sets the Bearer header; `warningColor` holds the 70 / 90 % thresholds; `makeContextMenu` builds the right-click menu.
 - Decode the API defensively (`JSONSerialization`, optional casts): its shape has changed before. Prefer the `limits` array; keep the older fallbacks.
@@ -51,8 +51,8 @@ Nothing personal goes into `harvest/`. Who the owner is — name, language, emai
 
 ## Safety
 
-- Tokens are never logged or printed. The access token goes only to `api.anthropic.com`; the refresh token only to Anthropic's OAuth token endpoint, in the refresh grant.
-- Writing renewed credentials back to the Keychain keeps them out of every argument list: `security -i`, with the command on stdin — never the JSON as an argument. Every other field of the stored credentials stays as it was (`mergeRenewal`).
+- Tokens are never logged or printed. The access token goes only to `api.anthropic.com`; the refresh token is never used.
+- The app only reads Claude Code's login and never renews or writes it: a refresh grant rotates the refresh token, and every running `claude` holding the old one gets signed out (the repeated sign-outs fixed 2026-10-12). A lapsed token waits, yellow, for Claude Code to renew it.
 - No analytics, no crash reporting, no network calls to anyone but Anthropic.
 - Harvest runs are unattended: they keep `HARVEST_UNATTENDED=1`, their own process group (so Stop reaches every child) and `--permission-mode auto`. No flag that skips permissions; the app never pushes, merges or deletes.
 

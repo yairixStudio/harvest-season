@@ -9,15 +9,15 @@ Where they come from, in order:
 1. The login Keychain's generic password named `Claude Code-credentials`, read with `/usr/bin/security find-generic-password -w`. The read gets 10 s, then a terminate, then a kill (14 s at most), so a Keychain prompt nobody answers can't hang the app. A timeout, an error or an empty value moves on to (2).
 2. The file `~/.claude/.credentials.json`.
 
-Both hold JSON with the OAuth fields inside `claudeAiOauth` (older files: at the top level) — `accessToken`, `refreshToken`, `expiresAt` (epoch milliseconds) — next to other fields such as `scopes`. The app keeps the whole object, fields it doesn't know included, and reads it again before every poll, so a token Claude Code renews is used at once. The access token is sent only as a Bearer header to `api.anthropic.com`; the refresh token only in the renewal below; neither is ever logged or displayed.
+Both hold JSON with the OAuth fields inside `claudeAiOauth` (older files: at the top level) — `accessToken`, `refreshToken`, `expiresAt` (epoch milliseconds) — next to other fields such as `scopes`. The app only reads it — never writes it — and reads it again before every poll, so a token Claude Code renews is used at once. The access token is sent only as a Bearer header to `api.anthropic.com`; the refresh token is never used or sent; neither is ever logged or displayed.
 
-### Renewing an expired token
+### An expired token
 
-Before a poll, if the access token has expired or expires within 60 s, the app renews it: `POST https://console.anthropic.com/v1/oauth/token` with `{grant_type: "refresh_token", refresh_token, client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e"}`, 15 s timeout.
+The app never renews the login itself. A refresh grant rotates the refresh token and voids the old one, and every running `claude` (Claude Code sessions, harvest runs) still holds the old one in memory: the next one to renew would send a voided token and be signed out — often the whole login with it. That was the cause of repeated sign-outs until 2026-10-12. Claude Code renews its own login whenever it runs; the app reads the store again before every poll and uses the new token at once.
 
-- The new `accessToken`, the new `refreshToken` (the old one only when the response has none) and `expiresAt` = now + `expires_in` are merged into the stored JSON, every other field untouched, and written back to the same place they were read from — never the other one. The old refresh token stops working once a new one is issued, so the write-back must happen. To the Keychain it goes through `security -i` with its command on stdin, so the JSON never appears in an argument list (same time limits as the read); to the file, as an atomic replace with mode `0600`.
-- A 401 or 403 from the usage endpoint leads to one renewal and one retry.
-- One renewal attempt per 60 s at most. If it fails, the poll goes ahead with the old token and the dot reports the problem (red, "sign-in expired — open Claude Code").
+- An access token past its `expiresAt` isn't sent: the dot turns yellow ("waiting for Claude Code to renew the sign-in") and the next poll comes after the base 5 minutes (no backoff — nothing was sent).
+- A 401 or 403 for a token that hadn't lapsed means the login was revoked: red, "sign-in expired", and the sign-in card.
+- Sign-in events go to the macOS unified log (subsystem `dev.harvest-season.widget`, category `signin`; no tokens): a renewal by Claude Code (the stored `expiresAt` moved), a refused token with the minutes it had left, an unreadable login, `claude auth status` changing, the sign-in card appearing or clearing. `log show --last 3d --predicate 'subsystem == "dev.harvest-season.widget" && category == "signin"'`.
 
 ## What it asks Anthropic
 
@@ -51,7 +51,7 @@ A usage row is a label, a bar and a whole percentage. The bar is blue below 70 %
 Trouble shows only in the live dot — its color and tooltip — never as text in the panel:
 
 - gray "waiting for data…" before the first answer; green "connected" after one.
-- yellow, it will try again by itself: "paused — Claude asked to slow down" (429), or "can't reach Claude — trying again" (offline, a 5xx, an answer it can't read).
+- yellow, it will try again by itself: "paused — Claude asked to slow down" (429), "can't reach Claude — trying again" (offline, a 5xx, an answer it can't read), or "waiting for Claude Code to renew the sign-in" (the stored token has lapsed).
 - red, it needs the user: "not signed in — run claude to sign in", or "sign-in expired — open Claude Code".
 
 After a successful fetch the tooltip adds `· updated HH:mm`. (Each in Hebrew or English, with the rest of the panel.)
@@ -299,7 +299,7 @@ reuses the branch. The coordinator's own limit waits for a running task to stop,
 
 Without a signed-in Claude Code nothing works — no fresh figures, no harvest — so this one problem is spelled
 out (`SignInProblem`: not installed / signed out / expired). Two sources: the widget's own poll (no stored login
-→ signed out; 401/403 after a renewal → expired) and `claude auth status --json` (the harvest runs the command
+→ signed out; 401/403 for a token that hadn't lapsed → expired) and `claude auth status --json` (the harvest runs the command
 line, which can be signed out on its own), checked at launch, every 30 min, after "Check again", and every 30 s
 for 15 min after "Sign in". While it's set: a red card under the usage rows ("Claude Code לא מחובר", what it
 stops, when the figures shown were last updated, **התחבר** / **בדוק שוב**); the menu bar image gets a red "!"
@@ -453,4 +453,4 @@ The switch (in Settings) is on when `~/Library/LaunchAgents/dev.harvest-season.w
 
 ## Out of scope
 
-The rest of the usage response — extra-usage credits, spending, other scopes and buckets — isn't shown. There is no sign-in inside the app: when the refresh token itself no longer works, the user signs in again through Claude Code.
+The rest of the usage response — extra-usage credits, spending, other scopes and buckets — isn't shown. There is no sign-in or token renewal inside the app: Claude Code renews its own login, and when that no longer works, the user signs in again through Claude Code.

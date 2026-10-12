@@ -66,7 +66,7 @@ Anything it replaces is backed up first. At the end it offers a short getting-st
 
 ## Privacy and safety
 
-- Your Claude credentials never leave your Mac except to Anthropic: the access token only to `api.anthropic.com`, the refresh token only to Anthropic's sign-in endpoint. Nothing is logged, no analytics, no other network calls.
+- Your Claude credentials never leave your Mac except to Anthropic: the access token only to `api.anthropic.com`; the widget only reads your login and never renews it — Claude Code does. Nothing is logged, no analytics, no other network calls.
 - The harvest never pushes, merges, deploys or deletes. Agents can't approve tasks for themselves. Text inside your code and backlog is treated as data, not instructions.
 
 ## Remove
