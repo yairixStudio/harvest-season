@@ -79,18 +79,20 @@ frame saved as `HarvestSeasonAllTasks`; the drop-down panel hides first in menu 
   `all` — every task with its `line` (its section in BACKLOG.md; rows are keyed project + line, since a
   done title can come back as a new task), `cleared`, `added`, `result` and, for done tasks, `sessionId`.
   One engine run feeds both; nothing extra runs while the window is closed.
-- Above the table: a segmented filter with counts — הכל (everything not dropped) · בתור · הצעות ·
-  מחכה לך (blocked, and done with an unmerged branch) · בוצעו · הוסרו (dropped) — kept in
+- Above the table: a segmented filter with counts — הכל (everything not dropped) · בתור · לתאריך (open, waiting for a
+  date) · הצעות · מחכה לך (blocked, a proposal whose date came, and done with an unmerged branch) · בוצעו · הוסרו (dropped) — kept in
   `UserDefaults` (`AllTasksFilter`); "גם מה שנוקה" (cleared done tasks are hidden until it is on);
   a search over title, project, details and result; ↻.
-- Columns, each sortable (default: status, then run order, then newest): status (a colored dot and a
-  word — question for you / awaiting merge, orange; queued with its place in the run order, accent;
-  proposal, purple; done, green, "· cleared" when cleared; removed, gray), task, project, priority,
-  complexity, estimated cost (open, proposed and blocked only), added (dd.MM), updated (days since the
+- Columns, each sortable (default: status, then run order, then the next date, then newest): status (a colored dot and a
+  word — question for you / awaiting merge / date has come, orange; queued with its place in the run order, accent;
+  awaiting its date, teal; proposal, purple; done, green, "· cleared" when cleared; removed, gray), task, project, priority,
+  complexity, estimated cost (open, proposed and blocked only), added (dd.MM), date (the recommended date, then
+  "by" the deadline; orange within a week of it, red past it), updated (days since the
   result's date, else since added), branch (icon and name, its state in the tooltip).
-- Under the table, the selected task: status, title, project, its details, then the question (blocked),
+- Under the table, the selected task: status, title, project, its dates, its details, then the question (blocked),
   what was done (done) or the last note, and its actions — take out of the queue / put in the queue,
-  delete a proposal, review and merge or answer the question (`openNeed`), reject (blocked, and done
+  delete a proposal, "תאריכים…" (open, proposed and blocked: `ScheduleForm`, in place of the details — the recommended
+  date, "not a day earlier", the deadline, each with a checkbox that clears it; then `schedule`), review and merge or answer the question (`openNeed`), reject (blocked, and done
   with an unmerged branch — the same `RejectForm`, in place of the details), open the session that did it,
   clear from or back to the Done list, open BACKLOG.md. The same actions on a right-click; a double-click
   opens the review (or answer) or the session. No run controls: running stays in the panel.
@@ -135,7 +137,7 @@ open or a harvest runs, else every 2 min):
   engine, used by both `list` and `plan`): first those the owner placed by dragging, in
   their order (`queue-order.json`, `claude-harvest queue-order <key>…`, keys
   `<project>::<title>`), then the rest by priority and, within a priority, the bigger
-  estimate first. Each row shows its project under the title and can be grabbed anywhere and dragged (`.draggable` / `.dropDestination`, the target shown by
+  estimate first; dates change that (see "Dates"). Each row shows its project under the title and can be grabbed anywhere and dragged (`.draggable` / `.dropDestination`, the target shown by
   an accent line — `WidgetModel.queueDropTarget`) onto another row to land above it, or
   below the last to go last; the whole new order is sent at once. "↺ Back to the automatic
   order" (shown while any task is `placed`) runs `queue-order --reset`. Refused in
@@ -147,6 +149,9 @@ open or a harvest runs, else every 2 min):
   turns × (the project's starting context + growth) — measured per project from its
   sessions, predicted from its CLAUDE.md size until then; the tooltip shows both parts), ▶ to run only that
   task now, and ⊖ (take it out of the queue). Header: count · total %.
+- **ממתינות לתאריך** (only while it has tasks) — `open` tasks whose date is still ahead (`waiting` in the listing,
+  soonest first), each with its project and date; see "Dates". Header: count · the next date. ▶ runs one now
+  anyway (`--only`), ⊖ takes it out of the queue like any queued task. Their cost isn't counted in the queue's.
 - **הצעות** — `proposed` tasks, with ⊕ (put it in the queue). ⊕ / ⊖ run
   `set-status open|proposed`. Header: count, plus "מקום לעוד X%" when the next
   harvest could absorb at least 5 more points.
@@ -155,7 +160,8 @@ open or a harvest runs, else every 2 min):
   proposals from this project…" (confirmation naming how many go, then `proposals
   "<project>" off`: its proposals are dropped, scans skip it and `add --status proposed`
   there is refused; `on` in Settings undoes it).
-- **מחכה לך** — `blocked` tasks and `done` tasks whose `backlog/*` branch is not
+- **מחכה לך** — at the top, when there are any, `dueProposals` (see "Dates"), as proposal rows (⊕, trash can). Then
+  `blocked` tasks and `done` tasks whose `backlog/*` branch is not
   merged into the project's main branch, with their age (orange at 14+ days).
   Clicking opens `claude://code/new?folder=<project>&q=<prompt>`: a new desktop
   session that reviews and, on approval, merges the branch (or resolves the
@@ -193,6 +199,9 @@ open or a harvest runs, else every 2 min):
   "נקה הכל" (an inline question with the count in place of the links — "נקה" / "ביטול" — then
   `clear-done --all`, which clears exactly what the done list shows) and "כל המשימות בטבלה ←", which opens the all-tasks window. `--undo` (from that
   window) brings one back. Refused in unattended runs: only the owner tidies the list.
+- A row with dates has one more quiet line under the title (`dateNote`): "לא לפני 01.12 · בעוד 30 ימים", "מועד 05.11 ·
+  מחר", "המועד היום", "דדליין 20.11", gray while it waits, accent once it may run, orange within a week of its
+  deadline, red past it; the tooltip has all three dates (`datesLine`).
 - Rows give titles up to two lines. Projects are grouped by name, in a fixed order, so a group never moves
   when one of its tasks leaves the list; the proposals' ⋯ sits right after the project's name. Above the
   queue and the proposals one muted line says what the % is (estimated token cost, of the weekly quota); a
@@ -217,7 +226,7 @@ Running: pulsing dot, the current task, Stop, an indeterminate bar. A run starte
 elsewhere (a live lock this widget didn't take) shows as "קציר רץ מסשן אחר"
 without Stop.
 
-Launching a run: `harvest.py maintain`, then `harvest.py launch --mode <auto|manual>
+Launching a run: `harvest.py maintain`, then `harvest.py launch --mode <auto|manual|deadline>
 --remote-control [--only <project>::<title>]… [--test]` via `posix_spawn` in its own
 process group, PATH extended with `~/.local/bin` and Homebrew, output to
 `logs/launch-*.out`; `caffeinate -i -w <launcher pid>` keeps the Mac awake for
@@ -295,6 +304,55 @@ kept, the task back to open with "· paused at … · continues from <branch>" (
 reuses the branch. The coordinator's own limit waits for a running task to stop, then ends the run with
 `5h-full` / `weekly-full`, so the next pulse follows. The 45-minute idle close is a signal too.
 
+### Dates
+
+Every task has three dates in BACKLOG.md: `added` (the engine, never changed), `scheduled` (the recommended date:
+`YYYY-MM-DD`, or `YYYY-MM-DD strict` for "not a day earlier") and `deadline` (`YYYY-MM-DD`). Both are optional and
+empty means none: a file without them works as before, and `add` always writes them, right under `added`.
+
+The engine works out what they mean on every read (`task_timing`), so nothing has to change in the file when a day
+passes and no one has to promote anything. `timing`: `none` · `waiting` (too early) · `soon` · `due` · `invalid`.
+
+- **A date ahead keeps the task out.** An `open` task that is `waiting` isn't in `queue`, `plan` or the cost of a
+  harvest: `list` gives it under `waiting`, and `plan` under `waiting` too. It stays `open`, so on its date it is in
+  the queue by itself, and `--only` (▶, the owner's word) still runs it. An unreadable date holds the task too, shown
+  and reported by `migrate --check`: a typo must not run something early.
+- **Near.** A strict date opens on the day. A recommended date opens `earlyDays` days before (setting, default 3, 0–7,
+  Settings → Harvest): the harvest comes once a week, so 3 keeps a task within half a week of its date, the nearer
+  harvest of the two. A deadline within a week opens a recommended date whatever is left of it; it never opens a strict one.
+- **Passed.** A date that passed with no harvest is simply due; a whole harvest late (`LATE_DAYS`, 7) it counts one
+  priority higher.
+- **Deadlines and the order** (`ordered_queue`, shared by `list` and `plan`). `urgent` = 7 days or less to the deadline
+  or past it (`overdue`): at most one harvest is left. Urgent tasks go first, above even the owner's drag, by the
+  owner's order among themselves, else by deadline. Then the rest: the owner's order, then priority, one higher
+  within 14 days of a deadline (`effective_priority`); within a priority a task with a date before one without, then
+  the bigger. A missed deadline is shown and goes first; nothing else happens to it.
+- **A deadline before the harvest** (`deadline_run`, `deadlineRun` in the listing): an `urgent` queued task 2 days or
+  less from a deadline that comes before the last possible start of the weekly harvest (reset − 6 h) gets a run of its
+  own: mode `deadline`, `--only` those tasks, with the same budget and reserves, no scan and no email. The widget
+  starts at most one a day (`HarvestDeadlineDay`), only with automatic on and the battery guard clear, and notifies.
+- **A proposal whose date came** (`dueProposal`: its date arrived, or a week or less to its deadline). It can't run by
+  itself: agents never approve work. It moves from `proposals` to `dueProposals`, shown in מחכה לך, in `brief`, the
+  talk session, the report and the digest. It never queues itself.
+- **Notifications** (`dateNudgeTick`): one per task and date, between 10:00 and 21:00, for a proposal whose date came
+  and for a queued task past its deadline (`DateNudged`).
+- `queue-order` keeps a waiting task's place (the widget's list doesn't show it, so a drag can't place it: it stays
+  after the same neighbor, `keep_places`), and `queue-clear` leaves waiting tasks and their places alone.
+
+`claude-harvest add … --not-before|--when|--deadline <date>` takes `YYYY-MM-DD`, day-first dates (`1.12`, `1.12.2026`, a
+bare one being its next occurrence) and words in English and Hebrew ("in a month", "next week", "בעוד חודש", "עוד
+שבועיים", "סוף החודש", "ביום שלישי", "1 בדצמבר"; months are calendar months, clamped to the month's end), and always
+stores an absolute date (`parse_when`). What it can't read for sure is refused rather than guessed, and `add` refuses a
+past date or a deadline before the date. `schedule <project> <title>` sets or clears dates on a task in play and can
+retitle it; refused in unattended runs, where `add` still takes dates, as `proposed`. With the owner present a dated
+task is `open`: proposing it would hold it back for good.
+
+`migrate` brings every registered BACKLOG.md to this format: the format comment, and the two empty fields on open,
+proposed and blocked tasks (done and dropped ones are history and stay). It keeps every other line, copies the
+original to `~/.claude/harvest/backups/backlogs-<time>/` first, reads the file again right before the swap and starts
+over if another session wrote to it, and leaves a current file alone. `--check` only reports. `./install` runs it after
+an upgrade. A task session whose task has dates gets them at the end of its prompt.
+
 ### Signed out
 
 Without a signed-in Claude Code nothing works — no fresh figures, no harvest — so this one problem is spelled
@@ -321,7 +379,7 @@ when installed, else in the widget's `UILanguage` default; the panel, menus and 
 at once), start at login, menu bar mode (these two moved here from the ⋯ menu). **Harvest**
 (installed) — automatic runs, pulses (`PulsesPicker`, `config.json`), the next harvest and the capacity, and
 "kept free for you": the 5-hour reserve (0–60, step 5) and the weekly one (0–30), `settings --set
-fiveReserve=… / weeklyReserve=…` on each step — and "Battery": "Don't start on a low battery" (`batteryGuard`) and
+fiveReserve=… / weeklyReserve=…` on each step — "Dates" (`earlyDays`, 0–7: how many days before a recommended date) — and "Battery": "Don't start on a low battery" (`batteryGuard`) and
 "Starts only above N % or when the Mac is plugged in" (5–80, step 5). **Models** — a model per task size (`settings --set models=…`),
 and for the model with its own weekly quota (`scopedLabel`, Fable): the percent it gives way at (50–100, step
 5), the model it gives way to or "None — the tasks wait for the reset" (`fallback`), and "Mid-task too"

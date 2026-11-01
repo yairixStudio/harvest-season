@@ -10,6 +10,7 @@ In Hebrew or English. [עברית](README.he.md)
 
 - **Usage at a glance.** Three bars in the panel (or three small gauges in the menu bar), orange from 70 %, red from 90 %, with the reset times.
 - **A backlog that fills itself.** Once set up, every Claude Code session (and Codex, if you use it) knows to record small, non-urgent things it notices — a missing test, a stale README, a TODO — in the project's `BACKLOG.md`, instead of doing them now or forgetting them. You can also just say "add this to the backlog".
+- **Tasks with a date.** Say "check this in a month" and the task goes in with its date: it waits, out of the queue and out of every harvest, and runs by itself once the date comes. A deadline moves a task up the queue, and gets it a run of its own when the weekly harvest would come too late.
 - **Proposals you approve.** Tasks an agent records on its own arrive as proposals. ⊕ next to a proposal moves it to the queue; the trash can deletes it; a project can be kept out of proposals altogether.
 - **The harvest.** Before your weekly reset the widget starts a Claude Code session that works through the queue, one task at a time, as far as the remaining quota allows — in **pulses** of one 5-hour window each, as many as you choose or as many as the quota left and the queue call for. A task that can't finish before the reset doesn't start. You can also run the queue right away.
 - **When a quota runs out.** A model with its own weekly quota (Fable) gives way to another at the percent you set — before a task, and mid-task too, the session going on with its context intact. When the shared 5-hour or weekly limit runs out, the task stops at once, keeps its work on its branch and goes on from there in the next pulse.
@@ -50,12 +51,13 @@ Anything it replaces is backed up first. At the end it offers a short getting-st
 ## Using it
 
 - **Queue** — approved tasks, top first, with each one's estimated share of your weekly quota. They run by priority unless you drag them into your own order. ▶ runs one now; ⊖ takes it out of the queue (or all of them at once).
+- **Waiting for a date** — tasks you approved whose date hasn't come. It shows only when it has any; on the date they move to the queue by themselves.
 - **Proposals** — ⊕ to approve, the trash can to delete, ⋯ next to a project for "no proposals from this project".
 - **Waiting for you** — finished branches and questions; a click opens a Claude session that walks you through the change, ✕ rejects it (not merged, the branch archived).
 - **Done** — the last 30 days; a click opens the session that did the task, the trash can (or **Clear all**) tidies the list.
 - The **table button** at the top — **All tasks**: every task of every project in one window, with tabs, search, sortable columns, and each task's details and actions.
 - **Harvest** (bottom) — the countdown to the next automatic run, **Run now**, and the schedule.
-- ⋯ → **Settings…** — five tabs: **General** (language, start at login, menu bar or floating, your details), **Harvest** (automatic runs, pulses, how much of each limit is kept free for you), **Models** (a model per task size, when and to what to switch), **Projects** (which may get proposals) and **Texts** (every instruction the harvest gives its agents, editable, with the default a click away). ⋯ → **Help** explains every part of the panel.
+- ⋯ → **Settings…** — five tabs: **General** (language, start at login, menu bar or floating, your details), **Harvest** (automatic runs, pulses, how much of each limit is kept free for you, how many days before a recommended date a task may run), **Models** (a model per task size, when and to what to switch), **Projects** (which may get proposals) and **Texts** (every instruction the harvest gives its agents, editable, with the default a click away). ⋯ → **Help** explains every part of the panel.
 
 ## How it works
 

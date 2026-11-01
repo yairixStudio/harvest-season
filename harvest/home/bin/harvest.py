@@ -6,6 +6,7 @@ edit it there and reinstall (`./install`, or `python3 harvest/install.py install
 overwrite a copy edited in place."""
 
 import argparse
+import calendar
 import hashlib
 import json
 import os
@@ -15,7 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 HOME = os.path.expanduser(os.environ.get("HARVEST_HOME", "~/.claude/harvest"))
 # A new BACKLOG.md starts from the template in the owner's language (BACKLOG.template.<he|en>.md).
@@ -59,7 +60,10 @@ DEFAULT_SETTINGS = {"ownerName": "", "language": "en", "email": "", "emailDigest
                     "fallback": DEFAULT_FALLBACK, "switchMidTask": True,
                     # Points the harvest leaves unused: in the 5-hour window, so the owner can keep working,
                     # and in the week (anything more than a little would vanish at the reset anyway).
-                    "fiveReserve": 15, "weeklyReserve": 2}
+                    "fiveReserve": 15, "weeklyReserve": 2,
+                    # How many days before its recommended date a task may run. The harvest comes once a week, so
+                    # 3 keeps a task within half a week of its date: this harvest if it is closer, else the next.
+                    "earlyDays": 3}
 
 SEED_TOKENS_PER_WEEKLY_PCT = 120000
 SEED_TOKENS_PER_FIVE_PCT = 30000
@@ -85,10 +89,17 @@ CONTEXT_FILES = ("CLAUDE.md", ".claude/CLAUDE.md", "CLAUDE.local.md")
 MAX_SCANS_PER_RUN = 3
 ARCHIVE_AFTER_DAYS = 35
 AUTO_SLACK_H = 0.5
+# Dates. The harvest comes once a week, so a deadline within a week has at most one harvest left: it goes first.
+URGENT_DAYS = 7
+RAISE_DAYS = 14      # a deadline this close, or a date LATE_DAYS behind, counts one priority higher
+LATE_DAYS = 7
+DEADLINE_RUN_DAYS = 2  # a deadline the weekly harvest would miss gets a run of its own this many days before it
+LAST_PULSE_H = 6     # the weekly harvest has started by this many hours before the reset
 
 KEY_LINE = re.compile(r"^- ([a-z_]+):[ \t]?(.*)$")
 BRANCH_RE = re.compile(r"(backlog(?:-archive|-stopped)?/[A-Za-z0-9._/-]+)")
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+SCHEDULED_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(\s+strict)?$")
 
 
 # ---------- small helpers ----------
@@ -113,7 +124,14 @@ def parse_iso(s):
 
 
 def today():
-    return datetime.now().strftime("%Y-%m-%d")
+    return os.environ.get("HARVEST_TODAY") or datetime.now().strftime("%Y-%m-%d")
+
+
+def parse_date(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
 
 
 def cycle_id(resets_at):
@@ -169,6 +187,7 @@ TEXT = {
     "onboard_name": {"he": "קציר · היכרות · %s", "en": "Harvest · getting started · %s"},
     "mode_auto": {"he": "אוטומטי", "en": "automatic"},
     "mode_manual": {"he": "ידני", "en": "manual"},
+    "mode_deadline": {"he": "דדליין", "en": "deadline"},
     "run_name": {"he": "עונת הקציר · %s · %s", "en": "Harvest Season · %s · %s"},
     "task_name": {"he": "קציר · %s", "en": "Harvest · %s"},
     "no_report": {"he": "הסשן נסגר בלי לדווח תוצאה", "en": "the session closed without reporting a result"},
@@ -194,13 +213,28 @@ def manual_order():
     return [k for k in (read_json(QUEUE_ORDER, {}) or {}).get("keys", []) if isinstance(k, str)]
 
 
+def effective_priority(t):
+    """A task's priority as the queue counts it: one higher once its deadline is near or its date is a harvest behind."""
+    behind = t.get("deadlineIn", RAISE_DAYS + 1) <= RAISE_DAYS or t.get("scheduledIn", 0) <= -LATE_DAYS
+    return max(1, t["priority"] - 1) if behind else t["priority"]
+
+
 def ordered_queue(tasks):
-    """The order queued tasks run in — and are shown in: first those the owner placed by hand, in their order;
-    then the rest by priority, the bigger task first within a priority (it fits best early, while the budget
-    is widest)."""
+    """The order queued tasks run in — and are shown in. First the tasks a deadline presses (`urgent`: this may be
+    their last harvest), then the rest; in each group those the owner placed by hand, in their order; after them
+    the urgent ones by deadline and the rest by priority (deadlines and missed dates raise it), a task whose date
+    has come before one that could run any week, the bigger task first (it fits best early, while the budget is
+    widest)."""
     place = {k: i for i, k in enumerate(manual_order())}
-    return sorted(tasks, key=lambda t: (0, place[task_key(t)], 0) if task_key(t) in place
-                  else (1, t["priority"], -t["tokens"]))
+
+    def rank(t):
+        group = 0 if t.get("urgent") else 1
+        if task_key(t) in place:
+            return (group, 0, place[task_key(t)], 0, 0)
+        if t.get("urgent"):
+            return (group, 1, t["deadlineIn"], t["priority"], -t["tokens"])
+        return (group, 1, effective_priority(t), 0 if t.get("scheduled") else 1, -t["tokens"])
+    return sorted(tasks, key=rank)
 
 
 def proposals_off(repo):
@@ -347,6 +381,142 @@ def int_or(value, default):
         return int(str(value).strip())
     except (ValueError, TypeError):
         return default
+
+
+# ---------- what a person says about a date ----------
+
+HE_MONTHS = {"ינואר": 1, "פברואר": 2, "מרץ": 3, "מרס": 3, "אפריל": 4, "מאי": 5, "יוני": 6, "יולי": 7, "אוגוסט": 8,
+             "ספטמבר": 9, "אוקטובר": 10, "נובמבר": 11, "דצמבר": 12}
+EN_MONTHS = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
+EN_MONTHS.update({m.lower(): i for i, m in enumerate(calendar.month_abbr) if m})
+MONTHS = dict(HE_MONTHS, **EN_MONTHS)
+WEEKDAYS = dict({"ראשון": 6, "שני": 0, "שלישי": 1, "רביעי": 2, "חמישי": 3, "שישי": 4, "שבת": 5},
+                **{d.lower(): i for i, d in enumerate(calendar.day_name)})
+UNITS = {"day": "d", "days": "d", "יום": "d", "ימים": "d", "week": "w", "weeks": "w", "שבוע": "w", "שבועות": "w",
+         "month": "m", "months": "m", "חודש": "m", "חודשים": "m", "year": "y", "years": "y", "שנה": "y", "שנים": "y"}
+PAIRS = {"יומיים": "d", "שבועיים": "w", "חודשיים": "m", "שנתיים": "y"}
+COUNTS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+          "nine": 9, "ten": 10, "אחד": 1, "אחת": 1, "שני": 2, "שתי": 2, "שניים": 2, "שתיים": 2, "שלושה": 3, "שלוש": 3,
+          "ארבעה": 4, "ארבע": 4, "חמישה": 5, "חמש": 5, "שישה": 6, "שש": 6, "שבעה": 7, "שבע": 7, "שמונה": 8,
+          "תשעה": 9, "תשע": 9, "עשרה": 10, "עשר": 10}
+
+
+def add_months(d, n):
+    month = d.month - 1 + n
+    year, month = d.year + month // 12, month % 12 + 1
+    return date(year, month, min(d.day, calendar.monthrange(year, month)[1]))
+
+
+def shifted(day, count, unit):
+    if unit == "d":
+        return day + timedelta(days=count)
+    if unit == "w":
+        return day + timedelta(weeks=count)
+    return add_months(day, count * (12 if unit == "y" else 1))
+
+
+def valid_date(year, month, day):
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def next_occurrence(day, month, dom, year=None):
+    """A day and month with no year: the next time it comes, today included."""
+    if year:
+        return valid_date(year, month, dom)
+    found = valid_date(day.year, month, dom)
+    return found if found and found >= day else valid_date(day.year + 1, month, dom)
+
+
+def month_part(day, part, month, year=None):
+    """The start, middle or end of a named month (of `year`, or the next time it comes)."""
+    if not year:
+        year = day.year if month >= day.month else day.year + 1
+    return date(year, month, {"start": 1, "mid": 15, "end": calendar.monthrange(year, month)[1]}[part])
+
+
+def month_of(word):
+    """A month's number from a word, with or without a Hebrew prefix: מרץ, במרץ, ב-מרץ, march."""
+    return MONTHS.get(word) or MONTHS.get(re.sub(r"^[במל]-?", "", word))
+
+
+def parse_when(text, day):
+    """A date as the owner says it, in English or Hebrew, as a date — always absolute before it reaches BACKLOG.md.
+    `day` is today. None when it can't be read for sure: the caller asks for YYYY-MM-DD instead of guessing."""
+    t = " ".join((text or "").lower().replace("־", "-").replace("–", "-").replace("׳", "").split()).strip(" .,?!")
+    t = re.sub(r"^(on|by|from|until|till|starting|החל מ-?|עד)\s+", "", t)
+    if DATE_RE.fullmatch(t):
+        return parse_date(t)
+    m = re.fullmatch(r"(?:[במל]-?)?(\d{1,2})[./](\d{1,2})(?:[./](\d{2}|\d{4}))?", t)
+    if m:  # day first, as dates are written here
+        year = m.group(3)
+        return next_occurrence(day, int(m.group(2)), int(m.group(1)), (2000 + int(year) if len(year) == 2 else int(year)) if year else None)
+    if t in ("today", "היום"):
+        return day
+    if t in ("tomorrow", "מחר"):
+        return day + timedelta(days=1)
+    if t in ("day after tomorrow", "the day after tomorrow", "מחרתיים"):
+        return day + timedelta(days=2)
+    m = re.fullmatch(r"\+\s*(\d+)\s*([dwmy])", t)
+    if m:
+        return shifted(day, int(m.group(1)), m.group(2))
+
+    # "next week", "בשבוע הבא"
+    m = re.fullmatch(r"next (week|month|year)", t) or re.fullmatch(r"ב?(?:ה)?(שבוע|חודש|שנה) (?:ה)?(?:בא|באה|קרוב|קרובה)", t)
+    if m:
+        return shifted(day, 1, UNITS[m.group(1)])
+
+    # the edges of the week, the month, the year
+    if re.fullmatch(r"(?:the )?end of (?:the |this )?week|ב?סוף (?:ה)?שבוע(?: הזה)?", t):
+        return day + timedelta(days=(4 - day.weekday()) % 7)
+    if re.fullmatch(r"(?:the )?end of (?:the |this )?month|ב?סוף (?:ה)?חודש(?: הזה)?", t):
+        return month_part(day, "end", day.month, day.year)
+    following = add_months(day.replace(day=1), 1)
+    if re.fullmatch(r"(?:the )?(?:start|beginning) of (?:the )?next month|ב?תחילת (?:ה)?חודש (?:ה)?בא", t):
+        return following
+    if re.fullmatch(r"(?:the )?end of (?:the )?next month|ב?סוף (?:ה)?חודש (?:ה)?בא", t):
+        return month_part(following, "end", following.month, following.year)
+    if re.fullmatch(r"(?:the )?end of (?:the |this )?year|ב?סוף (?:ה)?שנה(?: הזאת| הזו)?", t):
+        return date(day.year, 12, 31)
+
+    # weekdays: the next one after today
+    m = re.fullmatch(r"(?:(?:next|this) )?([a-z]+)", t) or re.fullmatch(r"ב?יום (\S+)(?: (?:ה)?(?:בא|קרוב))?", t) \
+        or re.fullmatch(r"ב?(שבת)(?: (?:ה)?(?:באה|קרובה))?", t)
+    if m and m.group(1) in WEEKDAYS:
+        return day + timedelta(days=(WEEKDAYS[m.group(1)] - day.weekday() - 1) % 7 + 1)
+
+    # months: "1 בדצמבר", "dec 1", "תחילת דצמבר", "december 2027"
+    year = lambda g: int(g) if g else None
+    m = re.fullmatch(r"(?:[במל]-?)?(\d{1,2})(?:st|nd|rd|th)? (?:of )?(\S+?)(?:,? (\d{4}))?", t)
+    if m and month_of(m.group(2)):
+        return next_occurrence(day, month_of(m.group(2)), int(m.group(1)), year(m.group(3)))
+    m = re.fullmatch(r"(\S+) (\d{1,2})(?:st|nd|rd|th)?(?:,? (\d{4}))?", t)
+    if m and month_of(m.group(1)):
+        return next_occurrence(day, month_of(m.group(1)), int(m.group(2)), year(m.group(3)))
+    m = re.fullmatch(r"(?:the )?(start|beginning|mid|middle|end)(?: of)?[- ](\S+)(?: (\d{4}))?", t) \
+        or re.fullmatch(r"ב?(תחילת|אמצע|סוף) (\S+)(?: (\d{4}))?", t)
+    if m and month_of(m.group(2)):
+        part = {"start": "start", "beginning": "start", "תחילת": "start", "mid": "mid", "middle": "mid", "אמצע": "mid"}.get(m.group(1), "end")
+        return month_part(day, part, month_of(m.group(2)), year(m.group(3)))
+    m = re.fullmatch(r"(\S+)(?: (\d{4}))?", t)
+    if m and month_of(m.group(1)):
+        return month_part(day, "start", month_of(m.group(1)), year(m.group(2)))
+
+    # spans: "in a month", "בעוד שבועיים", "עוד 3 ימים", "חצי שנה"
+    t = re.sub(r"^(in|after|בעוד|עוד|אחרי|לעוד)\s+", "", t)
+    t = re.sub(r"\s+(from now|מהיום|מעכשיו)$", "", t)
+    if t in ("half a year", "חצי שנה"):
+        return add_months(day, 6)
+    if t in PAIRS:
+        return shifted(day, 2, PAIRS[t])
+    if t in UNITS:
+        return shifted(day, 1, UNITS[t])
+    m = re.fullmatch(r"(\S+) (?:of )?(\S+)", t)
+    if m and m.group(2) in UNITS and (m.group(1).isdigit() or m.group(1) in COUNTS):
+        return shifted(day, int(m.group(1)) if m.group(1).isdigit() else COUNTS[m.group(1)], UNITS[m.group(2)])
+    return None
 
 
 # ---------- registry, config, status ----------
@@ -573,6 +743,10 @@ def parse_backlog(repo):
             text = f.read()
     except OSError:
         return None, []
+    return parse_sections(text)
+
+
+def parse_sections(text):
     lines = text.split("\n")
     tasks, cur = [], None
     for i, line in enumerate(lines):
@@ -617,6 +791,70 @@ def write_fields(repo, lines, t, updates):
     write_text(backlog_path(repo), "\n".join(lines))
 
 
+def field_line(key, value):
+    return "- %s: %s" % (key, value) if value != "" else "- %s:" % key
+
+
+def write_dates(repo, lines, t, updates):
+    """Sets date fields in the task section `t`; a field the section lacks goes right under `added`, where `add`
+    puts it."""
+    for key, value in updates.items():
+        if key in t["lines"]:
+            lines[t["lines"][key]] = field_line(key, value)
+    at = t["lines"].get("added", t["lines"].get("status", t["line"])) + 1
+    for key, value in reversed(list(updates.items())):
+        if key not in t["lines"]:
+            lines.insert(at, field_line(key, value))
+    write_text(backlog_path(repo), "\n".join(lines))
+
+
+def task_timing(fields, day, early):
+    """What a task's dates mean today. `timing`: none (no recommended date) · waiting (too early: it stays out of the
+    queue, and out of a harvest) · soon (within `early` days of a recommended date, or a deadline presses it) · due
+    (its date has come) · invalid (a date no one can read: it waits, rather than run early by a typo). `strict`: the
+    date is "not before", for work with no value earlier. `urgent`: a deadline within a week, or past it (`overdue`)."""
+    out = {"scheduled": "", "strict": False, "deadline": "", "timing": "none", "urgent": False, "overdue": False}
+    raw = fields.get("deadline", "")
+    deadline = parse_date(raw)
+    if raw and not deadline:
+        out["dateProblem"] = raw
+    elif deadline:
+        left = (deadline - day).days
+        out.update(deadline=raw, deadlineIn=left, urgent=left <= URGENT_DAYS, overdue=left < 0)
+    raw = fields.get("scheduled", "")
+    m = SCHEDULED_RE.match(raw)
+    scheduled = parse_date(m.group(1)) if m else None
+    if raw and not scheduled:
+        out.update(timing="invalid", dateProblem=raw)
+    elif scheduled:
+        left = (scheduled - day).days
+        out.update(scheduled=m.group(1), strict=bool(m.group(2)), scheduledIn=left)
+        if left <= 0:
+            out["timing"] = "due"
+        elif not out["strict"] and (left <= early or out["urgent"]):
+            out["timing"] = "soon"
+        else:
+            out["timing"] = "waiting"
+    out["waits"] = out["timing"] in ("waiting", "invalid")
+    return out
+
+
+def due_proposal(t):
+    """A proposal whose date has come: it can't run by itself, so it goes to the owner rather than pass unnoticed."""
+    return t["status"] == "proposed" and (t.get("scheduledIn", 1) <= 0 or t.get("deadlineIn", URGENT_DAYS + 1) <= URGENT_DAYS)
+
+
+def deadline_run(queue, usage):
+    """Queued tasks that can't wait for the weekly harvest: their deadline is here and comes before the harvest
+    does. The widget gives them a run of their own. A deadline already missed waits for the harvest, first in line:
+    a run outside the weekly window can still save only one that hasn't passed."""
+    reset = parse_iso(((usage or {}).get("weekly") or {}).get("resetsAt"))
+    if not reset:
+        return []
+    harvest = (reset - timedelta(hours=LAST_PULSE_H)).astimezone().date()
+    return [t for t in queue if 0 <= t.get("deadlineIn", -1) <= DEADLINE_RUN_DAYS and parse_date(t["deadline"]) < harvest]
+
+
 def task_view(repo, t, r):
     f = t["fields"]
     complexity = f.get("complexity") or "medium"
@@ -631,12 +869,12 @@ def task_view(repo, t, r):
         "details": f.get("details", ""), "added": f.get("added", ""), "result": result,
         "line": t["line"], "cleared": bool(f.get("cleared")),
     }
-    date = DATE_RE.search(result) or DATE_RE.search(v["added"])
-    if date:
-        try:
-            v["ageDays"] = (datetime.now().date() - datetime.strptime(date.group(1), "%Y-%m-%d").date()).days
-        except ValueError:
-            pass
+    day = parse_date(today())
+    v.update(task_timing(f, day, settings()["earlyDays"]))
+    v["dueProposal"] = due_proposal(v)
+    found = DATE_RE.search(result) or DATE_RE.search(v["added"])
+    if found and parse_date(found.group(1)):
+        v["ageDays"] = (day - parse_date(found.group(1))).days
     if v["status"] == "done":
         parts = [x.strip() for x in result.split("·")]
         rest = [x for x in parts if x and not DATE_RE.fullmatch(x) and not BRANCH_RE.fullmatch(x)
@@ -812,6 +1050,16 @@ def done_list(tasks):
     return done[:DONE_LIST_MAX]
 
 
+def by_date(t):
+    """Soonest first: a task's next date, whichever it is. A date no one can read comes first, to be seen."""
+    return (min(t.get("scheduledIn", 99999), t.get("deadlineIn", 99999)) if not t.get("dateProblem") else -99999, t["priority"])
+
+
+def waiting_tasks(tasks):
+    """Queued tasks whose date is still ahead: they keep their place in the owner's order and come back by themselves."""
+    return sorted([t for t in tasks if t["status"] == "open" and t["waits"]], key=by_date)
+
+
 def cmd_list(a):
     r = ratio()
     tasks, infos = all_tasks(r)
@@ -826,17 +1074,22 @@ def cmd_list(a):
     lk = read_lock()
     placed = set(manual_order())
     extra = {"all": tasks} if a.all else {}
+    usage = read_json(USAGE, None)
+    queue = ordered_queue([t for t in tasks if t["status"] == "open" and not t["waits"]])
     emit(dict(extra, **{
         "now": iso(now()),
         "projects": infos,
-        "queue": [dict(t, placed=task_key(t) in placed) for t in ordered_queue([t for t in tasks if t["status"] == "open"])],
-        "proposals": sorted([t for t in tasks if t["status"] == "proposed"], key=by_priority),
+        "queue": [dict(t, placed=task_key(t) in placed) for t in queue],
+        "waiting": waiting_tasks(tasks),
+        "proposals": sorted([t for t in tasks if t["status"] == "proposed" and not due_proposal(t)], key=by_priority),
+        "dueProposals": sorted([t for t in tasks if due_proposal(t)], key=by_date),
+        "deadlineRun": deadline_run(queue, usage),
         "needsYou": [t for t in tasks if t["status"] == "blocked"
                      or (t["status"] == "done" and t.get("branchState") == "unmerged")],
         "done": done_list(tasks),
         "ratio": r, "config": config(), "status": status(),
         "lock": dict(lk, live=lock_is_live(lk)) if lk else None,
-        "usage": read_json(USAGE, None),
+        "usage": usage,
         "launch": read_json(LAUNCH, None),
         "settings": dict(settings(), configured=os.path.exists(SETTINGS)),
     }))
@@ -909,6 +1162,10 @@ def cmd_settings(a):
                 if not v.strip().isdigit() or not 0 <= int(v) <= 60:
                     fail(k + " takes a whole number of points, 0–60")
                 v = int(v)
+            elif k == "earlyDays":
+                if not v.strip().isdigit() or not 0 <= int(v) <= 7:
+                    fail("earlyDays takes a whole number of days, 0–7")
+                v = int(v)
             elif k in ("emailDigest", "switchMidTask"):
                 v = v.strip().lower() in ("1", "true", "yes", "on")
             elif k == "language" and v not in LANGUAGES:
@@ -940,6 +1197,17 @@ def cmd_proposals(a):
     emit({"ok": True, "project": repo, "proposals": a.state, "dropped": dropped})
 
 
+def keep_places(old, new, held):
+    """The owner's new order, and the tasks that wait for a date where they were in the old one (right after the
+    same neighbor): the widget's list doesn't show them, so a drag there can't place them."""
+    out = list(new)
+    for i, k in enumerate(old):
+        if k in held and k not in out:
+            before = next((p for p in reversed(old[:i]) if p in out), None)
+            out.insert(out.index(before) + 1 if before else 0, k)
+    return out
+
+
 def cmd_queue_order(a):
     """`queue-order <key>…`: the owner's order for the queue, first to run first — keys are "<project>::<title>"
     of queued tasks (others are dropped). Queued tasks not named keep the automatic order after them.
@@ -956,29 +1224,34 @@ def cmd_queue_order(a):
         for k in a.keys:
             if k in queued and k not in keys:
                 keys.append(k)
-        write_json(QUEUE_ORDER, {"keys": keys})
+        write_json(QUEUE_ORDER, {"keys": keep_places(manual_order(), keys, {task_key(t) for t in waiting_tasks(tasks)})})
     tasks, _ = all_tasks(ratio())
     emit({"ok": True, "manual": bool(manual_order()),
-          "queue": [task_key(t) for t in ordered_queue([t for t in tasks if t["status"] == "open"])]})
+          "queue": [task_key(t) for t in ordered_queue([t for t in tasks if t["status"] == "open" and not t["waits"]])]})
 
 
 def cmd_queue_clear(a):
     """Empties the queue in one step: every queued (open) task goes back to the proposals, where it waits until
-    the owner queues it again, and the owner's dragged order goes with it. Only the owner: never from an
-    unattended run."""
+    the owner queues it again, and the owner's dragged order goes with it. Tasks waiting for a date aren't in the
+    queue the owner is looking at: they stay, with their places. Only the owner: never from an unattended run."""
     if os.environ.get("HARVEST_UNATTENDED"):
         fail("only the owner empties the queue")
     moved = []
+    day, early = parse_date(today()), settings()["earlyDays"]
     for repo in projects():
         # One section at a time from a fresh read: adding a missing status line moves the lines below it.
         while True:
             lines, tasks = parse_backlog(repo)
-            t = next((t for t in tasks if (t["fields"].get("status") or "open") == "open"), None)
+            t = next((t for t in tasks if (t["fields"].get("status") or "open") == "open"
+                      and not task_timing(t["fields"], day, early)["waits"]), None)
             if t is None:
                 break
             write_fields(repo, lines, t, {"status": "proposed"})
             moved.append({"project": repo, "title": t["title"]})
-    if os.path.exists(QUEUE_ORDER):
+    held = {task_key(t) for t in waiting_tasks(all_tasks(ratio())[0])}
+    if held & set(manual_order()):
+        write_json(QUEUE_ORDER, {"keys": [k for k in manual_order() if k in held]})
+    elif os.path.exists(QUEUE_ORDER):
         os.remove(QUEUE_ORDER)
     emit({"ok": True, "unqueued": moved})
 
@@ -1023,6 +1296,68 @@ def cmd_link_session(a):
     emit({"ok": True, "project": repo, "title": t["title"], "sessionId": a.session_id})
 
 
+def resolve_dates(a, day, past_ok):
+    """--when / --not-before / --deadline as the fields BACKLOG.md stores: absolute dates, whatever the wording."""
+    if a.when and a.not_before:
+        fail("give --when (a recommended date) or --not-before (not a day earlier), not both")
+    dates = {}
+    phrase = a.not_before or a.when
+    scheduled = None
+    if phrase:
+        scheduled = parse_when(phrase, day)
+        if not scheduled:
+            fail("can't read the date %r: give YYYY-MM-DD" % phrase)
+        dates["scheduled"] = scheduled.isoformat() + (" strict" if a.not_before else "")
+    if a.deadline:
+        deadline = parse_when(a.deadline, day)
+        if not deadline:
+            fail("can't read the date %r: give YYYY-MM-DD" % a.deadline)
+        if scheduled and deadline < scheduled:
+            fail("the deadline %s comes before the date %s" % (deadline, scheduled))
+        dates["deadline"] = deadline.isoformat()
+    if not past_ok:
+        for key, value in dates.items():
+            if parse_date(value.split()[0]) < day:
+                fail("the %s %s has already passed" % (key, value.split()[0]))
+    return dates
+
+
+def cmd_schedule(a):
+    """Sets or clears the dates of a task in play (open, proposed or blocked), and can give it a clearer title; its
+    status stays. A title can come back as a new task once the old one is done, so it's the live section. Only the
+    owner: never from an unattended run."""
+    if os.environ.get("HARVEST_UNATTENDED"):
+        fail("unattended runs cannot change a task's dates")
+    repo = os.path.abspath(a.project)
+    lines, tasks = parse_backlog(repo)
+    if lines is None:
+        fail("no BACKLOG.md in " + repo)
+    live = [t for t in tasks if t["title"] == a.title.strip()
+            and (t["fields"].get("status") or "open") in ("open", "proposed", "blocked")]
+    if not live:
+        fail("no open, proposed or blocked task under this title: " + a.title, project=repo)
+    t = live[-1]
+    day = parse_date(today())
+    dates = resolve_dates(a, day, past_ok=True)
+    updates = {}
+    if a.clear_scheduled or "scheduled" in dates:
+        updates["scheduled"] = dates.get("scheduled", "")
+    if a.clear_deadline or "deadline" in dates:
+        updates["deadline"] = dates.get("deadline", "")
+    both = dict(t["fields"], **updates)
+    timing = task_timing(both, day, settings()["earlyDays"])
+    if timing["scheduled"] and timing["deadline"] and timing["deadlineIn"] < timing["scheduledIn"]:
+        fail("the deadline %s comes before the date %s" % (timing["deadline"], timing["scheduled"]))
+    title = t["title"]
+    if a.title_new:
+        title = a.title_new.strip().replace("\n", " ")
+        lines[t["line"]] = "## " + title
+    write_dates(repo, lines, t, updates)
+    emit({"ok": True, "project": repo, "title": title, "status": t["fields"].get("status") or "open",
+          "added": t["fields"].get("added", ""), "scheduled": timing["scheduled"], "strict": timing["strict"],
+          "deadline": timing["deadline"], "waits": timing["waits"]})
+
+
 def cmd_add(a):
     repo = os.path.abspath(a.project)
     if not os.path.isdir(repo):
@@ -1037,6 +1372,7 @@ def cmd_add(a):
         fail("the owner turned proposals off for this project — don't record proposals here", proposalsOff=True)
     if a.complexity not in MODEL_BY_COMPLEXITY:
         fail("complexity must be low, medium or high")
+    dates = resolve_dates(a, parse_date(today()), past_ok=False)
     path = backlog_path(repo)
     if not os.path.exists(path):
         try:
@@ -1051,13 +1387,16 @@ def cmd_add(a):
         fail("a task with this title is already in the backlog", project=repo, title=title)
     tokens = a.tokens or DEFAULT_TOKENS[a.complexity]
     block = ["", "## " + title, "- status: " + status_value, "- added: " + today(),
+             field_line("scheduled", dates.get("scheduled", "")), field_line("deadline", dates.get("deadline", "")),
              "- priority: %d" % a.priority, "- complexity: " + a.complexity, "- tokens: %d" % tokens,
              "- details: " + a.details.strip().replace("\n", " "), "- result:"]
     text = "\n".join(lines).rstrip("\n") + "\n" + "\n".join(block) + "\n"
     write_text(path, text)
     registered = register(repo)
-    emit({"ok": True, "project": repo, "title": title, "status": status_value,
-          "downgradedToProposed": downgraded, "registered": registered})
+    timing = task_timing(dates, parse_date(today()), settings()["earlyDays"])
+    emit({"ok": True, "project": repo, "title": title, "status": status_value, "added": today(),
+          "scheduled": timing["scheduled"], "strict": timing["strict"], "deadline": timing["deadline"],
+          "waits": timing["waits"], "downgradedToProposed": downgraded, "registered": registered})
 
 
 def model_full(model, usage, st, s):
@@ -1142,8 +1481,12 @@ def cmd_plan(a):
 
     tasks, infos = all_tasks(r)
     only = set(a.only or [])
-    candidates = [x for x in tasks if x["status"] == "open" and (not only or x["project"] + "::" + x["title"] in only)]
+    # A task waiting for its date stays out, unless the owner named it ("run it now anyway").
+    candidates = [x for x in tasks if x["status"] == "open" and (task_key(x) in only if only else not x["waits"])]
     candidates = ordered_queue(candidates)
+    brief = lambda x: {k: x.get(k) for k in ("project", "projectName", "title", "scheduled", "strict", "deadline", "timing")}
+    res["waiting"] = [brief(x) for x in waiting_tasks(tasks) if task_key(x) not in only]
+    res["dueProposals"] = [brief(x) for x in tasks if due_proposal(x)]
     minutes_left = (reset - t).total_seconds() / 60
     deferred_budget = False
     for c in candidates:
@@ -1163,7 +1506,8 @@ def cmd_plan(a):
         if res["next"] is None:
             res["next"] = {"kind": "task", "project": c["project"], "projectName": c["projectName"],
                            "title": c["title"], "details": c["details"], "priority": c["priority"],
-                           "complexity": c["complexity"], "tokens": c["tokens"], "model": model}
+                           "complexity": c["complexity"], "tokens": c["tokens"], "model": model,
+                           "scheduled": c["scheduled"], "deadline": c["deadline"], "overdue": c["overdue"]}
     if res["next"] is None and a.mode == "auto" and not only and st.get("scansThisRun", 0) < MAX_SCANS_PER_RUN:
         open_or_proposed = {x["project"] for x in tasks if x["status"] in ("open", "proposed")}
         scanned = set(st.get("scannedThisRun", []))
@@ -1261,7 +1605,8 @@ def start_task(repo, title, model, usage_json):
                "branch": branch, "base": base, "worktree": path, "model": model,
                "tokens": tokens_of(t["fields"].get("tokens"), t["fields"].get("complexity")),
                "details": t["fields"].get("details", ""), "priority": int_or(t["fields"].get("priority"), 2),
-               "complexity": t["fields"].get("complexity") or "medium",
+               "complexity": t["fields"].get("complexity") or "medium", "added": t["fields"].get("added", ""),
+               "scheduled": t["fields"].get("scheduled", ""), "deadline": t["fields"].get("deadline", ""),
                "startedAt": iso(now()), "usageBefore": u, "resumed": bool(resumed)}
     st = status()
     st["current"] = current
@@ -1495,6 +1840,88 @@ def cmd_maintain(a):
     emit(report)
 
 
+FORMAT_LINES = ["scheduled:  YYYY-MM-DD the recommended date, empty for any time; the harvest takes it from a few days before (earlyDays).",
+                "            \"YYYY-MM-DD strict\" = not a day earlier, for work with no value before it. Set by `claude-harvest add --when/--not-before`",
+                "deadline:   YYYY-MM-DD the last useful day, empty for none; it moves the task up as it nears"]
+
+
+def current_format(text):
+    """A BACKLOG.md in the current format: the format comment names the date fields, and every task in play has
+    them, under `added`. Nothing else changes; done and dropped tasks are history and stay as they were."""
+    lines, tasks = parse_sections(text)
+    for t in reversed(tasks):
+        if (t["fields"].get("status") or "open") in ("open", "proposed", "blocked"):
+            missing = [k for k in ("scheduled", "deadline") if k not in t["lines"]]
+            at = t["lines"].get("added", t["lines"].get("status", t["line"])) + 1
+            lines[at:at] = [field_line(k, "") for k in missing]
+    head = lines[:tasks[0]["line"]] if tasks else lines
+    if not any(l.startswith("scheduled:") for l in head):
+        at = next((i for i, l in enumerate(head) if l.startswith("added:")), None)
+        if at is not None:
+            lines[at + 1:at + 1] = FORMAT_LINES
+    return "\n".join(lines)
+
+
+def backlog_problems(text):
+    """What in a BACKLOG.md the engine can't honor."""
+    _, tasks = parse_sections(text)
+    problems = []
+    day = parse_date(today())
+    for t in tasks:
+        f = t["fields"]
+        if (f.get("status") or "open") not in STATUSES:
+            problems.append({"title": t["title"], "problem": "status: " + f.get("status", "")})
+        if not parse_date(f.get("added", "")):
+            problems.append({"title": t["title"], "problem": "added: " + f.get("added", "(missing)")})
+        v = task_timing(f, day, 0)
+        if v.get("dateProblem"):
+            problems.append({"title": t["title"], "problem": "date: " + v["dateProblem"]})
+        elif v["scheduled"] and v["deadline"] and v["deadlineIn"] < v["scheduledIn"]:
+            problems.append({"title": t["title"], "problem": "deadline before the date"})
+    return problems
+
+
+def upgrade_backlog(repo, backups):
+    """Brings one BACKLOG.md to the current format, the original copied to `backups` first. Other sessions may be
+    writing to it: the file is read again right before the swap, and a change in between starts over."""
+    path = backlog_path(repo)
+    for _ in range(5):
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        upgraded = current_format(text)
+        if upgraded == text:
+            return False
+        os.makedirs(backups, exist_ok=True)
+        with open(os.path.join(backups, hashlib.sha256(repo.encode("utf-8")).hexdigest()[:12] + "-BACKLOG.md"), "w", encoding="utf-8") as f:
+            f.write("<!-- %s -->\n%s" % (repo, text))
+        with open(path, encoding="utf-8") as f:
+            if f.read() == text:
+                write_text(path, upgraded)
+                return True
+    fail("BACKLOG.md keeps changing: " + repo)
+
+
+def cmd_migrate(a):
+    """Every registered BACKLOG.md in the current format, and what in them the engine can't honor. Safe to run
+    again: a file already current isn't touched. --check only reports."""
+    if os.environ.get("HARVEST_UNATTENDED") and not a.check:
+        fail("unattended runs cannot rewrite the backlogs")
+    backups = os.path.join(HOME, "backups", "backlogs-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+    rows = []
+    for repo in projects():
+        if not os.path.exists(backlog_path(repo)):
+            continue
+        changed = False if a.check else upgrade_backlog(repo, backups)
+        with open(backlog_path(repo), encoding="utf-8") as f:
+            text = f.read()
+        rows.append({"project": repo, "changed": changed, "current": current_format(text) == text,
+                     "problems": backlog_problems(text)})
+    emit({"ok": all(r["current"] and not r["problems"] for r in rows), "projects": len(rows),
+          "changed": sum(1 for r in rows if r["changed"]), "notCurrent": [r["project"] for r in rows if not r["current"]],
+          "problems": [dict(p, project=r["project"]) for r in rows for p in r["problems"]],
+          "backups": backups if any(r["changed"] for r in rows) else None})
+
+
 # ---------- launching and watching a run ----------
 
 WORKDIR = os.path.expanduser(os.environ.get("HARVEST_WORKDIR") or settings()["workdir"])
@@ -1551,6 +1978,8 @@ def build_prompt(mode, only, test):
     s = "Run the harvest-season skill (invoke it with the Skill tool) in %s mode. " % mode.upper()
     s += ("The Harvest Season widget launched you unattended at the start of the harvest window before the weekly quota reset."
           if mode == "auto" else
+          "The Harvest Season widget launched you unattended because a deadline comes before the weekly harvest."
+          if mode == "deadline" else
           "The Harvest Season widget launched you unattended because the owner pressed \"run now\".")
     if only:
         s += " Scope: only these tasks — pass each to every plan call as --only: " + " ".join('"%s"' % o for o in only) + "."
@@ -1836,7 +2265,8 @@ def branch_brief(repo, branch):
 
 def cmd_brief(a):
     """What the harvest left waiting for the owner, oldest first, compact enough to read instead of exploring
-    the repositories: every unmerged harvest branch (with branch_brief) and every blocked question."""
+    the repositories: every unmerged harvest branch (with branch_brief), every blocked question, and every
+    proposal whose date has come."""
     tasks, _ = all_tasks(ratio())
     tests = {}
     for h in history():
@@ -1850,6 +2280,8 @@ def cmd_brief(a):
             item.update(branch_brief(t["project"], t["branch"]))
         elif t["status"] == "blocked":
             item.update(question=t.get("question"), details=t.get("details"))
+        elif due_proposal(t):
+            item.update(dueProposal=True, details=t.get("details"), scheduled=t["scheduled"], deadline=t["deadline"])
         else:
             continue
         items.append(item)
@@ -1963,6 +2395,7 @@ def cmd_reject(a):
     emit(dict(out, ok=True))
 
 
+MODES = ("auto", "manual", "deadline")
 TALK_TOPICS = {"waiting": ("talk_name", "talk-prompt.md"), "onboard": ("onboard_name", "onboard-prompt.md")}
 
 
@@ -2055,7 +2488,7 @@ def cmd_launch(a):
     """The harvest's coordinating session, in the harvest folder; each task then gets its own session in its
     project (run-task). Closed once the run has called `end`."""
     os.makedirs(a.workdir, exist_ok=True)
-    label = tr("mode_auto") if a.mode == "auto" else tr("mode_manual")
+    label = tr("mode_" + a.mode)
     name = a.name or tr("run_name", datetime.now().strftime("%d.%m %H:%M"), label)
     prompt = a.prompt or build_prompt(a.mode, a.only or [], a.test)
 
@@ -2260,6 +2693,10 @@ def cmd_run_task(a):
         prompt += ("\n\nAn earlier attempt at this task stopped at a usage limit. Its work is already on this branch"
                    " (`git log %s..HEAD`; the last commit may be a WIP snapshot the harvest made of uncommitted"
                    " changes). Go on from there instead of starting over." % cur["base"])
+    if cur["scheduled"] or cur["deadline"]:
+        prompt += "\n\nDates: today is %s; the task was added on %s%s%s. The harvest has checked them: its date has come." % (
+            today(), cur["added"] or "?", "; recommended date " + cur["scheduled"] if cur["scheduled"] else "",
+            "; deadline " + cur["deadline"] if cur["deadline"] else "")
     effort = "high" if cur["complexity"] == "high" else "medium"
 
     def track(info):
@@ -2395,6 +2832,13 @@ def describe_event(line):
                 print("%s%s ▸ %s  %s" % (stamp, sub, b.get("name"), str(what).replace("\n", " ")[:160]), flush=True)
 
 
+def add_date_flags(p):
+    p.add_argument("--when", help="recommended date: YYYY-MM-DD, DD.MM, or words (\"in a month\", \"בעוד חודש\"); "
+                                  "the harvest may take it a few days early")
+    p.add_argument("--not-before", dest="not_before", help="like --when, but not a day earlier: work with no value before it")
+    p.add_argument("--deadline", help="the last useful day, in the same forms")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="harvest.py", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2466,16 +2910,28 @@ def main():
     p.add_argument("--priority", type=int, default=2, choices=(1, 2, 3))
     p.add_argument("--complexity", default="low"); p.add_argument("--tokens", type=int)
     p.add_argument("--status", default="open")
+    add_date_flags(p)
     p.set_defaults(fn=cmd_add)
 
+    p = sub.add_parser("schedule")
+    p.add_argument("project"); p.add_argument("title")
+    add_date_flags(p)
+    p.add_argument("--clear-scheduled", action="store_true"); p.add_argument("--clear-deadline", action="store_true")
+    p.add_argument("--title", dest="title_new", help="a new title; the section keeps its place")
+    p.set_defaults(fn=cmd_schedule)
+
+    p = sub.add_parser("migrate")
+    p.add_argument("--check", action="store_true", help="report only, change nothing")
+    p.set_defaults(fn=cmd_migrate)
+
     p = sub.add_parser("plan")
-    p.add_argument("--mode", choices=("auto", "manual"), default="manual")
+    p.add_argument("--mode", choices=MODES, default="manual")
     p.add_argument("--only", action="append", metavar="PROJECT::TITLE")
     p.add_argument("--usage-json")
     p.set_defaults(fn=cmd_plan)
 
     p = sub.add_parser("begin")
-    p.add_argument("--mode", choices=("auto", "manual"), default="manual")
+    p.add_argument("--mode", choices=MODES, default="manual")
     p.add_argument("--usage-json")
     p.set_defaults(fn=cmd_begin)
 
@@ -2503,7 +2959,7 @@ def main():
     sub.add_parser("maintain").set_defaults(fn=cmd_maintain)
 
     p = sub.add_parser("launch")
-    p.add_argument("--mode", choices=("auto", "manual"), default="manual")
+    p.add_argument("--mode", choices=MODES, default="manual")
     p.add_argument("--only", action="append", metavar="PROJECT::TITLE")
     p.add_argument("--test", action="store_true", help="skip email and push")
     p.add_argument("--model", default="opus"); p.add_argument("--effort", default="medium")

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Tests for harvest.py against throwaway git repos in a temporary HARVEST_HOME. Run: python3 test_harvest.py"""
 
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 ENGINE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harvest.py")
 # In the repository the prompts sit beside the engine's source (harvest/skills/…): test those, not whatever
@@ -831,6 +832,303 @@ class Harvest(unittest.TestCase):
         self.assertEqual(out["backlog"]["status"], "open")
         end = self.run_engine("end", "--reason", "queue-empty")
         self.assertEqual((end["lastRun"]["paused"], end["lastRun"]["failed"]), (1, 1))
+
+    # ---------- dates ----------
+
+    def dated(self, title, *flags, status="open", repo=None, env=None, details="do it", code=0):
+        return self.run_engine("add", repo or self.repo, "--title", title, "--details", details, "--status", status,
+                               *flags, env=env, code=code)
+
+    def on(self, day):
+        return dict(self.env, HARVEST_TODAY=day)
+
+    def backlog(self, repo=None):
+        with open(os.path.join(repo or self.repo, "BACKLOG.md"), encoding="utf-8") as f:
+            return f.read()
+
+    def titles(self, listing, key):
+        return [t["title"] for t in listing[key]]
+
+    def test_add_stores_absolute_dates_right_under_added(self):
+        env = self.on("2026-11-01")
+        out = self.dated("Check the logs", "--not-before", "בעוד חודש", "--deadline", "2026-12-15", env=env)
+        self.assertEqual((out["status"], out["added"], out["scheduled"], out["strict"], out["deadline"], out["waits"]),
+                         ("open", "2026-11-01", "2026-12-01", True, "2026-12-15", True))
+        self.assertIn("- status: open\n- added: 2026-11-01\n- scheduled: 2026-12-01 strict\n- deadline: 2026-12-15\n- priority:",
+                      self.backlog())
+        self.dated("No dates", env=env)
+        self.assertIn("## No dates\n- status: open\n- added: 2026-11-01\n- scheduled:\n- deadline:\n- priority:", self.backlog())
+
+    def test_add_refuses_dates_it_cannot_honor(self):
+        env = self.on("2026-11-01")
+        self.assertIn("can't read", self.dated("a", "--when", "someday soon", env=env, code=2)["error"])
+        self.assertIn("passed", self.dated("a", "--when", "2026-10-01", env=env, code=2)["error"])
+        self.assertIn("before", self.dated("a", "--when", "2026-12-10", "--deadline", "2026-12-01", env=env, code=2)["error"])
+        self.assertIn("not both", self.dated("a", "--when", "מחר", "--not-before", "מחר", env=env, code=2)["error"])
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "BACKLOG.md")))
+
+    def test_an_owners_task_with_a_future_date_waits_then_comes_by_itself(self):
+        self.usage()
+        self.dated("Far check", "--not-before", "2026-12-01", env=self.on("2026-11-01"))
+        self.dated("Undated", env=self.on("2026-11-01"))
+        # Today: it waits, out of the queue and out of a harvest, still `open` in the file.
+        now = self.on("2026-11-01")
+        listing = self.run_engine("list", env=now)
+        self.assertEqual(self.titles(listing, "queue"), ["Undated"])
+        self.assertEqual(self.titles(listing, "waiting"), ["Far check"])
+        self.assertEqual(listing["waiting"][0]["status"], "open")
+        self.assertEqual(listing["waiting"][0]["scheduledIn"], 30)
+        plan = self.run_engine("plan", env=now)
+        self.assertEqual(plan["next"]["title"], "Undated")
+        self.assertEqual([w["title"] for w in plan["waiting"]], ["Far check"])
+        # A day before a strict date is still too early.
+        self.assertEqual(self.titles(self.run_engine("list", env=self.on("2026-11-30")), "waiting"), ["Far check"])
+        # On the day, and after it, it's in the queue with nobody touching it.
+        for day in ("2026-12-01", "2026-12-20"):
+            listing = self.run_engine("list", env=self.on(day))
+            self.assertIn("Far check", self.titles(listing, "queue"))
+            self.assertEqual(listing["waiting"], [])
+        self.run_engine("set-status", self.repo, "Undated", "done", "--result", "x")
+        self.assertEqual(self.run_engine("plan", env=self.on("2026-12-01"))["next"]["title"], "Far check")
+
+    def test_a_recommended_date_is_taken_when_near_and_earlyDays_sets_how_near(self):
+        self.dated("Soft", "--when", "2026-12-10", env=self.on("2026-11-01"))
+        timing = lambda day: self.run_engine("list", "--all", env=self.on(day))["all"][0]["timing"]
+        self.assertEqual([timing(d) for d in ("2026-12-06", "2026-12-07", "2026-12-10", "2026-12-20")],
+                         ["waiting", "soon", "due", "due"])
+        self.assertEqual(self.titles(self.run_engine("list", env=self.on("2026-12-07")), "queue"), ["Soft"])
+        self.run_engine("settings", "--set", "earlyDays=1")
+        self.assertEqual(timing("2026-12-07"), "waiting")
+        self.assertEqual(timing("2026-12-09"), "soon")
+        self.assertEqual(self.run_engine("settings", "--set", "earlyDays=9", code=2)["ok"], False)
+
+    def test_a_deadline_presses_a_soft_date_but_not_a_strict_one(self):
+        self.dated("Soft", "--when", "2026-12-20", "--deadline", "2026-12-21", env=self.on("2026-11-01"))
+        self.dated("Strict", "--not-before", "2026-12-20", "--deadline", "2026-12-21", env=self.on("2026-11-01"))
+        listing = self.run_engine("list", env=self.on("2026-12-14"))
+        self.assertEqual(self.titles(listing, "queue"), ["Soft"])
+        self.assertEqual(self.titles(listing, "waiting"), ["Strict"])
+
+    def test_an_unreadable_date_holds_the_task_and_is_reported(self):
+        self.add("Typo")
+        text = self.backlog().replace("- added:", "- scheduled: 2026-13-45\n- added:")
+        with open(os.path.join(self.repo, "BACKLOG.md"), "w", encoding="utf-8") as f:
+            f.write(text)
+        listing = self.run_engine("list")
+        self.assertEqual(listing["queue"], [])
+        self.assertEqual(listing["waiting"][0]["dateProblem"], "2026-13-45")
+        report = self.run_engine("migrate", "--check")
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["problems"][0]["problem"], "date: 2026-13-45")
+
+    def test_deadlines_set_the_order(self):
+        env = self.on("2026-11-01")
+        for title, flags in (("Plain big", ("--tokens", "900000")), ("Low, deadline in 2 weeks", ()),
+                             ("Deadline in 3 days", ("--deadline", "2026-11-04")),
+                             ("Deadline in 1 day", ("--deadline", "2026-11-02")),
+                             ("Date came", ("--not-before", "2026-11-01"))):
+            self.dated(title, *flags, env=env)
+        self.run_engine("schedule", self.repo, "Low, deadline in 2 weeks", "--deadline", "2026-11-14", env=env)
+        order = self.titles(self.run_engine("list", env=env), "queue")
+        self.assertEqual(order[:2], ["Deadline in 1 day", "Deadline in 3 days"])
+        # Same priority: what has a date before what could run any week, and a near deadline raises it.
+        self.assertEqual(order[2:], ["Low, deadline in 2 weeks", "Date came", "Plain big"])
+        listing = self.run_engine("list", env=self.on("2026-11-03"))
+        self.assertTrue(listing["queue"][0]["overdue"])
+        self.assertEqual(listing["queue"][0]["deadlineIn"], -1)
+
+    def test_a_deadline_stays_ahead_of_the_owners_order_within_its_group(self):
+        env = self.on("2026-11-01")
+        self.dated("A", env=env)
+        self.dated("B", env=env)
+        self.dated("Pressed", "--deadline", "2026-11-03", env=env)
+        key = lambda t: self.repo + "::" + t
+        self.run_engine("queue-order", key("B"), key("A"), key("Pressed"), env=env)
+        self.assertEqual(self.titles(self.run_engine("list", env=env), "queue"), ["Pressed", "B", "A"])
+
+    def test_a_waiting_task_keeps_its_place_and_leaves_the_clearing_alone(self):
+        env = self.on("2026-11-01")
+        for title in ("A", "B", "C"):
+            self.dated(title, env=env)
+        key = lambda t: self.repo + "::" + t
+        self.run_engine("queue-order", key("C"), key("B"), key("A"), env=env)
+        self.run_engine("schedule", self.repo, "B", "--not-before", "2026-12-01", env=env)
+        # A drag sees only C and A; B holds its place between them while it waits.
+        self.run_engine("queue-order", key("A"), key("C"), env=env)
+        with open(os.path.join(self.home, "queue-order.json")) as f:
+            self.assertEqual(json.load(f)["keys"], [key("A"), key("C"), key("B")])
+        self.run_engine("queue-order", key("C"), key("A"), env=env)
+        self.assertEqual(self.titles(self.run_engine("list", env=self.on("2026-12-01")), "queue"), ["C", "B", "A"])
+        out = self.run_engine("queue-clear", env=env)
+        self.assertEqual(sorted(u["title"] for u in out["unqueued"]), ["A", "C"])
+        listing = self.run_engine("list", env=env)
+        self.assertEqual(self.titles(listing, "waiting"), ["B"])
+        self.assertEqual(listing["waiting"][0]["status"], "open")
+        with open(os.path.join(self.home, "queue-order.json")) as f:
+            self.assertEqual(json.load(f)["keys"], [key("B")])
+
+    def test_the_owner_can_run_a_waiting_task_now_anyway(self):
+        self.usage()
+        env = self.on("2026-11-01")
+        self.dated("Later", "--not-before", "2026-12-01", env=env)
+        key = self.repo + "::Later"
+        self.assertEqual(self.run_engine("plan", env=env)["reason"], "queue-empty")
+        self.assertEqual(self.run_engine("plan", "--only", key, env=env)["next"]["title"], "Later")
+
+    def test_a_proposal_whose_date_came_goes_to_the_owner(self):
+        env = self.on("2026-11-01")
+        self.dated("Idea", "--not-before", "2026-11-10", status="proposed", env=env)
+        self.dated("Idea with a deadline", "--deadline", "2026-12-01", status="proposed", env=env)
+        early = self.run_engine("list", env=self.on("2026-11-09"))
+        self.assertEqual(sorted(self.titles(early, "proposals")), ["Idea", "Idea with a deadline"])
+        self.assertEqual(early["dueProposals"], [])
+        due = self.run_engine("list", env=self.on("2026-11-10"))
+        self.assertEqual(self.titles(due, "dueProposals"), ["Idea"])
+        self.assertEqual(self.titles(due, "proposals"), ["Idea with a deadline"])
+        self.assertEqual(due["queue"], [])     # it never queues itself
+        self.assertEqual(sorted(self.titles(self.run_engine("list", env=self.on("2026-11-25")), "dueProposals")),
+                         ["Idea", "Idea with a deadline"])
+        brief = self.run_engine("brief", env=self.on("2026-11-10"))
+        self.assertEqual([i["title"] for i in brief["items"]], ["Idea"])
+        self.assertTrue(brief["items"][0]["dueProposal"])
+        self.run_engine("set-status", self.repo, "Idea", "open")
+        self.assertIn("Idea", self.titles(self.run_engine("list", env=self.on("2026-11-10")), "queue"))
+
+    def test_unattended_dates_stay_proposed_and_the_dates_stay_the_owners(self):
+        env = dict(self.env, HARVEST_UNATTENDED="1")
+        out = self.dated("Agent idea", "--when", "2099-01-01", env=env)
+        self.assertEqual((out["status"], out["downgradedToProposed"], out["scheduled"]), ("proposed", True, "2099-01-01"))
+        self.assertIn("unattended", self.run_engine("schedule", self.repo, "Agent idea", "--clear-scheduled", env=env, code=2)["error"])
+        self.assertFalse(self.run_engine("migrate", env=env, code=2)["ok"])
+
+    def test_schedule_sets_clears_and_renames_the_live_task(self):
+        env = self.on("2026-11-01")
+        self.dated("From 1.12: check", env=env)
+        self.run_engine("set-status", self.repo, "From 1.12: check", "done", "--result", "2026-10-01 · old")
+        self.dated("From 1.12: check", status="proposed", env=env)
+        out = self.run_engine("schedule", self.repo, "From 1.12: check", "--not-before", "1.12", "--deadline", "סוף דצמבר",
+                              "--title", "Check", env=env)
+        self.assertEqual((out["title"], out["scheduled"], out["strict"], out["deadline"], out["status"]),
+                         ("Check", "2026-12-01", True, "2026-12-31", "proposed"))
+        text = self.backlog()
+        self.assertEqual(text.count("## From 1.12: check"), 1)
+        self.assertIn("## Check\n- status: proposed\n- added: 2026-11-01\n- scheduled: 2026-12-01 strict\n- deadline: 2026-12-31\n", text)
+        out = self.run_engine("schedule", self.repo, "Check", "--clear-scheduled", env=env)
+        self.assertEqual((out["scheduled"], out["deadline"]), ("", "2026-12-31"))
+        self.assertIn("- scheduled:\n- deadline: 2026-12-31\n", self.backlog())
+        self.assertIn("before", self.run_engine("schedule", self.repo, "Check", "--when", "2027-01-05", env=env, code=2)["error"])
+        self.assertIn("no open", self.run_engine("schedule", self.repo, "Gone", "--when", "מחר", env=env, code=2)["error"])
+
+    def test_schedule_reaches_a_task_from_before_the_date_fields(self):
+        path = os.path.join(self.repo, "BACKLOG.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# Backlog\n\n## Old\n- status: open\n- added: 2026-01-01\n- priority: 2\n- details: x\n- result:\n")
+        self.run_engine("schedule", self.repo, "Old", "--deadline", "2027-01-01", env=self.on("2026-11-01"))
+        self.assertIn("- added: 2026-01-01\n- deadline: 2027-01-01\n- priority: 2\n", self.backlog())
+
+    def test_old_backlogs_read_as_before_and_migrate_keeps_every_line(self):
+        other = self.make_repo("beta")
+        old = ("# Backlog\n\nintro\n\n<!--\nFormat: one task\nstatus:     open\nadded:      YYYY-MM-DD\npriority:   1 high\n-->\n\n"
+               "## Open one\n- status: open\n- added: 2026-10-01\n- priority: 2\n- complexity: low\n- tokens: 100\n"
+               "- details: not 'a: b'\n- result:\n\n"
+               "## Done one\n- status: done\n- added: 2026-09-01\n- priority: 2\n- details: y\n- result: 2026-09-02 · z\n\n"
+               "## Blocked one\n- status: blocked\n- added: 2026-09-05\n- result: 2026-09-06 · why\n"
+               "\n## Proposed, no newline at the end\n- status: proposed\n- added: 2026-09-07\n- details: z")
+        with open(os.path.join(other, "BACKLOG.md"), "w", encoding="utf-8") as f:
+            f.write(old)
+        with open(os.path.join(self.home, "projects.md"), "w", encoding="utf-8") as f:
+            f.write("# comment\n%s\n%s\n" % (other, os.path.join(self.tmp, "gone")))
+        self.assertEqual(self.titles(self.run_engine("list"), "queue"), ["Open one"])
+        check = self.run_engine("migrate", "--check")
+        self.assertEqual((check["ok"], check["notCurrent"]), (False, [other]))
+        self.assertEqual(self.backlog(other), old)
+        out = self.run_engine("migrate")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["changed"], 1)
+        new = self.backlog(other)
+        added = [l for l in new.split("\n") if l not in old.split("\n")]
+        self.assertEqual(sum(l.startswith("- ") for l in added), 6)
+        self.assertTrue(all(l in ("- scheduled:", "- deadline:") or not l.startswith("- ") for l in added))
+        self.assertEqual([l for l in new.split("\n") if l in old.split("\n")], old.split("\n"))
+        self.assertIn("## Done one\n- status: done\n- added: 2026-09-01\n- priority: 2\n", new)
+        self.assertIn("added:      YYYY-MM-DD\nscheduled:  YYYY-MM-DD", new)
+        # The original is kept, and a second run touches nothing.
+        with open(os.path.join(out["backups"], os.listdir(out["backups"])[0]), encoding="utf-8") as f:
+            self.assertIn(old, f.read())
+        self.assertEqual(self.run_engine("migrate")["changed"], 0)
+        self.assertEqual(self.backlog(other), new)
+        self.assertTrue(self.run_engine("migrate", "--check")["ok"])
+
+    def test_the_template_is_in_the_current_format(self):
+        self.dated("First")
+        text = self.backlog()
+        self.assertIn("scheduled:", text.split("## First")[0])
+        self.assertIn("deadline:", text.split("## First")[0])
+        self.assertEqual(self.run_engine("migrate", "--check")["notCurrent"], [])
+
+    def test_a_deadline_the_weekly_harvest_would_miss_gets_its_own_run(self):
+        env = self.on(datetime.now().strftime("%Y-%m-%d"))
+        soon = (datetime.now().date() + timedelta(days=1)).isoformat()
+        later = (datetime.now().date() + timedelta(days=5)).isoformat()
+        self.dated("Tomorrow", "--deadline", soon, env=env)
+        self.dated("In five days", "--deadline", later, env=env)
+        self.dated("Proposal", "--deadline", soon, status="proposed", env=env)
+        self.usage(reset_in_h=24 * 6)
+        listing = self.run_engine("list", env=env)
+        self.assertEqual(self.titles(listing, "deadlineRun"), ["Tomorrow"])
+        # Once it has passed, the run can't save it: it waits for the harvest, first in line.
+        past = self.on((datetime.now().date() + timedelta(days=2)).isoformat())
+        listing = self.run_engine("list", env=past)
+        self.assertEqual((listing["deadlineRun"], listing["queue"][0]["title"], listing["queue"][0]["overdue"]), ([], "Tomorrow", True))
+        # The weekly harvest comes first: nothing of its own.
+        self.usage(reset_in_h=6)
+        self.assertEqual(self.run_engine("list", env=env)["deadlineRun"], [])
+        # The run is scoped to it, in a mode outside the harvest window, with no scan and no email cycle.
+        self.usage(reset_in_h=24 * 6)
+        key = self.repo + "::Tomorrow"
+        self.assertEqual(self.run_engine("plan", "--mode", "auto", env=env)["reason"], "too-early")
+        plan = self.run_engine("plan", "--mode", "deadline", "--only", key, env=env)
+        self.assertEqual((plan["harvest"], plan["next"]["title"], plan["next"]["deadline"]), (True, "Tomorrow", soon))
+        self.assertIn("DEADLINE", self.module().build_prompt("deadline", [key], False))
+
+    def module(self):
+        spec = importlib.util.spec_from_file_location("harvest_engine", ENGINE)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_what_a_person_says_becomes_a_date(self):
+        when = self.module().parse_when
+        day = date(2026, 11, 1)  # a Sunday
+        cases = {
+            # Hebrew, as it is said
+            "בעוד חודש": "2026-12-01", "עוד חודש": "2026-12-01", "חודש": "2026-12-01", "בעוד שבוע": "2026-11-08",
+            "עוד שבועיים": "2026-11-15", "בעוד חודשיים": "2027-01-01", "עוד 3 ימים": "2026-11-04", "בעוד יומיים": "2026-11-03",
+            "בעוד שלושה שבועות": "2026-11-22", "עוד שלושה חודשים": "2027-02-01", "בעוד חצי שנה": "2027-05-01",
+            "עוד שנה": "2027-11-01", "מחר": "2026-11-02", "מחרתיים": "2026-11-03", "היום": "2026-11-01",
+            "שבוע הבא": "2026-11-08", "בשבוע הבא": "2026-11-08", "בחודש הבא": "2026-12-01", "החודש הבא": "2026-12-01",
+            "ביום שלישי": "2026-11-03", "יום ראשון הבא": "2026-11-08", "בשבת": "2026-11-07", "סוף החודש": "2026-11-30",
+            "סוף השבוע": "2026-11-06", "תחילת החודש הבא": "2026-12-01", "סוף החודש הבא": "2026-12-31", "סוף השנה": "2026-12-31",
+            "בדצמבר": "2026-12-01", "דצמבר": "2026-12-01", "ינואר": "2027-01-01", "1 בדצמבר": "2026-12-01",
+            "ב-15 בינואר": "2027-01-15", "אמצע דצמבר": "2026-12-15", "סוף פברואר": "2027-02-28", "תחילת מרץ": "2027-03-01",
+            "במאי": "2027-05-01", "מאי": "2027-05-01", "3 במרץ": "2027-03-03", "במרץ 2028": "2028-03-01",
+            # English
+            "in a month": "2026-12-01", "in 2 weeks": "2026-11-15", "in two weeks": "2026-11-15", "a week from now": "2026-11-08",
+            "next week": "2026-11-08", "next month": "2026-12-01", "tomorrow": "2026-11-02", "in 3 days": "2026-11-04",
+            "next tuesday": "2026-11-03", "friday": "2026-11-06", "end of month": "2026-11-30", "december": "2026-12-01",
+            "dec 1": "2026-12-01", "1 december": "2026-12-01", "december 1, 2027": "2027-12-01", "mid december": "2026-12-15",
+            "start of next month": "2026-12-01", "half a year": "2027-05-01",
+            # Written dates, day first
+            "2026-12-01": "2026-12-01", "1.12": "2026-12-01", "1.12.2026": "2026-12-01", "1/12/26": "2026-12-01",
+            "15.1": "2027-01-15", "1.11": "2026-11-01", "ב-5.11": "2026-11-05", "+30d": "2026-12-01", "+2w": "2026-11-15",
+            "+1m": "2026-12-01",
+        }
+        for said, expected in cases.items():
+            self.assertEqual(str(when(said, day)), expected, said)
+        self.assertEqual(str(when("בעוד חודש", date(2026, 1, 31))), "2026-02-28")
+        self.assertEqual(str(when("סוף השבוע", date(2026, 11, 6))), "2026-11-06")
+        for nonsense in ("", "מתישהו", "soon", "13.13", "31.2", "32 בדצמבר", "2026-13-45", "בעוד הרבה זמן", "december 45"):
+            self.assertIsNone(when(nonsense, day), nonsense)
 
     def test_the_owner_can_rewrite_the_texts(self):
         listing = {p["name"]: p for p in self.run_engine("prompts")["prompts"]}

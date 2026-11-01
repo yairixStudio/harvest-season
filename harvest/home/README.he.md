@@ -12,7 +12,7 @@
 
 ## איפה זה חי
 - **הווידג'ט בשורת התפריט** (הריפו `harvest-season`) — הממשק: פסי מכסה, **בתור** / **הצעות** / **מחכה לך**, פעימות, "הרץ עכשיו", "עצור". נפתח בכניסה למחשב.
-- **המנוע** `bin/harvest.py` (בשורת הפקודה: `claude-harvest`) — כל החלק הדטרמיניסטי: קריאה ועריכה של `BACKLOG.md`, תקציב, בחירת משימות, git worktrees וענפים, קליברציה, סטטוס, נעילה ושחזור אחרי עצירה. טסטים: `python3 bin/test_harvest.py`.
+- **המנוע** `bin/harvest.py` (בשורת הפקודה: `claude-harvest`) — כל החלק הדטרמיניסטי: קריאה ועריכה של `BACKLOG.md`, תאריכי משימות (`claude-harvest schedule`, `claude-harvest migrate`), תקציב, בחירת משימות, git worktrees וענפים, קליברציה, סטטוס, נעילה ושחזור אחרי עצירה. טסטים: `python3 bin/test_harvest.py`.
 - **הסקילים** ב-`~/.claude/skills/`: `harvest-season` (הקציר עצמו), `backlog` (רישום משימות), `check-usage` (בדיקת מכסה).
 - **`~/.claude/CLAUDE.md`** ו-**`~/.codex/AGENTS.md`** — כל סשן של קלוד וגם Codex יודעים לרשום משימות לבקלוג.
 

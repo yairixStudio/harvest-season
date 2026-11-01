@@ -48,6 +48,8 @@ if python3 harvest/install.py status | grep -q '"installed": true'; then
   report="$(mktemp)"
   if python3 harvest/install.py install >"$report" 2>&1; then
     echo "harvest upgraded ($(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["changed"]))' "$report") files changed)"
+    # Registered backlogs follow the format; a file already current isn't touched.
+    python3 "$HOME/.claude/harvest/bin/harvest.py" migrate >/dev/null || echo "some backlogs need a look: claude-harvest migrate --check" >&2
   else
     echo "harvest not upgraded — files were edited by hand; details: $report" >&2
   fi

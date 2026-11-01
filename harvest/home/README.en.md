@@ -12,7 +12,7 @@ There is one queue. It runs by itself before the weekly reset, in pulses of one 
 
 ## Where it lives
 - **The menu bar widget** (the `harvest-season` repository) — the interface: usage bars, **Queue** / **Proposals** / **Waiting for you**, the pulses, "Run now", "Stop". Opens at login.
-- **The engine** `bin/harvest.py` (on the command line: `claude-harvest`) — every deterministic step: reading and editing `BACKLOG.md`, budget, task choice, git worktrees and branches, calibration, status, the lock and recovery after a stop. Tests: `python3 bin/test_harvest.py`.
+- **The engine** `bin/harvest.py` (on the command line: `claude-harvest`) — every deterministic step: reading and editing `BACKLOG.md`, task dates (`claude-harvest schedule`, `claude-harvest migrate`), budget, task choice, git worktrees and branches, calibration, status, the lock and recovery after a stop. Tests: `python3 bin/test_harvest.py`.
 - **The skills** in `~/.claude/skills/`: `harvest-season` (the harvest itself), `backlog` (recording tasks), `check-usage` (checking quota).
 - **`~/.claude/CLAUDE.md`** and **`~/.codex/AGENTS.md`** — every Claude session, and Codex too, knows how to record tasks in the backlog.
 

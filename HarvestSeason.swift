@@ -428,7 +428,25 @@ struct HTask: Decodable, Identifiable, Equatable {
     let line: Int?
     /// A done task the owner cleared from the done list (`clear-done`).
     let cleared: Bool?
+    /// The recommended date (YYYY-MM-DD, "" for none) and whether it means "not a day earlier".
+    let scheduled: String?
+    let strict: Bool?
+    let deadline: String?
+    /// What the dates mean today, from the engine: none · waiting · soon · due · invalid.
+    let timing: String?
+    /// Days until the dates; negative once they have passed.
+    let scheduledIn: Int?
+    let deadlineIn: Int?
+    /// A deadline within a week — this may be its last harvest — and past it.
+    let urgent: Bool?
+    let overdue: Bool?
+    /// Out of the queue until its date.
+    let waits: Bool?
+    let dateProblem: String?
+    /// A proposal whose date has come: it can't run by itself, so it goes to the owner.
+    let dueProposal: Bool?
     var id: String { project + "::" + title }
+    var hasDates: Bool { !(scheduled ?? "").isEmpty || !(deadline ?? "").isEmpty }
 }
 
 /// `harvest.py list --all`: every task of every registered project, for the all-tasks window.
@@ -512,6 +530,8 @@ struct HSettings: Decodable, Equatable {
     var switchMidTask: Bool?
     var fiveReserve: Double?
     var weeklyReserve: Double?
+    /// How many days before its recommended date a task may run.
+    var earlyDays: Int?
 }
 
 struct HFallback: Codable, Equatable {
@@ -549,6 +569,12 @@ struct HListing: Decodable, Equatable {
     var proposals: [HTask] = []
     var needsYou: [HTask] = []
     var done: [HTask] = []
+    /// Queued tasks whose date is still ahead, soonest first.
+    var waiting: [HTask]?
+    /// Proposals whose date has come.
+    var dueProposals: [HTask]?
+    /// Queued tasks whose deadline comes before the weekly harvest.
+    var deadlineRun: [HTask]?
     var ratio: HRatio?
     var status: HStatus?
     var lock: HLock?
@@ -1091,6 +1117,7 @@ protocol WidgetActions: AnyObject {
     func runOne(_ task: HTask)
     func stopHarvest()
     func setQueued(_ task: HTask, _ queued: Bool)
+    func setDates(_ task: HTask, date: Date?, strict: Bool, deadline: Date?)
     func openNeed(_ task: HTask)
     func rejectWaiting(_ task: HTask, reason: String)
     func rejectAllWaiting(reason: String)
@@ -1175,6 +1202,7 @@ final class WidgetModel: ObservableObject {
     /// The panel's collapsible parts. All closed whenever the panel opens (`collapseAll`): the owner
     /// sees the counts first and opens what they want.
     @Published var queueOpen = false
+    @Published var waitingOpen = false
     @Published var proposalsOpen = false
     @Published var needsOpen = false
     @Published var scheduleOpen = false
@@ -1191,7 +1219,7 @@ final class WidgetModel: ObservableObject {
     weak var actions: WidgetActions?
 
     func collapseAll() {
-        for open in [\WidgetModel.queueOpen, \.proposalsOpen, \.needsOpen, \.scheduleOpen, \.doneOpen]
+        for open in [\WidgetModel.queueOpen, \.waitingOpen, \.proposalsOpen, \.needsOpen, \.scheduleOpen, \.doneOpen]
         where self[keyPath: open] {
             self[keyPath: open] = false
         }
@@ -1204,6 +1232,8 @@ final class WidgetModel: ObservableObject {
     var ownRunActive: Bool { running || detachedRun }
     var lastRunInApp: Bool { listing.launch?.sessionId != nil && listing.launch?.endedAt != nil }
     var queuePct: Double { listing.queue.reduce(0) { $0 + $1.pct } }
+    var waitingTasks: [HTask] { listing.waiting ?? [] }
+    var dueProposals: [HTask] { listing.dueProposals ?? [] }
 
     var fiveReserve: Double { listing.settings?.fiveReserve ?? 15 }
     var weeklyReserve: Double { listing.settings?.weeklyReserve ?? 2 }
@@ -1233,9 +1263,12 @@ struct PanelView: View {
             if let problem = m.signIn { signInCard(problem) }
             if m.harvestInstalled {
                 section(L("בתור", "Queue"), summary: queueSummary, open: $m.queueOpen) { queueList }
+                if !m.waitingTasks.isEmpty {
+                    section(L("ממתינות לתאריך", "Waiting for a date"), summary: waitingSummary, open: $m.waitingOpen) { waitingList }
+                }
                 section(L("הצעות", "Proposals"), summary: proposalsSummary, open: $m.proposalsOpen) { proposalList }
-                section(L("מחכה לך", "Waiting for you"), summary: "\(m.listing.needsYou.count)", open: $m.needsOpen,
-                        highlight: !m.listing.needsYou.isEmpty) { needsList }
+                section(L("מחכה לך", "Waiting for you"), summary: "\(m.listing.needsYou.count + m.dueProposals.count)", open: $m.needsOpen,
+                        highlight: !m.listing.needsYou.isEmpty || !m.dueProposals.isEmpty) { needsList }
                 section(L("בוצעו", "Done"), summary: doneSummary, open: $m.doneOpen) { doneList }
                 footer
             } else {
@@ -1339,6 +1372,27 @@ struct PanelView: View {
         m.listing.queue.isEmpty ? L("ריק", "empty") : "\(m.listing.queue.count) · \(pctText(m.queuePct))"
     }
 
+    var waitingSummary: String {
+        let next = m.waitingTasks.first.map { shortDate($0.scheduled) } ?? ""
+        return next.isEmpty ? "\(m.waitingTasks.count)" : L("\(m.waitingTasks.count) · הבאה \(next)", "\(m.waitingTasks.count) · next \(next)")
+    }
+
+    /// Queued tasks whose date is still ahead, soonest first: they keep their place in the queue and come back
+    /// by themselves. ▶ runs one now anyway; ⊖ takes it out of the queue, like any queued task.
+    @ViewBuilder var waitingList: some View {
+        let rows = VStack(alignment: .leading, spacing: 0) {
+            ForEach(m.waitingTasks) { t in
+                TaskRow(task: t, queued: true, onRun: { m.actions?.runOne(t) },
+                        onToggle: { m.actions?.setQueued(t, $0) }, showProject: true)
+            }
+        }
+        if m.waitingTasks.count > 8 {
+            ScrollingList(height: 220) { rows }
+        } else {
+            rows
+        }
+    }
+
     var proposalsSummary: String {
         let n = m.listing.proposals.count
         guard n > 0 else { return "0" }
@@ -1358,7 +1412,7 @@ struct PanelView: View {
                 orderedQueue
             }
             if m.listing.queue.contains(where: { $0.placed == true }) {
-                Button(L("↺ חזרה לסדר האוטומטי (חשיבות, ואז גודל)", "↺ Back to the automatic order (priority, then size)")) {
+                Button(L("↺ חזרה לסדר האוטומטי (דדליין, חשיבות, גודל)", "↺ Back to the automatic order (deadline, priority, size)")) {
                     m.actions?.resetQueueOrder()
                 }
                 .buttonStyle(.link).font(.system(size: 11)).padding(.top, 3)
@@ -1465,9 +1519,20 @@ struct PanelView: View {
         }
     }
 
+    /// Proposals whose date has come: they can't run by themselves, so the owner decides here.
+    @ViewBuilder var dueProposalList: some View {
+        Text(L("הגיע המועד של הצעות — ⊕ מכניס לתור", "Proposals whose date has come — ⊕ queues one"))
+            .font(.system(size: 10)).foregroundStyle(.tertiary)
+        ForEach(m.dueProposals) { t in
+            TaskRow(task: t, queued: false, onRun: nil, onToggle: { m.actions?.setQueued(t, $0) },
+                    onRemove: { m.actions?.removeProposal(t) }, showProject: true)
+        }
+    }
+
     @ViewBuilder var needsList: some View {
+        if !m.dueProposals.isEmpty { dueProposalList }
         if m.listing.needsYou.isEmpty {
-            EmptyLine(text: L("אין מה לבדוק", "Nothing to review"))
+            if m.dueProposals.isEmpty { EmptyLine(text: L("אין מה לבדוק", "Nothing to review")) }
         } else {
             ByProject(tasks: m.listing.needsYou) { t in
                 VStack(alignment: .leading, spacing: 0) {
@@ -2008,7 +2073,8 @@ struct TaskRow: View {
                 Button(action: onRun) { Image(systemName: "play.fill").font(.system(size: 8)) }
                     .buttonStyle(.plain).foregroundStyle(Color.accentColor)
                     .frame(width: Self.iconColumn)
-                    .help(L("הרץ עכשיו רק את המשימה הזו", "Run just this task now"))
+                    .help(task.waits == true ? L("הרץ עכשיו, בלי לחכות לתאריך", "Run it now, without waiting for its date")
+                          : L("הרץ עכשיו רק את המשימה הזו", "Run just this task now"))
             } else if !queued {
                 Button { onToggle(true) } label: { Image(systemName: "plus.circle").font(.system(size: 12)) }
                     .buttonStyle(.plain).foregroundStyle(Color.accentColor)
@@ -2019,6 +2085,9 @@ struct TaskRow: View {
                 Text(task.title).lineLimit(2).truncationMode(.tail).fixedSize(horizontal: false, vertical: true)
                 if showProject {
                     Text(task.projectName).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
+                }
+                if let note = dateNote(task) {
+                    Text(note.text).font(.system(size: 10)).foregroundStyle(note.color).lineLimit(1)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -2045,6 +2114,7 @@ struct TaskRow: View {
     var tooltip: String {
         var s = task.title
         if let d = task.details, !d.isEmpty { s += "\n" + d }
+        if task.hasDates { s += "\n" + datesLine(task) }
         s += L("\nמורכבות \(task.complexity) · ~\(task.tokens / 1000)k טוקנים",
                "\nComplexity \(task.complexity) · ~\(task.tokens / 1000)k tokens")
         if let e = task.estimate, let base = e.base, let turns = e.turns.map({ Int($0.rounded()) }) {
@@ -2057,6 +2127,61 @@ struct TaskRow: View {
         }
         return s
     }
+}
+
+/// "מחר", "בעוד 30 ימים": how far a date is. Negative days are in the past.
+func daysUntil(_ days: Int) -> String {
+    switch days {
+    case 0: return L("היום", "today")
+    case 1: return L("מחר", "tomorrow")
+    case 2: return L("בעוד יומיים", "in 2 days")
+    case let d where d > 2: return L("בעוד \(d) ימים", "in \(d) days")
+    case -1: return L("אתמול", "yesterday")
+    case -2: return L("לפני יומיים", "2 days ago")
+    default: return L("לפני \(-days) ימים", "\(-days) days ago")
+    }
+}
+
+/// A task's dates as one quiet line under its title, the color saying what they mean: red past the deadline,
+/// orange a week from it, accent once the date has come, gray while it waits. The engine decides; this only words it.
+func dateNote(_ t: HTask) -> (text: String, color: Color)? {
+    guard ["open", "proposed", "blocked"].contains(t.status) else { return nil }
+    if let bad = t.dateProblem { return (L("תאריך לא קריא: \(bad)", "Unreadable date: \(bad)"), .orange) }
+    let date = shortDate(t.scheduled), deadline = shortDate(t.deadline)
+    var parts: [String] = []
+    switch t.timing {
+    case "waiting" where t.strict == true:
+        parts.append(L("לא לפני \(date) · \(daysUntil(t.scheduledIn ?? 0))", "Not before \(date) · \(daysUntil(t.scheduledIn ?? 0))"))
+    case "waiting", "soon":
+        parts.append(L("מועד \(date) · \(daysUntil(t.scheduledIn ?? 0))", "Date \(date) · \(daysUntil(t.scheduledIn ?? 0))"))
+    case "due":
+        parts.append((t.scheduledIn ?? 0) == 0 ? L("המועד היום", "Its date is today") : L("המועד היה ב-\(date)", "Its date was \(date)"))
+    default:
+        break
+    }
+    if t.overdue == true {
+        parts.append(L("עבר הדדליין \(deadline)", "Past its deadline \(deadline)"))
+    } else if t.urgent == true {
+        parts.append(L("דדליין \(deadline) · \(daysUntil(t.deadlineIn ?? 0))", "Deadline \(deadline) · \(daysUntil(t.deadlineIn ?? 0))"))
+    } else if !deadline.isEmpty {
+        parts.append(L("דדליין \(deadline)", "Deadline \(deadline)"))
+    }
+    guard !parts.isEmpty else { return nil }
+    let color: Color = t.overdue == true ? .red : t.urgent == true ? .orange : t.waits == true ? .secondary : .accentColor
+    return (parts.joined(separator: " · "), color)
+}
+
+/// All of a task's dates, for a tooltip and the details of the all-tasks window.
+func datesLine(_ t: HTask) -> String {
+    var parts = [L("נוספה \(shortDate(t.added))", "added \(shortDate(t.added))")]
+    if let date = t.scheduled, !date.isEmpty {
+        parts.append(t.strict == true ? L("לא לפני \(shortDate(date))", "not before \(shortDate(date))")
+                     : L("מועד מומלץ \(shortDate(date))", "recommended \(shortDate(date))"))
+    }
+    if let deadline = t.deadline, !deadline.isEmpty {
+        parts.append(L("דדליין \(shortDate(deadline))", "deadline \(shortDate(deadline))"))
+    }
+    return parts.joined(separator: " · ")
 }
 
 /// Lays its children out in rows, wrapping to a new row when one is full — the reject form's reasons.
@@ -2153,6 +2278,68 @@ struct RejectForm: View {
     }
 }
 
+/// A task's dates, inline in the details of the all-tasks window: the recommended date, whether it means "not a day
+/// earlier", and the deadline. Unticking one clears it.
+struct ScheduleForm: View {
+    let task: HTask
+    let onSave: (Date?, Bool, Date?) -> Void
+    let onCancel: () -> Void
+    @State private var hasDate: Bool
+    @State private var date: Date
+    @State private var strict: Bool
+    @State private var hasDeadline: Bool
+    @State private var deadline: Date
+
+    init(task: HTask, onSave: @escaping (Date?, Bool, Date?) -> Void, onCancel: @escaping () -> Void) {
+        self.task = task
+        self.onSave = onSave
+        self.onCancel = onCancel
+        let read: (String?) -> Date? = { value in
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
+            f.dateFormat = "yyyy-MM-dd"
+            return value.flatMap(f.date(from:))
+        }
+        let scheduled = read(task.scheduled), last = read(task.deadline)
+        _hasDate = State(initialValue: scheduled != nil)
+        _date = State(initialValue: scheduled ?? Date())
+        _strict = State(initialValue: task.strict ?? true)
+        _hasDeadline = State(initialValue: last != nil)
+        _deadline = State(initialValue: last ?? Date())
+    }
+
+    var clash: Bool { hasDate && hasDeadline && Calendar.current.compare(deadline, to: date, toGranularity: .day) == .orderedAscending }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
+                Toggle(L("מועד מומלץ", "Recommended date"), isOn: $hasDate).toggleStyle(.checkbox).frame(width: 150, alignment: .leading)
+                DatePicker("", selection: $date, displayedComponents: .date).labelsHidden().disabled(!hasDate).fixedSize()
+                Toggle(L("לא יום לפני — מוקדם יותר אין בזה ערך", "Not a day earlier — it has no value before that"), isOn: $strict)
+                    .toggleStyle(.checkbox).disabled(!hasDate)
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 8) {
+                Toggle(L("דדליין", "Deadline"), isOn: $hasDeadline).toggleStyle(.checkbox).frame(width: 150, alignment: .leading)
+                DatePicker("", selection: $deadline, displayedComponents: .date).labelsHidden().disabled(!hasDeadline).fixedSize()
+                if clash {
+                    Text(L("הדדליין לפני המועד", "The deadline is before the date")).font(.system(size: 11)).foregroundStyle(.orange)
+                }
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 8) {
+                Button(L("שמור", "Save")) { onSave(hasDate ? date : nil, strict, hasDeadline ? deadline : nil) }
+                    .buttonStyle(.borderedProminent).controlSize(.small).disabled(clash)
+                Button(L("ביטול", "Cancel"), action: onCancel).controlSize(.small)
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.05)))
+    }
+}
+
 /// A bulk action's question, in place of the link that asked it — no modal alert.
 struct ConfirmLine: View {
     let text: String
@@ -2243,13 +2430,14 @@ struct NeedRow: View {
 
 /// Which tasks the all-tasks window shows. "All" leaves out the removed ones, which have a tab of their own.
 enum TaskFilter: String, CaseIterable, Identifiable {
-    case all, queue, proposals, waiting, done, dropped
+    case all, queue, scheduled, proposals, waiting, done, dropped
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .all: return L("הכל", "All")
         case .queue: return L("בתור", "Queue")
+        case .scheduled: return L("לתאריך", "Dated")
         case .proposals: return L("הצעות", "Proposals")
         case .waiting: return L("מחכה לך", "Waiting")
         case .done: return L("בוצעו", "Done")
@@ -2260,9 +2448,10 @@ enum TaskFilter: String, CaseIterable, Identifiable {
     func includes(_ t: HTask) -> Bool {
         switch self {
         case .all: return t.status != "dropped"
-        case .queue: return t.status == "open"
+        case .queue: return t.status == "open" && t.waits != true
+        case .scheduled: return t.status == "open" && t.waits == true
         case .proposals: return t.status == "proposed"
-        case .waiting: return t.status == "blocked" || (t.status == "done" && t.branchState == "unmerged")
+        case .waiting: return t.status == "blocked" || t.dueProposal == true || (t.status == "done" && t.branchState == "unmerged")
         case .done: return t.status == "done"
         case .dropped: return t.status == "dropped"
         }
@@ -2275,10 +2464,12 @@ func taskStage(_ t: HTask) -> (order: Int, label: String, color: Color) {
     switch t.status {
     case "blocked": return (0, L("שאלה אליך", "Question for you"), .orange)
     case "done" where t.branchState == "unmerged": return (0, L("מחכה למיזוג", "Awaiting merge"), .orange)
+    case "proposed" where t.dueProposal == true: return (0, L("הגיע המועד", "Date has come"), .orange)
+    case "open" where t.waits == true: return (2, L("ממתינה לתאריך", "Awaiting date"), .teal)
     case "open": return (1, L("בתור", "Queued"), .accentColor)
-    case "proposed": return (2, L("הצעה", "Proposal"), .purple)
-    case "done": return (3, t.cleared == true ? L("בוצעה · נוקתה", "Done · cleared") : L("בוצעה", "Done"), .green)
-    default: return (4, L("הוסרה", "Removed"), .gray)
+    case "proposed": return (3, L("הצעה", "Proposal"), .purple)
+    case "done": return (4, t.cleared == true ? L("בוצעה · נוקתה", "Done · cleared") : L("בוצעה", "Done"), .green)
+    default: return (5, L("הוסרה", "Removed"), .gray)
     }
 }
 
@@ -2297,6 +2488,10 @@ struct TaskLine: Identifiable {
     var size: Int { ["low": 0, "medium": 1, "high": 2][task.complexity] ?? 1 }
     var pct: Double { ["open", "proposed", "blocked"].contains(task.status) ? task.pct : -1 }
     var added: String { task.added ?? "" }
+    /// The task's next date, for sorting; tasks with none go last.
+    var nextDate: String {
+        [task.scheduled, task.deadline].compactMap { $0 }.filter { !$0.isEmpty }.min() ?? "9999"
+    }
     var age: Int { task.ageDays ?? Int.max }
     var branch: String { task.branch ?? "" }
 }
@@ -2315,15 +2510,18 @@ final class AllTasksModel: ObservableObject {
     @Published var selection: String? {
         didSet {
             if rejecting != nil && rejecting != selection { rejecting = nil }
+            if scheduling != nil && scheduling != selection { scheduling = nil }
             if confirmingUnqueue && selection != nil { confirmingUnqueue = false }
         }
     }
     /// The reject form in the details: a row's key, or "all" for everything that waits.
     @Published var rejecting: String?
+    /// The dates form in the details: a row's key.
+    @Published var scheduling: String?
     /// "הוצא את כולן מהתור" on the queue tab, asking in the details before it empties the queue.
     @Published var confirmingUnqueue = false
     @Published var sortOrder = [KeyPathComparator(\TaskLine.stage), KeyPathComparator(\TaskLine.runOrder),
-                                KeyPathComparator(\TaskLine.age)]
+                                KeyPathComparator(\TaskLine.nextDate), KeyPathComparator(\TaskLine.age)]
     /// Off for snapshots, so rendering a preview never changes the owner's choice of tab.
     var persistsLayout = true
 
@@ -2361,7 +2559,8 @@ struct TaskAction: Identifiable {
     var id: String { title }
 }
 
-func taskActions(_ t: HTask, _ actions: WidgetActions?, reject: @escaping () -> Void) -> [TaskAction] {
+func taskActions(_ t: HTask, _ actions: WidgetActions?, reject: @escaping () -> Void,
+                 schedule: @escaping () -> Void) -> [TaskAction] {
     var out: [TaskAction] = []
     switch t.status {
     case "open":
@@ -2385,6 +2584,9 @@ func taskActions(_ t: HTask, _ actions: WidgetActions?, reject: @escaping () -> 
             : TaskAction(title: L("נקה מרשימת \"בוצעו\"", "Clear from the Done list"), icon: "trash") { actions?.clearDone(t) })
     default:
         break
+    }
+    if ["open", "proposed", "blocked"].contains(t.status) {
+        out.append(TaskAction(title: L("תאריכים…", "Dates…"), icon: "calendar", run: schedule))
     }
     out.append(TaskAction(title: L("פתח את BACKLOG.md", "Open BACKLOG.md"), icon: "doc.text") {
         NSWorkspace.shared.open(URL(fileURLWithPath: t.project).appendingPathComponent("BACKLOG.md"))
@@ -2488,7 +2690,7 @@ struct AllTasksView: View {
             TableColumn(L("משימה", "Task"), value: \TaskLine.title) { r in
                 Text(r.title).lineLimit(1).help(r.title)
             }
-            .width(min: 150, ideal: 230)
+            .width(min: 150, ideal: 205)
             TableColumn(L("פרויקט", "Project"), value: \TaskLine.project) { r in
                 Text(r.project).lineLimit(1).foregroundStyle(.secondary).help(r.task.project)
             }
@@ -2510,6 +2712,12 @@ struct AllTasksView: View {
                 Text(shortDate(r.task.added)).monospacedDigit().foregroundStyle(.secondary)
             }
             .width(min: 40, ideal: 48)
+            TableColumn(L("מועד", "Date"), value: \TaskLine.nextDate) { r in
+                Text(dateCell(r.task)).monospacedDigit().lineLimit(1)
+                    .foregroundStyle(r.task.overdue == true ? .red : r.task.urgent == true && r.task.status != "done" ? .orange : .secondary)
+                    .help(r.task.hasDates ? datesLine(r.task) : "")
+            }
+            .width(min: 50, ideal: 80)
             TableColumn(L("עדכון", "Updated"), value: \TaskLine.age) { r in
                 Text(daysAgo(r.task.ageDays)).foregroundStyle(.secondary)
             }
@@ -2525,11 +2733,11 @@ struct AllTasksView: View {
                     .help(branchNote(r.task.branchState))
                 }
             }
-            .width(min: 80, ideal: 120)
+            .width(min: 80, ideal: 100)
         }
         .contextMenu(forSelectionType: String.self) { ids in
             if let id = ids.first, let task = t.tasks.first(where: { TaskLine.key($0) == id }) {
-                ForEach(taskActions(task, m.actions, reject: { startReject(task) })) { a in
+                ForEach(taskActions(task, m.actions, reject: { startReject(task) }, schedule: { startSchedule(task) })) { a in
                     Button { a.run() } label: { Label(a.title, systemImage: a.icon) }
                 }
             }
@@ -2553,6 +2761,19 @@ struct AllTasksView: View {
     func startReject(_ task: HTask) {
         t.selection = TaskLine.key(task)
         t.rejecting = TaskLine.key(task)
+    }
+
+    func startSchedule(_ task: HTask) {
+        t.selection = TaskLine.key(task)
+        t.scheduling = TaskLine.key(task)
+    }
+
+    /// The table's date cell: the recommended date, then the deadline.
+    func dateCell(_ task: HTask) -> String {
+        var parts: [String] = []
+        if let date = task.scheduled, !date.isEmpty { parts.append(shortDate(date)) }
+        if let deadline = task.deadline, !deadline.isEmpty { parts.append(L("עד \(shortDate(deadline))", "by \(shortDate(deadline))")) }
+        return parts.joined(separator: " · ")
     }
 
     @ViewBuilder var details: some View {
@@ -2602,9 +2823,15 @@ struct AllTasksView: View {
                 RejectForm(blocked: task.status == "blocked", count: nil,
                            onReject: { m.actions?.rejectWaiting(task, reason: $0) },
                            onCancel: { t.rejecting = nil })
+            } else if t.scheduling == TaskLine.key(task) {
+                ScheduleForm(task: task, onSave: { date, strict, deadline in
+                    t.scheduling = nil
+                    m.actions?.setDates(task, date: date, strict: strict, deadline: deadline)
+                }, onCancel: { t.scheduling = nil })
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 5) {
+                        if task.hasDates { field(L("תאריכים", "Dates"), datesLine(task)) }
                         if let d = task.details, !d.isEmpty { field(L("מה לעשות", "What to do"), d) }
                         if task.status == "blocked", let q = task.question, !q.isEmpty {
                             field(L("השאלה", "The question"), q)
@@ -2617,7 +2844,7 @@ struct AllTasksView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 HStack(spacing: 8) {
-                    ForEach(taskActions(task, m.actions, reject: { startReject(task) })) { a in
+                    ForEach(taskActions(task, m.actions, reject: { startReject(task) }, schedule: { startSchedule(task) })) { a in
                         Button { a.run() } label: { Label(a.title, systemImage: a.icon) }.controlSize(.small)
                     }
                     Spacer()
@@ -2695,15 +2922,24 @@ struct HelpView: View {
             "**הסדר ברשימה הוא סדר הביצוע** — העליונה רצה ראשונה. בלי התערבות שלך הסדר הוא לפי חשיבות, ובאותה חשיבות הגדולה קודם.",
             "**גרירה:** תופסים משימה ומשחררים על משימה אחרת — היא נוחתת מעליה; מתחת לאחרונה — היא עוברת לסוף. **\"חזרה לסדר האוטומטי\"** מבטל את מה שגררת.",
             "**\"⊖ הוצא הכל מהתור\"** מתחת לרשימה — כל המשימות חוזרות להצעות בבת אחת (אחרי שאלה קצרה במקום), ו־⊕ מחזיר כל אחת.",
+            "**דדליין** קודם לכל: משימה שנשאר לה עד שבוע (או שעבר) עולה לראש התור, גם מעל מה שגררת. מתחת לכותרת כתוב התאריך: כתום — מתקרב, אדום — עבר.",
+        ]),
+        ("ממתינות לתאריך", [
+            "משימות שאישרת, עם תאריך שעוד לא הגיע. הן לא חלק מהתור ולא מהקציר, ולא נחשבות בעלות שלו. האזור מופיע רק כשיש בו משימות.",
+            "ביום שהתאריך מגיע המשימה עוברת לתור לבדה, למקום שהיה לה, ורצה בקציר הבא. לא צריך לזכור כלום.",
+            "**לא לפני** — לא יום אחד מוקדם יותר: בדיקה שאין טעם להריץ לפני שעבר הזמן. **מועד** — מועד מומלץ: הקציר יכול לקחת אותה עד 3 ימים לפניו (משנים בהגדרות ← קציר).",
+            "**▶** מריץ אותה עכשיו בכל זאת. **⊖** מוציא אותה מהתור ומחזיר להצעות. שינוי התאריכים: בטבלת כל המשימות, \"תאריכים…\".",
         ]),
         ("הצעות", [
             "משימות שעוד לא אישרת: רעיונות שסוכן רשם כשעבד לבד, או משימות שהשהית. הן לא ירוצו.",
             "**⊕ = אישור**, והמשימה עוברת לתור. סוכן אף פעם לא מאשר משימה לעצמו.",
             "\"מקום לעוד X%\" בכותרת — כמה עוד ייכנס לקציר הבא אם תאשר.",
+            "הצעה עם תאריך לא רצה לבדה גם כשהוא מגיע. באותו יום היא עוברת ל\"מחכה לך\", ומגיעה התראה.",
             "**פח** ליד הצעה מוחק אותה — והיא לא תוצע שוב. **⋯** ליד שם הפרויקט: **\"בלי הצעות מהפרויקט הזה\"** מסיר את כל ההצעות שלו, וסוכנים לא יציעו בו חדשות. מחזירים בהגדרות.",
         ]),
         ("מחכה לך", [
             "עבודה שהקציר גמר ומחכה לך: ענף עם שינויים שעוד לא מוזג, או שאלה שהסוכן נתקע עליה. ליד כל שורה — כמה זמן היא מחכה (כתום אחרי 14 יום).",
+            "למעלה, כשיש: **הצעות שהגיע המועד שלהן** (או שנשאר להן עד שבוע לדדליין). **⊕** מכניס לתור, **פח** מוחק.",
             "הסמלים: **ענף** — שינוי גמור שעוד לא מוזג. **סימן שאלה** — שאלה שהסוכן נתקע עליה. **חץ יוצא מריבוע** — נפתח באפליקציית Claude.",
             "**לחיצה על שורה** פותחת סשן באפליקציית Claude שמראה מה השתנה, וממזג רק אם תאשר. בשאלה — עונים לו שם.",
             "**✕** בסוף שורה = **דחייה**: השינוי לא ימוזג (או שהמשימה החסומה לא תתבצע). מתחת לשורה נפתח טופס קצר: מסמנים סיבות מוכנות (כמה שרוצים), אפשר להוסיף מילים, ו\"**דחה**\". המשימה עוברת ל\"הוסרו\" עם הסיבה, והענף נשמר בארכיון ולא נמחק.",
@@ -2719,15 +2955,16 @@ struct HelpView: View {
         ]),
         ("כל המשימות", [
             "**כפתור הטבלה** בראש הווידג'ט (או **כל המשימות…** בתפריט ⋯, או \"כל המשימות בטבלה\" מתחת ל\"בוצעו\") פותח חלון עם כל המשימות מכל הפרויקטים, בטבלה אחת.",
-            "למעלה: לשוניות עם מספרים — הכל, בתור, הצעות, מחכה לך, בוצעו, הוסרו (\"הכל\" הוא כל מה שלא הוסר) — חיפוש, ו\"**גם מה שנוקה**\" שמראה גם משימות שניקית מ\"בוצעו\".",
-            "העמודות: מצב (במשימה שבתור — גם המקום שלה בתור), משימה, פרויקט, עדיפות, מורכבות, עלות משוערת, מתי נוספה, עדכון אחרון וענף. לחיצה על כותרת עמודה ממיינת לפיה.",
-            "**בחירת שורה** מראה למטה את הפרטים ואת מה שאפשר לעשות: להכניס לתור או להוציא, למחוק הצעה, לבדיקה ולמיזוג או לדחות, לפתוח את הסשן שביצע, לנקות או להחזיר ל\"בוצעו\", ולפתוח את BACKLOG.md. אותן פעולות בלחיצה ימנית; לחיצה כפולה פותחת את הבדיקה או את הסשן. דחייה פותחת את אותו טופס סיבות כמו בווידג'ט, בלשונית \"מחכה לך\" יש גם \"דחה את כולן\", ובלשונית \"בתור\" — \"הוצא את כולן מהתור\". להריץ — רק מהווידג'ט.",
+            "למעלה: לשוניות עם מספרים — הכל, בתור, לתאריך, הצעות, מחכה לך, בוצעו, הוסרו (\"הכל\" הוא כל מה שלא הוסר) — חיפוש, ו\"**גם מה שנוקה**\" שמראה גם משימות שניקית מ\"בוצעו\".",
+            "העמודות: מצב (במשימה שבתור — גם המקום שלה בתור), משימה, פרויקט, עדיפות, מורכבות, עלות משוערת, מתי נוספה, מועד (התאריך המומלץ והדדליין), עדכון אחרון וענף. לחיצה על כותרת עמודה ממיינת לפיה.",
+            "**בחירת שורה** מראה למטה את הפרטים ואת מה שאפשר לעשות: להכניס לתור או להוציא, למחוק הצעה, לקבוע **תאריכים** (מועד מומלץ, \"לא יום לפני\", דדליין), לבדיקה ולמיזוג או לדחות, לפתוח את הסשן שביצע, לנקות או להחזיר ל\"בוצעו\", ולפתוח את BACKLOG.md. אותן פעולות בלחיצה ימנית; לחיצה כפולה פותחת את הבדיקה או את הסשן. דחייה פותחת את אותו טופס סיבות כמו בווידג'ט, בלשונית \"מחכה לך\" יש גם \"דחה את כולן\", ובלשונית \"בתור\" — \"הוצא את כולן מהתור\". להריץ — רק מהווידג'ט.",
         ]),
         ("קציר (בתחתית)", [
             "ספירה לאחור עד שהקציר האוטומטי מתחיל — רק כשהמתג \"אוטומטי\" דלוק. הוא רץ ב**פעימות**: כל פעימה היא חלון של 5 שעות, והאחרונה נגמרת לפני האיפוס השבועי. כמה פעימות — בוחרים בשורה (1–6), או \"אוטומטי\": כמה שצריך כדי לנצל את מה שנשאר מהשבוע על מה שבתור.",
             "פעימה מסתיימת כשחלון ה־5 שעות מתמלא; הבאה מתחילה כשהוא מתאפס, כל עוד יש בתור עבודה. מתחת: כמה חלונות, לכמה אחוזים מהמכסה השבועית הם מספיקים, וכמה בתור.",
             "**סוללה:** כברירת מחדל ההתחלה האוטומטית מחכה עד שהמק מחובר לחשמל או שהסוללה מעל 10% (משנים או מכבים בהגדרות ← קציר), ומגיעה התראה אחת. \"הרץ עכשיו\" תמיד מתחיל. ריצה שנקטעה באמצע — למשל כי המחשב נכנס לשינה — ממשיכה מעצמה אם יש עוד זמן לפני האיפוס, עם התראה; אבל לא אחרי ש\"עצור\" שלך.",
             "**הרץ עכשיו** מריץ את כל התור מיד.",
+            "**דדליין לפני הקציר השבועי:** משימה בתור שהדדליין שלה מגיע לפני הקציר הבא רצה לבד, יומיים לפניו, בריצה אחת ביום ובתוך שמירת המקום שלך. מגיעה התראה. עם המתג \"אוטומטי\" כבוי זה לא קורה.",
             "בזמן ריצה: נקודה מהבהבת, המשימה הנוכחית, **צפה** (הסשן החי באפליקציית Claude) ו**עצור**. אפשר גם לכתוב לו מהאפליקציה או מהטלפון.",
             "כל משימה רצה בסשן משלה ובענף נפרד משלה בתוך הפרויקט. שום דבר לא נדחף לשרת ולא ממוזג — את זה רק אתה מאשר. משימה שלא תספיק להסתיים לפני האיפוס לא מתחילה.",
             "**כשמכסה נגמרת באמצע:** אם נגמרה המכסה של המודל עצמו (למשל Fable), הסשן ממשיך מאותה נקודה על המודל החלופי. אם נגמר חלון 5 השעות או השבועי — המשימה נעצרת מיד, העבודה נשמרת בענף שלה, והיא ממשיכה משם בפעימה הבאה. זה לא נחשב כישלון.",
@@ -2739,7 +2976,7 @@ struct HelpView: View {
         ("הגדרות", [
             "חמש לשוניות בראש החלון.",
             "**כללי:** שפה, הפעלה בכניסה למחשב, בשורת התפריט או כווידג'ט צף; השם שלך, מייל לסיכום שבועי ותיקיית הקציר (שומרים ב\"שמור\"); עזרה והסרת הקציר.",
-            "**קציר:** קציר אוטומטי, כמה פעימות לפני האיפוס, **שמירת מקום בשבילך** — כמה אחוזים הקציר לא ייגע בהם בחלון ה־5 שעות (כדי שתוכל לעבוד) ובמכסה השבועית — ו**סוללה**: לא להתחיל אוטומטית על סוללה חלשה, ומאיזה אחוז.",
+            "**קציר:** קציר אוטומטי, כמה פעימות לפני האיפוס, **שמירת מקום בשבילך** — כמה אחוזים הקציר לא ייגע בהם בחלון ה־5 שעות (כדי שתוכל לעבוד) ובמכסה השבועית — **תאריכים**: כמה ימים לפני מועד מומלץ הקציר יכול לקחת משימה — ו**סוללה**: לא להתחיל אוטומטית על סוללה חלשה, ומאיזה אחוז.",
             "**מודלים:** מודל לכל גודל משימה, ו**מעבר בין מודלים** — מאיזה אחוז של המכסה של Fable עוברים, לאיזה מודל (או \"בלי\": המשימות יחכו), והאם לעבור גם באמצע משימה.",
             "**פרויקטים:** מתג \"הצעות\" לכל פרויקט רשום — כבוי = בלי הצעות ממנו.",
             "**טקסטים:** ההנחיות שהקציר נותן לסוכנים — משימה, סריקת הצעות, השיחות, מייל הסיכום וההודעה במעבר מודל. אפשר לערוך כל אחת; נקודה כחולה = מותאם אישית, כתומה = שינוי שלא נשמר. מה שחייב להישאר בטקסט כתוב מתחתיו, ושמירה בלעדיו נדחית. \"שחזר ברירת מחדל\" מחזיר את המקור.",
@@ -2753,6 +2990,7 @@ struct HelpView: View {
         ("איך משימות נכנסות", [
             "כל סשן של Claude או Codex יכול לרשום משימה לבקלוג של הפרויקט — גם כשאתה אומר לו \"תוסיף לבקלוג\" או \"לא עכשיו\".",
             "כשאתה נוכח ומסכים היא נכנסת **לתור**. כשסוכן עובד לבד היא נכנסת **להצעות**.",
+            "אפשר לתת לה זמן: \"תכניס לבקלוג בדיקה עוד חודש\". קלוד רושם תאריך מדויק, המשימה ממתינה ב\"ממתינות לתאריך\" ורצה לבד כשהוא מגיע.",
         ]),
     ]
 
@@ -2776,15 +3014,24 @@ struct HelpView: View {
             "**The list's order is the order they run in** — the top one runs first. Left alone, it's by priority, and within a priority the bigger task first.",
             "**Dragging:** grab a task and drop it on another one — it lands above it; below the last one — it goes last. **\"Back to the automatic order\"** undoes what you dragged.",
             "**\"⊖ Take everything out of the queue\"** under the list — every task goes back to the proposals at once (after a short question in place), and ⊕ brings each one back.",
+            "**A deadline** comes first: a task with a week or less left (or past it) goes to the top of the queue, even above what you dragged. The date shows under the title: orange — close, red — past.",
+        ]),
+        ("Waiting for a date", [
+            "Tasks you approved whose date hasn't come. They aren't part of the queue or of a harvest, and don't count in its cost. The section shows only when it has tasks.",
+            "On the day the date comes the task moves to the queue by itself, back to its place, and runs in the next harvest. There's nothing to remember.",
+            "**Not before** — not a day earlier: a check with no point before the time has passed. **Date** — a recommended date: the harvest may take it up to 3 days before (change it in Settings → Harvest).",
+            "**▶** runs it now anyway. **⊖** takes it out of the queue, back to the proposals. To change the dates: the all-tasks table, \"Dates…\".",
         ]),
         ("Proposals", [
             "Tasks you haven't approved yet: ideas an agent noted while working on its own, or tasks you paused. They don't run.",
             "**⊕ = approving it**, and the task moves to the queue. An agent never approves a task for itself.",
             "\"room for X% more\" in the header — how much more fits into the next harvest if you approve.",
+            "A proposal with a date doesn't run by itself even when the date comes. On that day it moves to \"Waiting for you\", and a notification comes.",
             "**The trash can** next to a proposal deletes it — it won't be proposed again. **⋯** next to a project's name: **\"No proposals from this project\"** removes all its proposals, and agents won't propose new ones there. Turn it back on in Settings.",
         ]),
         ("Waiting for you", [
             "Work the harvest finished that is waiting for you: a branch with changes not merged yet, or a question the agent got stuck on. Next to each row — how long it has waited (orange after 14 days).",
+            "At the top, when there are any: **proposals whose date has come** (or with a week or less to their deadline). **⊕** queues one, **the trash can** deletes it.",
             "The icons: **a branch** — finished changes not merged yet. **A question mark** — a question the agent got stuck on. **An arrow out of a square** — opens in the Claude app.",
             "**Clicking a row** opens a session in the Claude app that shows what changed, and merges only if you approve. For a question — you answer it there.",
             "**✕** at the end of a row = **rejecting** it: the change won't be merged (or the blocked task won't be done). A short form opens under the row: tick ready reasons (as many as you like), add words if you want, and \"**Reject**\". The task moves to Removed with the reason, and its branch is kept in the archive, not deleted.",
@@ -2800,15 +3047,16 @@ struct HelpView: View {
         ]),
         ("All tasks", [
             "**The table button** at the top of the widget (or **All tasks…** in the ⋯ menu, or \"All tasks in a table\" under Done) opens a window with every task of every project in one table.",
-            "At the top: tabs with counts — All, Queue, Proposals, Waiting, Done, Removed (\"All\" is everything not removed) — a search, and **\"Show cleared\"**, which also shows the tasks you cleared from Done.",
-            "The columns: status (for a queued task, also its place in the queue), task, project, priority, complexity, estimated cost, when it was added, the last update and the branch. Clicking a column's title sorts by it.",
-            "**Selecting a row** shows its details below, with what can be done: put it in the queue or take it out, delete a proposal, review and merge or reject, open the session that did it, clear it from Done or bring it back, and open BACKLOG.md. The same actions are on a right-click; a double-click opens the review or the session. Rejecting opens the same reasons form as in the widget, the Waiting tab also has \"Reject them all\", and the Queue tab \"Take them all out\". Running happens only from the widget.",
+            "At the top: tabs with counts — All, Queue, Dated, Proposals, Waiting, Done, Removed (\"All\" is everything not removed) — a search, and **\"Show cleared\"**, which also shows the tasks you cleared from Done.",
+            "The columns: status (for a queued task, also its place in the queue), task, project, priority, complexity, estimated cost, when it was added, the date (the recommended date and the deadline), the last update and the branch. Clicking a column's title sorts by it.",
+            "**Selecting a row** shows its details below, with what can be done: put it in the queue or take it out, delete a proposal, set its **dates** (a recommended date, \"not a day earlier\", a deadline), review and merge or reject, open the session that did it, clear it from Done or bring it back, and open BACKLOG.md. The same actions are on a right-click; a double-click opens the review or the session. Rejecting opens the same reasons form as in the widget, the Waiting tab also has \"Reject them all\", and the Queue tab \"Take them all out\". Running happens only from the widget.",
         ]),
         ("Harvest (at the bottom)", [
             "A countdown to the start of the automatic harvest — only while the \"automatic\" switch is on. It runs in **pulses**: each pulse is one 5-hour window, and the last one ends before the weekly reset. How many — you choose in the row (1–6), or \"Auto\": as many as it takes to spend what's left of the week on what's queued.",
             "A pulse ends when its 5-hour window fills up; the next starts when that window resets, as long as the queue has work. Underneath: how many windows, how much of the weekly quota they are enough for, and how much is queued.",
             "**Battery:** by default the automatic start waits until the Mac is plugged in or the battery is above 10% (change it or turn it off in Settings → Harvest), and one notification comes. \"Run now\" always starts. A run cut off midway — the Mac went to sleep, say — goes on by itself if there is time before the reset, with a notification; never after your own \"Stop\".",
             "**Run now** runs the whole queue right away.",
+            "**A deadline before the weekly harvest:** a queued task whose deadline comes before the next harvest runs by itself, two days before it, in one run a day and within what's kept free for you. A notification comes. With the \"automatic\" switch off, this doesn't happen.",
             "During a run: a blinking dot, the current task, **Watch** (the live session in the Claude app) and **Stop**. You can also write to it from the app or from your phone.",
             "Each task runs in its own session and on its own branch inside the project. Nothing is pushed to the server or merged — only you approve that. A task that wouldn't finish before the reset doesn't start.",
             "**When a quota runs out midway:** if it's the model's own quota (Fable, say), the session goes on from the same point with the fallback model. If it's the 5-hour window or the weekly quota, the task stops at once, its work is kept on its branch, and it goes on from there in the next pulse. That doesn't count as a failure.",
@@ -2820,7 +3068,7 @@ struct HelpView: View {
         ("Settings", [
             "Five tabs at the top of the window.",
             "**General:** language, start at login, the menu bar or a floating widget; your name, an email for the weekly summary and the harvest folder (kept with \"Save\"); help and removing the harvest.",
-            "**Harvest:** the automatic harvest, how many pulses before the reset, **kept free for you** — how many percent the harvest leaves alone in the 5-hour window (so you can work) and in the weekly quota — and **battery**: don't start automatically on a low battery, and from what percent.",
+            "**Harvest:** the automatic harvest, how many pulses before the reset, **kept free for you** — how many percent the harvest leaves alone in the 5-hour window (so you can work) and in the weekly quota — **dates**: how many days before a recommended date the harvest may take a task — and **battery**: don't start automatically on a low battery, and from what percent.",
             "**Models:** a model per task size, and **switching models** — from what percent of Fable's own quota to switch, to which model (or \"None\": the tasks wait), and whether to switch mid-task too.",
             "**Projects:** a \"Proposals\" switch per registered project — off = no proposals from it.",
             "**Texts:** the instructions the harvest gives its agents — a task, the proposal scan, the conversations, the summary email and the message on a model switch. Each can be edited; a blue dot = customized, orange = unsaved changes. What must stay in a text is listed under it, and saving without it is refused. \"Restore the default\" brings back the original.",
@@ -2834,6 +3082,7 @@ struct HelpView: View {
         ("How tasks get in", [
             "Any Claude or Codex session can add a task to the project's backlog — also when you tell it \"add to backlog\" or \"not now\".",
             "When you're there and agree, it goes into the **Queue**. When an agent works on its own, it goes into **Proposals**.",
+            "You can give it a time: \"put a check on this in the backlog in a month\". Claude records an exact date, the task sits in \"Waiting for a date\" and runs by itself when it comes.",
         ]),
     ]
 
@@ -3191,6 +3440,7 @@ final class SettingsModel: ObservableObject {
     @Published var switchMidTask = true
     @Published var fiveReserve = 15
     @Published var weeklyReserve = 2
+    @Published var earlyDays = 3
     @Published var saved = false
     @Published var prompts: [HPrompt] = []
     @Published var promptName = "task"
@@ -3210,6 +3460,7 @@ final class SettingsModel: ObservableObject {
         switchMidTask = settings?.switchMidTask ?? true
         fiveReserve = Int(settings?.fiveReserve ?? 15)
         weeklyReserve = Int(settings?.weeklyReserve ?? 2)
+        earlyDays = settings?.earlyDays ?? 3
         saved = false
     }
 
@@ -3430,6 +3681,21 @@ struct SettingsView: View {
                 }
             } header: {
                 Text(L("שמירת מקום בשבילך", "Kept free for you"))
+            }
+            Section {
+                Stepper(value: Binding(get: { s.earlyDays }, set: { v in
+                    s.earlyDays = v
+                    m.actions?.saveHarvestSettings(["earlyDays=\(v)"])
+                }), in: 0...7) {
+                    titled(L("מועד מומלץ: עד \(s.earlyDays) ימים לפניו", "A recommended date: up to \(s.earlyDays) days before it"),
+                           L("הקציר בא פעם בשבוע, אז 3 שומר על משימה בטווח חצי שבוע מהמועד שלה", "The harvest comes once a week, so 3 keeps a task within half a week of its date"))
+                }
+            } header: {
+                Text(L("תאריכים", "Dates"))
+            } footer: {
+                Text(L("משימה עם \"לא לפני\" לא רצה יום אחד מוקדם יותר, לא משנה מה כתוב כאן. דדליין מקדם משימה בתור מהרגע שנשאר לה עד שבוע, וכשהקציר השבועי יגיע רק אחריו היא רצה בנפרד יומיים לפניו.",
+                       "A task marked \"not before\" never runs a day earlier, whatever is set here. A deadline moves a task up the queue from a week before it, and when the weekly harvest would come too late, the task gets a run of its own two days before."))
+                    .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Section {
                 Toggle(isOn: Binding(get: { m.config.batteryGuard },
@@ -4004,6 +4270,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         autoHarvestTick()
         refreshNotificationPermission()
         nudgeTick()
+        dateNudgeTick()
         signInTick()
     }
 
@@ -4728,8 +4995,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     /// Launches the automatic harvest when its plan says it's due — on fresh numbers only.
     func autoHarvestTick() {
         guard model.harvestInstalled, model.signIn == nil, !runner.isRunning, !model.harvestActive, let raw = model.weekly?.resetsAt,
-              let fresh = lastSuccess, -fresh.timeIntervalSinceNow < 15 * 60,
-              let plan = autoHarvestPlan(), plan.due else { return }
+              let fresh = lastSuccess, -fresh.timeIntervalSinceNow < 15 * 60 else { return }
+        guard let plan = autoHarvestPlan(), plan.due else { deadlineRunTick(); return }
         let d = UserDefaults.standard
         if let battery = batteryHold() {
             // Once a cycle: the harvest is due but waits for power.
@@ -4755,6 +5022,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             d.set(model.harvestWindows, forKey: "HarvestCyclePulses")
         }
         launchHarvest(mode: "auto", only: [])
+    }
+
+    /// A deadline the weekly harvest would come too late for: those tasks get a run of their own, in the owner's
+    /// quota and within the reserves, like any other run. At most one a day, so a task that doesn't fit isn't
+    /// tried again every 30 seconds; the automatic switch and the battery guard apply.
+    func deadlineRunTick() {
+        let tasks = model.listing.deadlineRun ?? []
+        let d = UserDefaults.standard, today = formatTime(Date(), "yyyy-MM-dd")
+        guard model.config.auto, !tasks.isEmpty, d.string(forKey: "HarvestDeadlineDay") != today, batteryHold() == nil else { return }
+        d.set(today, forKey: "HarvestDeadlineDay")
+        notify(title: appName,
+               body: tasks.count == 1
+                   ? L("הדדליין של \"\(tasks[0].title)\" מגיע לפני הקציר השבועי, אז היא רצה עכשיו.",
+                       "The deadline of \"\(tasks[0].title)\" comes before the weekly harvest, so it runs now.")
+                   : L("הדדליין של \(tasks.count) משימות מגיע לפני הקציר השבועי, אז הן רצות עכשיו.",
+                       "The deadline of \(tasks.count) tasks comes before the weekly harvest, so they run now."))
+        launchHarvest(mode: "deadline", only: tasks)
     }
 
     /// The last run ended "interrupted" without the owner stopping it — the Mac slept, the session stalled.
@@ -4795,17 +5079,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
 
     func setQueued(_ task: HTask, _ queued: Bool) {
         var l = model.listing
-        if queued, let i = l.proposals.firstIndex(of: task) {
-            l.proposals.remove(at: i)
-            l.queue.append(task)
-        } else if !queued, let i = l.queue.firstIndex(of: task) {
-            l.queue.remove(at: i)
+        if queued, l.proposals.contains(task) || l.dueProposals?.contains(task) == true {
+            l.proposals.removeAll { $0 == task }
+            l.dueProposals?.removeAll { $0 == task }
+            if task.waits == true { l.waiting = (l.waiting ?? []) + [task] } else { l.queue.append(task) }
+        } else if !queued, l.queue.contains(task) || l.waiting?.contains(task) == true {
+            l.queue.removeAll { $0 == task }
+            l.waiting?.removeAll { $0 == task }
             l.proposals.insert(task, at: 0)
         }
         model.listing = l
         runEngine(["set-status", task.project, task.title, queued ? "open" : "proposed"]) { [weak self] _ in
             self?.refreshListing()
         }
+    }
+
+    /// The all-tasks window's dates form. No date = clear it.
+    func setDates(_ task: HTask, date: Date?, strict: Bool, deadline: Date?) {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        var args = ["schedule", task.project, task.title]
+        if let date = date { args += [strict ? "--not-before" : "--when", f.string(from: date)] } else { args.append("--clear-scheduled") }
+        if let deadline = deadline { args += ["--deadline", f.string(from: deadline)] } else { args.append("--clear-deadline") }
+        runEngine(args) { [weak self] _ in self?.refreshListing() }
     }
 
     func openNeed(_ task: HTask) {
@@ -4974,6 +5271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     func removeProposal(_ task: HTask) {
         var l = model.listing
         l.proposals.removeAll { $0 == task }
+        l.dueProposals?.removeAll { $0 == task }
         model.listing = l
         flash(L("ההצעה הוסרה", "Proposal removed"))
         runEngine(["set-status", task.project, task.title, "dropped"]) { [weak self] _ in self?.refreshListing() }
@@ -5280,6 +5578,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
                category: "waiting", id: "waiting")
     }
 
+    /// A date nobody is watching: one notification when a proposal's date comes (it can't run by itself) and when a
+    /// queued task passes its deadline — once per task and date, between 10:00 and 21:00.
+    func dateNudgeTick() {
+        guard listingLoaded, !model.harvestActive, (10..<21).contains(Calendar.current.component(.hour, from: Date())) else { return }
+        let tasks = model.dueProposals + model.listing.queue.filter { $0.overdue == true }
+        let key: (HTask) -> String = { $0.id + "@" + ($0.scheduled ?? "") + "@" + ($0.deadline ?? "") }
+        let d = UserDefaults.standard
+        let told = Set(d.stringArray(forKey: "DateNudged") ?? [])
+        let fresh = tasks.filter { !told.contains(key($0)) }
+        guard let first = fresh.first else { return }
+        d.set(tasks.map(key), forKey: "DateNudged")
+        let body: String
+        if fresh.count > 1 {
+            body = L("ל־\(fresh.count) משימות הגיע המועד. הן מחכות לך בווידג'ט.", "\(fresh.count) tasks have reached their date. They're waiting for you in the widget.")
+        } else if first.status == "proposed" {
+            body = L("הגיע המועד של \"\(first.title)\". היא הצעה, אז היא מחכה לאישור שלך בווידג'ט.",
+                     "The date of \"\(first.title)\" has come. It's a proposal, so it waits for your approval in the widget.")
+        } else {
+            body = L("עבר הדדליין של \"\(first.title)\". היא ראשונה בתור לקציר הבא.",
+                     "\"\(first.title)\" is past its deadline. It's first in the queue for the next harvest.")
+        }
+        notify(title: appName, body: body)
+    }
+
     var talkPid: pid_t = 0
     var talkReaper: DispatchSourceProcess?
 
@@ -5535,7 +5857,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             .background(Color(nsColor: .windowBackgroundColor))), width: 460, to: path)
     }
 
-    /// `--snapshot-tasks <png> [--filter all|queue|proposals|waiting|done|dropped] [--select <row>] [--cleared]
+    /// `--snapshot-tasks <png> [--filter all|queue|scheduled|proposals|waiting|done|dropped] [--select <row>] [--scheduling] [--cleared]
     /// [--demo] [--light] [--he|--en]`: the all-tasks window at its opening size, from `list --all` (or the
     /// demo data) — and exits.
     func snapshotAllTasks(to path: String) {
@@ -5560,7 +5882,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             loadDemo()
             let l = model.listing
             var seen = Set<String>()
-            let all = (l.queue + l.proposals + l.needsYou + l.done).filter { seen.insert($0.id).inserted }
+            let all = (l.queue + (l.waiting ?? []) + l.proposals + l.needsYou + l.done).filter { seen.insert($0.id).inserted }
             allTasksModel.update(all, queue: l.queue)
             DispatchQueue.main.async(execute: render)
             return
@@ -5594,6 +5916,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         let json = """
         {"queue":[\(task("recipes-app", he ? "בדיקות לחישוב המנות" : "Tests for the portion calculator", "open", 1.2)),
                   \(task("site", he ? "README לא תואם לפקודות ההתקנה" : "README doesn't match the install steps", "open", 0.4))],
+         "waiting":[\(task("site", he ? "בדיקת הלוגים חודש אחרי השינוי" : "Check the logs a month after the change", "open", 0.4, extra: #","added":"2026-11-01","scheduled":"2026-12-01","strict":true,"timing":"waiting","scheduledIn":30,"waits":true"#))],
          "proposals":[\(task("recipes-app", he ? "להסיר TODO ישן ב-sync" : "Resolve an old TODO in sync", "proposed", 0.6)),
                       \(task("site", he ? "שגיאות lint בטופס יצירת קשר" : "Lint errors in the contact form", "proposed", 0.3)),
                       \(task("site", he ? "תמונות בלי טקסט חלופי" : "Images without alt text", "proposed", 0.5))],
@@ -5620,6 +5943,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         model.dotColor = .systemGreen
         if expandAll {
             model.queueOpen = true
+            model.waitingOpen = true
             model.proposalsOpen = true
             model.needsOpen = true
             model.doneOpen = true
@@ -5648,6 +5972,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             model.confirmingClear = args[i + 1] == "clear"
             allTasksModel.confirmingUnqueue = args[i + 1] == "unqueue"
         }
+        if args.contains("--scheduling"), let key = allTasksModel.selection { allTasksModel.scheduling = key }
         guard let i = args.firstIndex(of: "--rejecting") else { return }
         let all = i + 1 < args.count && args[i + 1] == "all"
         model.rejecting = all ? "all" : model.listing.needsYou.first?.id
