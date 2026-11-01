@@ -26,7 +26,7 @@ command -v swiftc >/dev/null 2>&1 || { echo "swiftc is missing — install the C
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 swiftc -O -o "$exe.new" "$name.swift"
 mv -f "$exe.new" "$exe"
-cp Info.plist "$app/Contents/Info.plist"
+cp app/Info.plist "$app/Contents/Info.plist"
 cp -R lproj/. "$app/Contents/Resources/"
 
 # 2. The harvest's own files, for the setup window (Resources/harvest/install.py).

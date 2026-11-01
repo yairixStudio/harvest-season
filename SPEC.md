@@ -471,8 +471,10 @@ Notifications need the app bundle — `HarvestSeason.app`, bundle id
 `dev.harvest-season.widget`, named "Harvest Season" / "עונת הקציר" by language (`lproj/`),
 `LSUIElement` — which `./install` builds, signs ad hoc, registers and points the
 launch agent at. macOS keeps the notification permission per bundle id, so a new name
-asks for it again. Once, and only inside the app bundle (a bare build beside `Info.plist`
-takes on the bundle id, and a snapshot must not move or mark anything), `migrateDefaults`
+asks for it again. The bundle's `Info.plist` lives in `app/`, not beside the source: a bare
+binary next to an `Info.plist` takes on its bundle id, and with it the installed app's
+settings. A bare build (`./start`, snapshots) has its own defaults domain, `HarvestSeason`,
+for its switches, language and window positions. Once, and only inside the app bundle, `migrateDefaults`
 carries over the settings saved under the app's earlier names, newest first and never
 over a key already set: Quota Harvest's `dev.quota-harvest.widget` (the name before
 Harvest Season), then Claude Usage Widget's bundle id and its bare binary's domain — the

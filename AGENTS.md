@@ -11,6 +11,7 @@ Rules for anyone changing this repository — people and coding agents. `CLAUDE.
   - `instructions/` — the "Backlog" sections that go into `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`
   - `install.py` — puts all of the above into the user's home and records a hash per file; `test_install.py`
 - `install` — builds `HarvestSeason.app`, bundles `harvest/` into it, runs it under launchd (label `dev.harvest-season.widget`); it also stops and removes the copy installed under an earlier name. `start` — runs a bare build from this folder, for development.
+- `app/Info.plist` — the bundle's Info.plist, which `./install` copies in. Not at the top: a bare build beside it would take on the bundle id and the installed app's settings.
 - `lproj/` — the app's name per language. `docs/` — the README's pictures.
 
 ## The installed copies are not the source

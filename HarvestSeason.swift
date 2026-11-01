@@ -881,6 +881,11 @@ func openInClaude(folder: String, prompt: String) {
 /// notifications can't be clicked through to anything.
 var clickableNotifications = false
 
+/// Inside `HarvestSeason.app`, not a bare build. Only the bundle has the app's bundle id (its
+/// Info.plist lives in `app/`, out of a bare build's reach) — this holds even if a plist sits
+/// beside a bare binary again, which would hand it the installed app's settings.
+let runsAsApp = Bundle.main.bundleURL.pathExtension == "app" && Bundle.main.bundleIdentifier != nil
+
 func notify(title: String, body: String, category: String? = nil, id: String? = nil) {
     if clickableNotifications {
         let content = UNMutableNotificationContent()
@@ -5467,10 +5472,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     /// positions. Newest first, and a key that is already set is never overwritten: Quota Harvest
     /// (`dev.quota-harvest.widget`, the name before Harvest Season), then Claude Usage Widget (its
     /// bundle id, and the domain of the bare binary it was before that).
-    /// Only an app bundle moves them: a bare build beside Info.plist takes on the bundle id, and a
-    /// snapshot run from the repository must neither write the owner's settings nor mark the move done.
+    /// Only an app bundle moves them: a bare build has its own defaults domain, and must neither
+    /// copy the earlier settings into it nor mark the move done.
     func migrateDefaults() {
-        guard Bundle.main.bundleURL.pathExtension == "app", Bundle.main.bundleIdentifier != nil else { return }
+        guard runsAsApp else { return }
         let d = UserDefaults.standard
         guard !d.bool(forKey: "MigratedToHarvestSeason") else { return }
         // The saved windows under their earlier autosave names.
@@ -5491,7 +5496,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     }
 
     func setupNotifications() {
-        guard Bundle.main.bundleIdentifier != nil else { return }
+        guard runsAsApp else { return }
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         registerNotificationCategories()
@@ -5503,7 +5508,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
 
     /// The reminder's buttons, in the UI language — registered again when it changes.
     func registerNotificationCategories() {
-        guard Bundle.main.bundleIdentifier != nil else { return }
+        guard runsAsApp else { return }
         UNUserNotificationCenter.current().setNotificationCategories([UNNotificationCategory(
             identifier: "waiting",
             actions: [UNNotificationAction(identifier: "talk", title: L("כן, בוא נדבר", "Yes, let's talk")),
@@ -5514,7 +5519,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     /// The permission as it stands now — the owner may allow it (or take it back)
     /// in System Settings at any time, and the first answer can come late.
     func refreshNotificationPermission() {
-        guard Bundle.main.bundleIdentifier != nil else { return }
+        guard runsAsApp else { return }
         UNUserNotificationCenter.current().getNotificationSettings { settings in
             let allowed = [.authorized, .provisional].contains(settings.authorizationStatus)
             DispatchQueue.main.async {
