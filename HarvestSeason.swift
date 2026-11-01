@@ -397,7 +397,8 @@ struct InstallPlan: Decodable {
 struct HEstimate: Decodable, Equatable {
     let base: Int?
     let baseSource: String?
-    let turns: Int?
+    /// A median, so it can be a half; one that isn't a whole number must not blank the whole listing.
+    let turns: Double?
     let turnsSource: String?
 }
 
@@ -2046,7 +2047,7 @@ struct TaskRow: View {
         if let d = task.details, !d.isEmpty { s += "\n" + d }
         s += L("\nמורכבות \(task.complexity) · ~\(task.tokens / 1000)k טוקנים",
                "\nComplexity \(task.complexity) · ~\(task.tokens / 1000)k tokens")
-        if let e = task.estimate, let base = e.base, let turns = e.turns {
+        if let e = task.estimate, let base = e.base, let turns = e.turns.map({ Int($0.rounded()) }) {
             let baseNote = e.baseSource == "measured" ? L("נמדד בפרויקט", "measured in the project")
                 : L("משוער מ-CLAUDE.md", "estimated from CLAUDE.md")
             let turnsNote = e.turnsSource == "learned" ? L("לפי ריצות קודמות", "from earlier runs")

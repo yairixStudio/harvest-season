@@ -713,7 +713,8 @@ def estimate_tokens(repo, kind, hint=0, ctx=None):
     base, base_source = project_base(repo, ctx)
     turns, turns_source, growth = learned(ctx, kind)
     model = int(turns * (base + growth * (turns - 1) / 2.0))
-    parts = {"base": base, "baseSource": base_source, "turns": turns, "turnsSource": turns_source,
+    # A median of an even count can be x.5; the widget reads this as a whole number.
+    parts = {"base": base, "baseSource": base_source, "turns": int(round(turns)), "turnsSource": turns_source,
              "growth": int(growth), "model": model, "hint": hint}
     return max(model, hint or 0), parts
 

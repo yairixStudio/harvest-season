@@ -657,6 +657,12 @@ class Harvest(unittest.TestCase):
         finally:
             os.environ.pop("HARVEST_HOME")
 
+    def test_a_median_of_turns_reaches_the_widget_as_a_whole_number(self):
+        with open(os.path.join(self.home, "context.json"), "w") as f:
+            json.dump({"projects": {}, "sessions": [{"kind": "low", "turns": 7}, {"kind": "low", "turns": 8}]}, f)
+        self.add("Task")
+        self.assertIsInstance(self.run_engine("list")["queue"][0]["estimate"]["turns"], int)
+
     def test_session_stats_and_record(self):
         os.environ["HARVEST_HOME"] = self.home
         try:
