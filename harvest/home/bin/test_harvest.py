@@ -1159,6 +1159,186 @@ class Harvest(unittest.TestCase):
         out = {p["name"]: p for p in self.run_engine("prompts", "--reset", "task")["prompts"]}
         self.assertFalse(out["task"]["custom"])
 
+    # ---------- events (the widget's notifications) ----------
+
+    def events(self, since="0", *flags):
+        return self.run_engine("events", "--since", str(since), *flags)
+
+    def kinds(self):
+        return [e["kind"] for e in self.events()["events"]]
+
+    def test_every_step_writes_exactly_one_event(self):
+        self.usage()
+        self.assertEqual(self.events(), {"ok": True, "events": [], "lastId": 0, "more": False})
+        for title in ("Finishes", "Asks", "Breaks", "Stops", "Empty"):
+            self.add(title)
+        self.run_engine("begin", "--mode", "auto")
+        self.assertEqual(self.kinds(), ["run_started"])
+        started = self.events()["events"][0]
+        self.assertTrue(started["run_id"].startswith("run-"))
+        self.assertEqual(started["summary"], "The harvest started · automatic")
+        wt = self.run_engine("worktree", self.repo, "Finishes", "--model", "sonnet")
+        self.assertEqual(self.kinds()[1:], ["task_started"])
+        began = self.events()["events"][1]
+        self.assertEqual((began["project"], began["title"], began["branch"], began["run_id"]),
+                         ("alpha", "Finishes", wt["branch"], started["run_id"]))
+        self.assertEqual(began["summary"], "Started working · sonnet")
+        finishes = wt["branch"]
+        self.commit_in(wt["path"])
+        self.run_engine("finish-task", self.repo, "Finishes", "--outcome", "done", "--summary", "Added a file", "--tokens", "1000")
+        wt = self.run_engine("worktree", self.repo, "Asks")
+        self.run_engine("finish-task", self.repo, "Asks", "--outcome", "blocked", "--question", "Which color?")
+        wt = self.run_engine("worktree", self.repo, "Breaks")
+        self.run_engine("finish-task", self.repo, "Breaks", "--outcome", "failed", "--summary", "tests broke")
+        wt = self.run_engine("worktree", self.repo, "Stops")
+        stops = wt["branch"]
+        self.commit_in(wt["path"])
+        self.run_engine("finish-task", self.repo, "Stops", "--outcome", "paused", "--summary", "the 5-hour limit")
+        # A task that reports done without a commit is a failure, and says so once.
+        self.run_engine("worktree", self.repo, "Empty")
+        self.run_engine("finish-task", self.repo, "Empty", "--outcome", "done", "--summary", "all good")
+        self.assertEqual(self.kinds()[2:], [
+            "task_waiting_review",
+            "task_started", "task_blocked", "task_started", "task_failed", "task_started", "task_paused",
+            "task_started", "task_failed"])
+        by_kind = {}
+        for e in self.events()["events"]:
+            by_kind.setdefault(e["kind"], []).append(e)
+        review = by_kind["task_waiting_review"][0]
+        self.assertEqual(review["summary"], "Waiting for your approval · Added a file")
+        self.assertEqual(review["branch"], finishes)
+        blocked = by_kind["task_blocked"][0]
+        self.assertEqual((blocked["question"], blocked["summary"]), ("Which color?", "Needs an answer from you: Which color?"))
+        self.assertNotIn("branch", blocked, "no commits, no branch")
+        self.assertEqual(by_kind["task_failed"][0]["summary"], "Failed · tests broke")
+        self.assertEqual(by_kind["task_failed"][1]["summary"], "Failed · the agent reported done but made no commit")
+        self.assertEqual(by_kind["task_paused"][0]["summary"], "Stopped: the 5-hour limit · the work is saved")
+        self.assertEqual(by_kind["task_paused"][0]["branch"], stops)
+        before = len(self.events()["events"])
+        self.run_engine("end", "--reason", "queue-empty")
+        events = self.events()["events"]
+        self.assertEqual((len(events) - before, events[-1]["kind"]), (1, "run_ended"))
+        self.assertEqual(events[-1]["summary"], "1 task done · the queue ran out · 2 waiting for you"
+                         " · the summary email wasn't sent — details in the report")
+        self.assertEqual(events[-1]["run_id"], started["run_id"])
+        # The owner merges outside any run: still one event, belonging to none.
+        self.run_engine("merge", self.repo, "Finishes")
+        merged = self.events()["events"][-1]
+        self.assertEqual((merged["kind"], merged["run_id"], merged["summary"], merged["title"]),
+                         ("task_merged", None, "Merged into main", "Finishes"))
+        self.assertEqual(len(self.events()["events"]) - len(events), 1)
+        ids = [e["id"] for e in self.events()["events"]]
+        self.assertEqual(ids, list(range(1, len(ids) + 1)))
+        # Looking at things changes nothing.
+        count = len(ids)
+        for cmd in (["list"], ["plan"], ["brief"], ["settings"], ["maintain"]):
+            self.run_engine(*cmd)
+        self.assertEqual(len(self.events()["events"]), count)
+
+    def test_events_follow_the_owners_language_and_the_source_of_a_task(self):
+        self.usage()
+        self.run_engine("settings", "--set", "language=he")
+        self.add("משימה")
+        with open(os.path.join(self.repo, "BACKLOG.md"), encoding="utf-8") as f:
+            text = f.read()
+        with open(os.path.join(self.repo, "BACKLOG.md"), "w", encoding="utf-8") as f:
+            f.write(text.replace("- details:", "- source: clockwize:abc123\n- details:", 1))
+        self.run_engine("begin")
+        wt = self.run_engine("worktree", self.repo, "משימה")
+        self.commit_in(wt["path"])
+        self.run_engine("finish-task", self.repo, "משימה", "--outcome", "done", "--summary", "נוסף קובץ")
+        self.run_engine("end", "--reason", "5h-full")
+        events = self.events()["events"]
+        self.assertEqual([e["summary"] for e in events], [
+            "הקציר התחיל · ידני", "התחילה לרוץ", "ממתינה לאישור שלך · נוסף קובץ",
+            "משימה אחת הסתיימה · חלון 5 השעות התמלא — ימשיך אחרי האיפוס שלו · 1 מחכות לך"])
+        self.assertEqual([e.get("source") for e in events], [None, "clockwize:abc123", "clockwize:abc123", None])
+        self.assertEqual(events[1]["title"], "משימה")
+
+    def test_the_digest_note_only_when_an_email_was_due_and_did_not_go(self):
+        self.usage()
+        for emailed in ("skipped", "yes"):
+            self.run_engine("begin", "--mode", "auto")
+            self.run_engine("end", "--reason", "queue-empty", "--emailed", emailed)
+        self.assertEqual([e["summary"] for e in self.events()["events"] if e["kind"] == "run_ended"],
+                         ["No task finished · the queue ran out"] * 2)
+
+    def test_the_session_of_a_task_reaches_its_events(self):
+        self.usage()
+        self.add("Needs its session")
+        with open(os.path.join(self.home, "launch.json"), "w") as f:
+            json.dump({"sessionId": "coordinator-1", "launcherPid": os.getpid(), "endedAt": None}, f)
+        self.run_engine("begin")
+        self.assertEqual(self.events()["events"][0]["session_id"], "coordinator-1")
+        wt = self.run_engine("worktree", self.repo, "Needs its session")
+        self.commit_in(wt["path"])
+        self.run_engine("finish-task", self.repo, "Needs its session", "--outcome", "done", "--summary", "x")
+        self.run_engine("end", "--reason", "queue-empty")
+        self.run_engine("merge", self.repo, "Needs its session")
+        events = self.events()["events"]
+        self.assertEqual([e["session_id"] for e in events], ["coordinator-1"] * len(events),
+                         "the merge finds the session history knows")
+
+    def test_an_interrupted_run_still_ends_with_an_event(self):
+        self.usage()
+        self.add("Cut off")
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        env = dict(self.env, HARVEST_RUNNER_PID=str(dead.pid))
+        self.run_engine("begin", env=env)
+        self.run_engine("maintain")
+        events = self.events()["events"]
+        self.assertEqual([e["kind"] for e in events], ["run_started", "run_ended"])
+        self.assertEqual(events[1]["summary"], "No task finished · stopped midway")
+        self.run_engine("maintain")
+        self.assertEqual(len(self.events()["events"]), 2, "once")
+
+    def test_events_are_read_in_pages_from_an_id(self):
+        os.environ["HARVEST_HOME"] = self.home
+        try:
+            h = self.load_engine()
+            for i in range(7):
+                h.append_event("task_started", run_id="r", project="p", title="t%d" % i, summary="s")
+        finally:
+            os.environ.pop("HARVEST_HOME")
+        page = self.events(0, "--limit", "3")
+        self.assertEqual(([e["id"] for e in page["events"]], page["lastId"], page["more"]), ([1, 2, 3], 7, True))
+        page = self.events(3, "--limit", "3")
+        self.assertEqual(([e["id"] for e in page["events"]], page["more"]), ([4, 5, 6], True))
+        page = self.events(6, "--limit", "3")
+        self.assertEqual(([e["id"] for e in page["events"]], page["more"]), ([7], False))
+        self.assertEqual(self.events(7)["events"], [])
+        self.assertEqual(self.events("latest"), {"ok": True, "events": [], "lastId": 7, "more": False})
+        self.assertEqual(self.events(99)["lastId"], 7, "an id past the end tells where the file stands")
+        self.run_engine("events", "--since", "soon", code=2)
+
+    def test_the_events_file_keeps_its_last_lines_and_ids_keep_rising(self):
+        os.environ["HARVEST_HOME"] = self.home
+        try:
+            h = self.load_engine()
+            h.EVENTS_CAP = 5
+            for i in range(12):
+                h.append_event("task_started", run_id="r", project="p", title="t%d" % i, summary="s")
+            with open(os.path.join(self.home, "events.jsonl"), encoding="utf-8") as f:
+                self.assertEqual(len(f.read().splitlines()), 5)
+            self.assertEqual([e["id"] for e in self.events()["events"]], [8, 9, 10, 11, 12])
+            with open(os.path.join(self.home, "events.jsonl"), "a", encoding="utf-8") as f:
+                f.write("{not json\n")
+            h.append_event("run_ended", run_id="r", summary="x")
+            self.assertEqual([e["id"] for e in self.events()["events"]], [9, 10, 11, 12, 13], "a damaged line is dropped")
+            self.assertFalse(h.append_event("nonsense"), "an unknown kind is refused, quietly")
+        finally:
+            os.environ.pop("HARVEST_HOME")
+
+    def test_notify_takes_one_of_three_modes(self):
+        self.assertEqual(self.run_engine("settings")["notify"], "all")
+        for mode in ("needs_me", "run_end", "all"):
+            self.assertEqual(self.run_engine("settings", "--set", "notify=" + mode)["notify"], mode)
+        self.assertIn("notify is one of", self.run_engine("settings", "--set", "notify=never", code=2)["error"])
+        self.assertEqual(self.run_engine("settings")["notify"], "all", "a refused value changes nothing")
+        self.assertEqual(self.run_engine("list")["settings"]["notify"], "all")
+        self.run_engine("settings", "--set", "notify=run_end", env=dict(self.env, HARVEST_UNATTENDED="1"), code=2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

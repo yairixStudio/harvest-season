@@ -7,6 +7,7 @@ overwrite a copy edited in place."""
 
 import argparse
 import calendar
+import fcntl
 import hashlib
 import json
 import os
@@ -34,6 +35,10 @@ SKILL_REFS = os.path.expanduser(os.environ.get("HARVEST_SKILL_REFS", "~/.claude/
 WORKTREE_PREFIX = "harvest-"
 HISTORY = os.path.join(HOME, "history.jsonl")
 TALK = os.path.join(HOME, "talk.json")
+# One line per step of a run or a task, for the widget's notifications (`events --since`). The engine is its only writer.
+EVENTS = os.path.join(HOME, "events.jsonl")
+EVENTS_LOCK = os.path.join(HOME, ".events.lock")
+EVENTS_CAP = 500
 # The owner's own order for the queue (dragged in the widget): task keys "<project>::<title>", first to run first.
 QUEUE_ORDER = os.path.join(HOME, "queue-order.json")
 MERGED_RE = re.compile(r"merged (\d{4}-\d{2}-\d{2})")
@@ -63,7 +68,11 @@ DEFAULT_SETTINGS = {"ownerName": "", "language": "en", "email": "", "emailDigest
                     "fiveReserve": 15, "weeklyReserve": 2,
                     # How many days before its recommended date a task may run. The harvest comes once a week, so
                     # 3 keeps a task within half a week of its date: this harvest if it is closer, else the next.
-                    "earlyDays": 3}
+                    "earlyDays": 3,
+                    # Which steps the widget notifies about: all · needs_me (a question, a failure, work to approve,
+                    # the end of a run) · run_end (only the end of a run).
+                    "notify": "all"}
+NOTIFY_MODES = ("all", "needs_me", "run_end")
 
 SEED_TOKENS_PER_WEEKLY_PCT = 120000
 SEED_TOKENS_PER_FIVE_PCT = 30000
@@ -198,6 +207,30 @@ TEXT = {
     "removed": {"he": "%s · הוסר על ידי הבעלים", "en": "%s · removed by the owner"},
     "no_proposals": {"he": "%s · הוסר — בלי הצעות לפרויקט הזה", "en": "%s · removed — no proposals for this project"},
     "rejected": {"he": "%s · נדחה על ידי הבעלים", "en": "%s · rejected by the owner"},
+    # What the widget's notifications say (events.jsonl `summary`).
+    "ev_run_started": {"he": "הקציר התחיל · %s", "en": "The harvest started · %s"},
+    "ev_task_started": {"he": "התחילה לרוץ", "en": "Started working"},
+    "ev_task_started_on": {"he": "התחילה לרוץ · %s", "en": "Started working · %s"},
+    "ev_waiting_review": {"he": "ממתינה לאישור שלך · %s", "en": "Waiting for your approval · %s"},
+    "ev_blocked": {"he": "צריך תשובה ממך: %s", "en": "Needs an answer from you: %s"},
+    "ev_failed": {"he": "נכשלה · %s", "en": "Failed · %s"},
+    "ev_paused": {"he": "נעצרה: %s · העבודה נשמרה", "en": "Stopped: %s · the work is saved"},
+    "ev_merged": {"he": "מוזגה ל-%s", "en": "Merged into %s"},
+    "ev_done_none": {"he": "אף משימה לא הסתיימה", "en": "No task finished"},
+    "ev_done_one": {"he": "משימה אחת הסתיימה", "en": "1 task done"},
+    "ev_done_many": {"he": "%d משימות הסתיימו", "en": "%d tasks done"},
+    "ev_waiting_you": {"he": "%d מחכות לך", "en": "%d waiting for you"},
+    "ev_no_digest": {"he": "מייל הסיכום לא נשלח — פרטים בדוח", "en": "the summary email wasn't sent — details in the report"},
+    "stop_usage-unreadable": {"he": "לא הצליח לקרוא את המכסה", "en": "couldn't read the quota"},
+    "stop_queue-empty": {"he": "התור התרוקן", "en": "the queue ran out"},
+    "stop_5h-full": {"he": "חלון 5 השעות התמלא — ימשיך אחרי האיפוס שלו", "en": "the 5-hour window filled up — it goes on after that resets"},
+    "stop_model-full": {"he": "המשימות שנשארו מחכות למכסה של מודל", "en": "the tasks left wait for a model's quota"},
+    "stop_signed-out": {"he": "Claude Code לא היה מחובר", "en": "Claude Code was signed out"},
+    "stop_weekly-full": {"he": "המכסה השבועית נוצלה", "en": "the weekly quota is used up"},
+    "stop_cutoff-near": {"he": "קרוב מדי לאיפוס", "en": "too close to the reset"},
+    "stop_too-early": {"he": "מוקדם מדי לפני האיפוס", "en": "too early before the reset"},
+    "stop_interrupted": {"he": "נעצר באמצע", "en": "stopped midway"},
+    "stop_stopped-by-owner": {"he": "נעצר על ידך", "en": "stopped by you"},
 }
 # A failed task's result starts with this marker in either language; a second failure blocks it.
 FAILED_MARKERS = (" · נכשל", " · failed")
@@ -1014,6 +1047,120 @@ def history():
     return out
 
 
+# ---------- events (the widget's notifications) ----------
+
+EVENT_KINDS = ("run_started", "run_ended", "task_started", "task_waiting_review", "task_blocked", "task_failed",
+               "task_paused", "task_merged")
+
+
+def event_lines():
+    """The parsed lines of events.jsonl, oldest first; a damaged line is skipped."""
+    out = []
+    try:
+        with open(EVENTS, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and isinstance(e.get("id"), int):
+                    out.append(e)
+    except OSError:
+        pass
+    return out
+
+
+def append_event(kind, run_id=None, project="", title="", summary="", **extra):
+    """Adds one event to events.jsonl: the next id (always above every earlier one, even after the file was
+    trimmed), the time, the run, what happened and a one-line summary in the owner's language. Several engine
+    processes can write at once (the coordinator, a task's `run-task`, a merge from a conversation), so the id and
+    the append happen under a lock of their own — not on events.jsonl, which a trim replaces. The file keeps the
+    last EVENTS_CAP lines. A failure here never touches the step it reports: the event is simply lost."""
+    try:
+        assert kind in EVENT_KINDS, kind
+        os.makedirs(HOME, exist_ok=True)
+        with open(EVENTS_LOCK, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            kept = event_lines()
+            e = {"id": (kept[-1]["id"] if kept else 0) + 1, "at": iso(now()), "run_id": run_id, "kind": kind,
+                 "project": project, "title": title, "summary": " ".join((summary or "").split())}
+            e.update({k: v for k, v in extra.items() if v})
+            kept.append(e)
+            lines = [json.dumps(x, ensure_ascii=False) + "\n" for x in kept[-EVENTS_CAP:]]
+            if len(kept) > EVENTS_CAP:
+                write_text(EVENTS, "".join(lines))
+            else:
+                with open(EVENTS, "a", encoding="utf-8") as f:
+                    f.write(lines[-1])
+        return e
+    except Exception:
+        return None
+
+
+def current_run_id():
+    """The run now going on (status.runId), or None — a merge the owner does between runs belongs to none."""
+    st = status()
+    return st.get("runId") if st.get("state") == "running" else None
+
+
+def task_session(repo, title):
+    """The newest session history knows for a task."""
+    found = None
+    for h in history():
+        if h.get("sessionId") and h.get("project") == repo and h.get("title") == title:
+            found = h["sessionId"]
+    return found
+
+
+def stop_reason_text(reason):
+    if not reason:
+        return ""
+    key = "stop_usage-unreadable" if reason.startswith("usage-unreadable") else "stop_" + reason
+    return tr(key) if key in TEXT else reason
+
+
+def waiting_count():
+    tasks, _ = all_tasks(ratio())
+    return sum(1 for t in tasks if t["status"] == "blocked" or (t["status"] == "done" and t.get("branchState") == "unmerged"))
+
+
+def run_summary(last):
+    """The one line that ends a run: how many tasks finished, why it stopped, what waits for the owner."""
+    n = last.get("done") or 0
+    parts = [tr("ev_done_none") if n == 0 else tr("ev_done_one") if n == 1 else tr("ev_done_many", n)]
+    if stop_reason_text(last.get("stopReason")):
+        parts.append(stop_reason_text(last["stopReason"]))
+    waiting = waiting_count()
+    if waiting:
+        parts.append(tr("ev_waiting_you", waiting))
+    # The weekly digest is the owner's sign that the system is alive: say so when it didn't go out.
+    if last.get("mode") == "auto" and last.get("final") and last.get("emailed") is False:
+        parts.append(tr("ev_no_digest"))
+    return " · ".join(parts)
+
+
+def run_ended_event(last):
+    try:
+        append_event("run_ended", run_id=status().get("runId"), summary=run_summary(last),
+                     session_id=live_launch_session())
+    except Exception:
+        pass
+
+
+def cmd_events(a):
+    """The notification events after id --since (`latest`: none, only where the file stands), oldest first, at most
+    --limit; `lastId` is the newest id in the file (0 when there are none), `more` says the page was cut short.
+    Read-only: the widget asks here instead of reading events.jsonl itself."""
+    lines = event_lines()
+    last = lines[-1]["id"] if lines else 0
+    if a.since == "latest":
+        emit({"ok": True, "events": [], "lastId": last, "more": False})
+    if not a.since.lstrip("-").isdigit():
+        fail("--since takes an event id or `latest`")
+    fresh = [e for e in lines if e["id"] > int(a.since)]
+    emit({"ok": True, "events": fresh[:a.limit], "lastId": last, "more": len(fresh) > a.limit})
+
+
 def live_launch_session():
     lk = read_json(LAUNCH, {}) or {}
     return lk.get("sessionId") if lk.get("sessionId") and not lk.get("endedAt") and alive(lk.get("launcherPid")) else None
@@ -1166,6 +1313,8 @@ def cmd_settings(a):
                 if not v.strip().isdigit() or not 0 <= int(v) <= 7:
                     fail("earlyDays takes a whole number of days, 0–7")
                 v = int(v)
+            elif k == "notify" and v not in NOTIFY_MODES:
+                fail("notify is one of " + ", ".join(NOTIFY_MODES))
             elif k in ("emailDigest", "switchMidTask"):
                 v = v.strip().lower() in ("1", "true", "yes", "on")
             elif k == "language" and v not in LANGUAGES:
@@ -1551,8 +1700,11 @@ def cmd_begin(a):
     if st.get("cycle"):
         st["cycle"]["runs"] = st["cycle"].get("runs", 0) + 1
     st.update({"state": "running", "mode": a.mode, "runStartedAt": iso(now()), "current": None,
-               "doneThisRun": [], "scansThisRun": 0, "scannedThisRun": [], "usageAtStart": u})
+               "doneThisRun": [], "scansThisRun": 0, "scannedThisRun": [], "usageAtStart": u,
+               "runId": "run-" + datetime.now().strftime("%Y%m%d-%H%M%S")})
     save_status(st)
+    append_event("run_started", run_id=st["runId"], summary=tr("ev_run_started", tr("mode_" + a.mode)),
+                 session_id=live_launch_session())
     emit({"ok": True, "status": st})
 
 
@@ -1574,7 +1726,7 @@ def worktree_dir(repo, name):
     return os.path.join(repo, ".claude", "worktrees", WORKTREE_PREFIX + name)
 
 
-def start_task(repo, title, model, usage_json):
+def start_task(repo, title, model, usage_json, session_id=None):
     _, t = find_task(repo, title)
     if (t["fields"].get("status") or "open") != "open":
         fail("only open tasks can be started")
@@ -1611,6 +1763,9 @@ def start_task(repo, title, model, usage_json):
     st = status()
     st["current"] = current
     save_status(st)
+    append_event("task_started", run_id=current_run_id(), project=display_name(repo), title=title,
+                 summary=tr("ev_task_started_on", model) if model else tr("ev_task_started"),
+                 session_id=session_id or live_launch_session(), branch=branch, source=t["fields"].get("source"))
     return current
 
 
@@ -1704,6 +1859,13 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
         st["cycle"].setdefault(key, []).append(record)
     st["current"] = None
     save_status(st)
+    kept = branch if outcome == "done" or (outcome in ("blocked", "paused") and commits) else None
+    kind, text = {"done": ("task_waiting_review", tr("ev_waiting_review", summary)),
+                  "blocked": ("task_blocked", tr("ev_blocked", question if outcome == "blocked" else "")),
+                  "paused": ("task_paused", tr("ev_paused", summary))}.get(outcome, ("task_failed", tr("ev_failed", summary)))
+    append_event(kind, run_id=current_run_id(), project=display_name(repo), title=title, summary=text,
+                 question=question if outcome == "blocked" else None, session_id=session_id, branch=kept,
+                 source=t["fields"].get("source"))
     return {"ok": True, "outcome": record["outcome"], "commits": commits, "backlog": updates,
             "branch": record["branch"], "summary": summary}
 
@@ -1743,6 +1905,7 @@ def end_run(reason, final, emailed, report=None):
     lk = read_lock()
     if lk and (not lk.get("pid") or lk.get("pid") == runner_pid() or not alive(lk.get("pid"))):
         os.remove(LOCK)
+    run_ended_event(st["lastRun"])
     return st["lastRun"]
 
 
@@ -1792,6 +1955,7 @@ def cmd_maintain(a):
                          "stopReason": "interrupted", "final": False, "emailed": False}
         st.update({"state": "idle", "current": None})
         save_status(st)
+        run_ended_event(st["lastRun"])
         report["interrupted"] = True
     if not lock_is_live(read_lock()):
         leftovers = []
@@ -2317,6 +2481,9 @@ def cmd_merge(a):
     head = git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
     git(repo, "branch", "-d", branch)
     set_fields(repo, v["title"], {"result": v["result"] + " · merged " + today()})
+    append_event("task_merged", run_id=current_run_id(), project=display_name(repo), title=v["title"],
+                 summary=tr("ev_merged", base), session_id=task_session(repo, v["title"]), branch=branch,
+                 source=t["fields"].get("source"))
     emit({"ok": True, "project": repo, "title": v["title"], "branch": branch, "base": base, "head": head})
 
 
@@ -2681,8 +2848,8 @@ def cmd_run_task(a):
     history). Takes minutes — run it in the background and wait for it."""
     import uuid
     repo = os.path.abspath(a.project)
-    cur = start_task(repo, a.title, a.model, a.usage_json)
     session_id = str(uuid.uuid4())
+    cur = start_task(repo, a.title, a.model, a.usage_json, session_id)
     os.makedirs(TASK_RESULTS, exist_ok=True)
     result_path = os.path.join(TASK_RESULTS, session_id + ".json")
     prompt = fill_template("task-agent-prompt.md", {
@@ -2861,6 +3028,11 @@ def main():
     p = sub.add_parser("proposals")
     p.add_argument("project"); p.add_argument("state", choices=("on", "off"))
     p.set_defaults(fn=cmd_proposals)
+
+    p = sub.add_parser("events", help="the notification events after an id, as JSON")
+    p.add_argument("--since", default="0", metavar="ID", help="an event id, or `latest` for none")
+    p.add_argument("--limit", type=int, default=100)
+    p.set_defaults(fn=cmd_events)
 
     p = sub.add_parser("settings")
     p.add_argument("--set", action="append", metavar="KEY=VALUE")

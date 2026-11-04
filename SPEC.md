@@ -121,8 +121,9 @@ BACKLOG.md itself. Files under `~/.claude/harvest/`, one writer each:
 - `config.json` — written by the widget: `auto` (bool), `pulses` (0 = automatic, 1–6), `batteryGuard` (bool,
   default true) and `minBattery` (5–80, default 10), and `leadHours`
   (pulses × 5 + 1, automatic counting as 6 — the engine refuses an auto run started earlier than that).
-  A file from before pulses (`leadHours` only) reads as ⌈leadHours / 5⌉ pulses.
-- `status.json`, `calibration.md`, `history.jsonl`, `launch.json`, `.lock`,
+  A file from before pulses (`leadHours` only) reads as ⌈leadHours / 5⌉ pulses. `eventsSeen` — the id of the newest
+  step event the widget has handled (see "Step notifications").
+- `status.json`, `calibration.md`, `history.jsonl`, `events.jsonl`, `launch.json`, `.lock`,
   `worktrees/`, BACKLOG.md edits — written by the engine only. `logs/run-*.jsonl` — each run's stream-json
   output, newest 20 kept.
 
@@ -273,9 +274,9 @@ Stop sends SIGTERM to the running task session's group and to the launcher's
 group (the launcher forwards it to the coordinator's terminal session), SIGKILL
 after 8 s. A launcher that outlived a
 widget restart is still shown as ours, watchable and stoppable. On exit:
-`maintain` (recovers lock, worktrees, partial branches), refresh, a macOS
-notification when the panel is hidden (and always when an automatic cycle ended
-without its digest email).
+`maintain` (recovers lock, worktrees, partial branches), refresh, and the
+`run_ended` step notification (see "Step notifications"; it also says when an
+automatic cycle ended without its digest email).
 
 Automatic runs (checked every 30 s) come in **pulses**, one 5-hour window each: when `auto` is on, usage
 is under 15 min old, and the weekly reset is between 20 min and pulses × 5 h + 30 min away — once per weekly
@@ -377,7 +378,8 @@ at a sign-out"), the coordinator ends the run as `signed-out`. `--snapshot … -
 latest listing): **General** — language (he/en: `setLanguage`, stored in the harvest settings
 when installed, else in the widget's `UILanguage` default; the panel, menus and help follow
 at once), start at login, menu bar mode (these two moved here from the ⋯ menu). **Harvest**
-(installed) — automatic runs, pulses (`PulsesPicker`, `config.json`), the next harvest and the capacity, and
+(installed) — automatic runs, "Notifications" (`notify`: a menu of three, `settings --set notify=…`, see "Step
+notifications"), pulses (`PulsesPicker`, `config.json`), the next harvest and the capacity, and
 "kept free for you": the 5-hour reserve (0–60, step 5) and the weekly one (0–30), `settings --set
 fiveReserve=… / weeklyReserve=…` on each step — "Dates" (`earlyDays`, 0–7: how many days before a recommended date) — and "Battery": "Don't start on a low battery" (`batteryGuard`) and
 "Starts only above N % or when the Mac is plugged in" (5–80, step 5). **Models** — a model per task size (`settings --set models=…`),
@@ -440,6 +442,52 @@ earlier name (`harvest-quota`, now `harvest-season`) goes on upgrade. A block is
 marker alone, so one written under an earlier wording is replaced like any other.
 `./install` upgrades a harvest the installer installed (not a hand-made one) and
 reports conflicts without writing.
+
+### Step notifications
+
+While the harvest works, the widget tells the owner what happens, one macOS notification per step. The engine
+records the steps; the widget only asks.
+
+**Events** — `events.jsonl` in the harvest folder, one JSON line per step, written only by the engine
+(`append_event`, under a lock of its own — `.events.lock` — so concurrent engine processes get distinct ids), the
+last 500 lines kept. A failure to write one never touches the step it reports. Fields:
+`{id, at, run_id, kind, project, title, summary, question?, session_id?, branch?, source?}` — `id` rises by one and
+never repeats, even after a trim; `run_id` is `status.runId`, set by `begin` (`run-YYYYmmdd-HHMMSS`; null for a merge
+the owner does between runs); `project` / `title` are the project's name and the task's title (empty for a run);
+`summary` is one line in the owner's language (the same `TEXT` table as everything else the engine writes);
+`session_id` is the session that did the task (a run-task's own session, else the coordinator's; a merge finds it in
+`history.jsonl`); `source` is the task's `source` field in BACKLOG.md, when it has one (an external task, e.g.
+`clockwize:<id>`), copied as it is.
+
+| kind | written by | when |
+|---|---|---|
+| `run_started` | `begin` | a run begins |
+| `task_started` | `worktree` / `run-task` | a task's worktree and branch are ready (a task going on from a pause too) |
+| `task_waiting_review` | `finish-task` | done with commits: the branch waits for approval |
+| `task_blocked` | `finish-task` | stopped on a question (`question`) |
+| `task_failed` | `finish-task` | failed (also: "done" with no commit; also the second failure that blocks the task) |
+| `task_paused` | `finish-task` | a usage limit stopped it; its work is saved |
+| `task_merged` | `merge` | the owner's approved merge |
+| `run_ended` | `end`, a limit ending the coordinator, `maintain` (a run that was cut off) | the run is over: how many tasks finished, why it stopped, how many wait for the owner, and "the summary email wasn't sent" when an automatic final run's digest was due and didn't go |
+
+`claude-harvest events [--since <id>|latest] [--limit N]` prints `{ok, events, lastId, more}` — the events after that
+id, oldest first, at most N (default 100); `latest` returns none and only where the file stands. It reads and writes
+nothing else, so it works unattended too.
+
+**The widget** (`pollEvents`, "Step notifications" in the code) asks for events after `config.json`'s `eventsSeen`:
+when the listing is refreshed (every 30 s tick while a harvest runs or the panel is open, else every 2 minutes —
+local calls, not the API), after a run starts, and when a run ends. It saves the newest id before posting, so a
+notification never comes twice; with no id saved it only notes where the events stand (nothing old is replayed), and
+an id past the engine's newest (the file started over) is replaced by the engine's. At most the newest 8 of a page are
+posted. The setting `notify` (engine settings, default `all`) filters at the widget: `all`, `needs_me` (`task_blocked`,
+`task_failed`, `task_waiting_review`, `run_ended`), `run_end` (`run_ended` only — the behavior from before this
+existed). A run's end is one notification, the `run_ended` one; the widget's old end-of-run notification is gone, so
+it no longer waits for the panel to be hidden. Title: the project and the task title (a run: the app's name); body:
+`summary`; `threadIdentifier` = `run_id` (`harvest` when none), identifier `event-<id>`, category `event`. Between
+22:00 and 08:00 local time there is no sound; otherwise the default sound (these are the only notifications with
+one). A click opens the task's session the way the Done list does — the live Remote Control session when the task (or
+the coordinator) still runs, else `openSessionInApp(session_id)`; a run event with no session opens the newest run.
+`--test-notification` posts one sample and exits (a bare build uses the same fallback as every notification there).
 
 ### Reminder and conversation
 
