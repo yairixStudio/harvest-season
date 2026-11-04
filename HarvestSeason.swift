@@ -532,7 +532,28 @@ struct HSettings: Decodable, Equatable {
     var weeklyReserve: Double?
     /// How many days before its recommended date a task may run.
     var earlyDays: Int?
+    /// The outside task sources (Clockwize) this Mac can use, and whether each is on.
+    var sourceStatus: [HSource]?
 }
+
+/// A source of requests from outside (`claude-harvest pull`): its tool is `cli`; `found` = the tool exists.
+struct HSource: Decodable, Equatable {
+    var type: String
+    var enabled: Bool
+    var cli: String?
+    var found: Bool
+}
+
+/// What `claude-harvest pull` answered: whether every source could be asked, and the tasks to start now.
+struct HPullResult: Decodable {
+    struct RunNow: Decodable { var project: String; var title: String }
+    var ok: Bool?
+    var busy: Bool?
+    var requests: [HPullRequest]?
+    var runNow: [RunNow]?
+}
+
+struct HPullRequest: Decodable { var outcome: String? }
 
 struct HFallback: Codable, Equatable {
     var to: String
@@ -1146,6 +1167,7 @@ protocol WidgetActions: AnyObject {
     func showSettings()
     func removeProposal(_ task: HTask)
     func setProposals(project: String, name: String, on: Bool)
+    func setSource(_ type: String, on: Bool)
     func setLanguage(hebrew: Bool)
     func saveHarvestSettings(_ values: [String])
     func loadPrompts()
@@ -2980,7 +3002,7 @@ struct HelpView: View {
         ]),
         ("הגדרות", [
             "חמש לשוניות בראש החלון.",
-            "**כללי:** שפה, הפעלה בכניסה למחשב, בשורת התפריט או כווידג'ט צף; השם שלך, מייל לסיכום שבועי ותיקיית הקציר (שומרים ב\"שמור\"); עזרה והסרת הקציר.",
+            "**כללי:** שפה, הפעלה בכניסה למחשב, בשורת התפריט או כווידג'ט צף; השם שלך, מייל לסיכום שבועי ותיקיית הקציר (שומרים ב\"שמור\"); **בקשות מבחוץ** (רק כשהכלי של Clockwize מותקן); עזרה והסרת הקציר.",
             "**קציר:** קציר אוטומטי, כמה פעימות לפני האיפוס, **שמירת מקום בשבילך** — כמה אחוזים הקציר לא ייגע בהם בחלון ה־5 שעות (כדי שתוכל לעבוד) ובמכסה השבועית — **תאריכים**: כמה ימים לפני מועד מומלץ הקציר יכול לקחת משימה — ו**סוללה**: לא להתחיל אוטומטית על סוללה חלשה, ומאיזה אחוז.",
             "**מודלים:** מודל לכל גודל משימה, ו**מעבר בין מודלים** — מאיזה אחוז של המכסה של Fable עוברים, לאיזה מודל (או \"בלי\": המשימות יחכו), והאם לעבור גם באמצע משימה.",
             "**פרויקטים:** מתג \"הצעות\" לכל פרויקט רשום — כבוי = בלי הצעות ממנו.",
@@ -2996,6 +3018,13 @@ struct HelpView: View {
             "כל סשן של Claude או Codex יכול לרשום משימה לבקלוג של הפרויקט — גם כשאתה אומר לו \"תוסיף לבקלוג\" או \"לא עכשיו\".",
             "כשאתה נוכח ומסכים היא נכנסת **לתור**. כשסוכן עובד לבד היא נכנסת **להצעות**.",
             "אפשר לתת לה זמן: \"תכניס לבקלוג בדיקה עוד חודש\". קלוד רושם תאריך מדויק, המשימה ממתינה ב\"ממתינות לתאריך\" ורצה לבד כשהוא מגיע.",
+        ]),
+        ("בקשות מבחוץ", [
+            "אם אתה עובד עם Clockwize (אפליקציית המשימות), אפשר ללחוץ שם **\"טפל עם Claude Code\"** על משימה, לכתוב מה לעשות, לבחור תיקייה ו**עכשיו** או **בקציר הבא**. הווידג'ט שולף את הבקשה, והיא נכנסת **לתור** של הפרויקט — הלחיצה שלך היא האישור.",
+            "זה כבוי כברירת מחדל, ומדליקים ב**הגדרות ← כללי ← בקשות מבחוץ**. המתג מופיע רק כשהכלי של Clockwize בשורת הפקודה מותקן במק. הקציר מדבר איתו דרך הכלי הזה, שמחזיק את ההתחברות בעצמו — הקציר לא שומר שם שום מפתח. זה הקשר היחיד של הקציר עם שירות חיצוני, והוא פועל אחת לשתי דקות כשהמק ער.",
+            "ההוראה היא מה שכתבת. מה ש-Clockwize יודע על המשימה (שם, תיאור, לקוח) מצורף כמידע בלבד: הסוכן לא מבצע הוראות שכתובות שם.",
+            "כל שלב חוזר ל-Clockwize: התחיל, מחכה לבדיקה (עם הענף והסשן), שאלה, כישלון, ומוזג. תיקייה שלא נמצאה, או שאינה ריפו git, מחזירה שאלה לשם.",
+            "**עכשיו** מריץ רק את המשימה הזאת מיד. אם קציר רץ באותו רגע היא תרוץ בו או מיד אחריו; אם אין מכסה או שאין חיבור ל-Claude Code, היא נשארת בתור לקציר הבא. כשאין חיבור לשירות, הנקודה למעלה הופכת לצהובה והעדכון נשלח שוב בהמשך.",
         ]),
     ]
 
@@ -3072,7 +3101,7 @@ struct HelpView: View {
         ]),
         ("Settings", [
             "Five tabs at the top of the window.",
-            "**General:** language, start at login, the menu bar or a floating widget; your name, an email for the weekly summary and the harvest folder (kept with \"Save\"); help and removing the harvest.",
+            "**General:** language, start at login, the menu bar or a floating widget; your name, an email for the weekly summary and the harvest folder (kept with \"Save\"); **requests from outside** (only when Clockwize's tool is installed); help and removing the harvest.",
             "**Harvest:** the automatic harvest, how many pulses before the reset, **kept free for you** — how many percent the harvest leaves alone in the 5-hour window (so you can work) and in the weekly quota — **dates**: how many days before a recommended date the harvest may take a task — and **battery**: don't start automatically on a low battery, and from what percent.",
             "**Models:** a model per task size, and **switching models** — from what percent of Fable's own quota to switch, to which model (or \"None\": the tasks wait), and whether to switch mid-task too.",
             "**Projects:** a \"Proposals\" switch per registered project — off = no proposals from it.",
@@ -3088,6 +3117,13 @@ struct HelpView: View {
             "Any Claude or Codex session can add a task to the project's backlog — also when you tell it \"add to backlog\" or \"not now\".",
             "When you're there and agree, it goes into the **Queue**. When an agent works on its own, it goes into **Proposals**.",
             "You can give it a time: \"put a check on this in the backlog in a month\". Claude records an exact date, the task sits in \"Waiting for a date\" and runs by itself when it comes.",
+        ]),
+        ("Requests from outside", [
+            "If you use Clockwize (the task app), you can press **\"Handle with Claude Code\"** on a task there, write what to do, choose a folder and **now** or **next harvest**. The widget picks the request up, and it goes into the project's **Queue** — your press is the approval.",
+            "It is off by default; turn it on in **Settings → General → Requests from outside**. The switch shows only when Clockwize's command-line tool is installed on this Mac. The harvest talks to Clockwize through that tool, which keeps its own sign-in — the harvest stores no key of it. This is the harvest's only link to an outside service, and it runs once every two minutes while the Mac is awake.",
+            "The instruction is what you wrote. What Clockwize knows about the task (name, description, client) is attached as information only: the agent never follows instructions written there.",
+            "Every step goes back to Clockwize: started, waiting for review (with the branch and the session), a question, a failure, and merged. A folder that wasn't found, or isn't a git repository, sends a question back.",
+            "**Now** runs only that task right away. If a harvest is running at that moment it runs in it or right after it; if there is no quota or Claude Code is signed out, it stays queued for the next harvest. When the service can't be reached, the dot at the top turns yellow and the update is sent again later.",
         ]),
     ]
 
@@ -3548,6 +3584,12 @@ struct SettingsView: View {
     static let width: CGFloat = 600
 
     var tabs: [SettingsTab] { m.harvestInstalled ? SettingsTab.allCases : [.general] }
+    /// The outside sources worth showing: their tool is on this Mac, or the owner already turned them on.
+    var sources: [HSource] { (m.listing.settings?.sourceStatus ?? []).filter { $0.found || $0.enabled } }
+    var tabHeight: CGFloat {
+        let tab = tabs.contains(s.tab) ? s.tab : .general
+        return tab.height + (tab == .general && m.harvestInstalled && !sources.isEmpty ? 130 : 0)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -3563,7 +3605,7 @@ struct SettingsView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: Self.width, height: (tabs.contains(s.tab) ? s.tab : .general).height)
+        .frame(width: Self.width, height: tabHeight)
         .font(.system(size: 13))
         .environment(\.layoutDirection, uiHebrew ? .rightToLeft : .leftToRight)
         .focusEffectDisabled()
@@ -3617,6 +3659,23 @@ struct SettingsView: View {
                             s.saved = true
                         }
                         .buttonStyle(.borderedProminent)
+                    }
+                }
+                if !sources.isEmpty {
+                    Section {
+                        ForEach(sources, id: \.type) { source in
+                            Toggle(isOn: Binding(get: { source.enabled }, set: { m.actions?.setSource(source.type, on: $0) })) {
+                                titled(sourceTitle(source.type),
+                                       L("בקשות \"טפל עם Claude Code\" שמשם נכנסות לתור, והקציר מדווח לשם.",
+                                         "\"Handle with Claude Code\" requests from there join the queue, and the harvest reports back."))
+                            }
+                        }
+                    } header: {
+                        Text(L("בקשות מבחוץ", "Requests from outside"))
+                    } footer: {
+                        Text(L("כבוי עד שמדליקים. הקשר עובר דרך הכלי של השירות בשורת הפקודה, שמחזיק את ההתחברות בעצמו; הקציר לא שומר מפתח. אחת לשתי דקות כשהמק ער.",
+                               "Off until you turn it on. The link goes through the service's own command-line tool, which keeps its own sign-in; the harvest stores no key. Once every two minutes while the Mac is awake."))
+                            .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 Section {
@@ -3725,6 +3784,13 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    func sourceTitle(_ type: String) -> String {
+        switch type {
+        case "clockwize": return "Clockwize"
+        default: return type.capitalized
+        }
     }
 
     // MARK: Models
@@ -4113,6 +4179,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     /// to catch it while it was running.
     var handledLaunchId: String?
     var listingLoaded = false
+    var pulling = false
+    var pulledOnce = false
+    var pullProblem = false
     /// `--pretend-weekly-reset-in <minutes>`: test hook that moves the weekly
     /// reset close, so the automatic harvest can be exercised on any day.
     var pretendWeeklyReset: Date?
@@ -4207,6 +4276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         }
         tick.tolerance = 5
         pollAgainAfterWake()
+        pullAfterWake()
         closeDropDownOnOutsideClick()
         signal(SIGUSR1, SIG_IGN)
         let usr1 = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
@@ -4277,6 +4347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         nudgeTick()
         dateNudgeTick()
         signInTick()
+        pullTick()
     }
 
     /// The right-click menu — built only here, the same in both modes except that menu bar mode
@@ -4740,6 +4811,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         guard let data = try? Data(contentsOf: harvestHome.appendingPathComponent("usage.json")),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return parseDate(obj["fetchedAt"])
+    }
+
+    // MARK: Requests from outside
+
+    /// A source (Clockwize) is on and its tool is there: only then is anything asked, so a Mac without it
+    /// never starts an engine run for this.
+    var sourcesOn: Bool { model.listing.settings?.sourceStatus?.contains { $0.enabled && $0.found } == true }
+
+    /// Every 4th tick (about 2 minutes), and once as soon as the first listing is in.
+    func pullTick() {
+        guard listingLoaded, model.harvestInstalled else { return }
+        if !pulledOnce || tickCount % 4 == 0 {
+            pulledOnce = true
+            pullRequests()
+        }
+    }
+
+    /// When the Mac wakes: a pull a few seconds later, once the network is back.
+    func pullAfterWake() {
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { self?.pullRequests() }
+        }
+    }
+
+    /// `claude-harvest pull`: quietly. One at a time; a failure changes only the live dot — yellow, and never
+    /// over a red one (which is about Claude Code, and needs the owner).
+    func pullRequests() {
+        guard model.harvestInstalled, sourcesOn, !pulling else { return }
+        pulling = true
+        runEngine(["pull"]) { [weak self] data in
+            guard let self else { return }
+            self.pulling = false
+            let result = data.flatMap { try? JSONDecoder().decode(HPullResult.self, from: $0) }
+            self.pullEnded(result)
+        }
+    }
+
+    func pullEnded(_ result: HPullResult?) {
+        let fine = result?.ok == true || result?.busy == true
+        if !fine {
+            pullProblem = true
+            if model.dotColor != .systemRed {
+                setStatus(.systemYellow, L("אין חיבור לבקשות מבחוץ — מנסה שוב", "Can't reach the outside requests — trying again"))
+            }
+            return
+        }
+        if pullProblem {
+            pullProblem = false
+            if model.dotColor == .systemYellow, pollProblem == nil { setStatus(.systemGreen, L("מחובר", "Connected")) }
+        }
+        if (result?.requests ?? []).contains(where: { $0.outcome != "known" }) || !(result?.runNow ?? []).isEmpty {
+            refreshListing { [weak self] in self?.startRequested(result?.runNow ?? []) }
+        }
+    }
+
+    /// The requests that asked to run now: one run, limited to those tasks (the same as ▶ on each), started
+    /// only when nothing stands in the way — otherwise the engine offers them again in a while.
+    func startRequested(_ wanted: [HPullResult.RunNow]) {
+        let tasks = model.listing.queue.filter { t in wanted.contains { $0.project == t.project && $0.title == t.title } }
+        guard !tasks.isEmpty, !runner.isRunning, !model.harvestActive, model.signIn == nil, claudeExecutable() != nil else { return }
+        launchHarvest(mode: "manual", only: tasks)
+    }
+
+    func setSource(_ type: String, on: Bool) {
+        runEngine(["source", type, on ? "on" : "off"]) { [weak self] _ in
+            self?.refreshListing { [weak self] in
+                guard let self else { return }
+                if on { self.pullRequests() }
+            }
+        }
     }
 
     // MARK: Harvest
@@ -5810,7 +5951,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         }
     }
 
-    /// `--snapshot-settings <png> [--tab general|harvest|models|projects|texts] [--light] [--he|--en]`:
+    /// `--snapshot-settings <png> [--tab general|harvest|models|projects|texts] [--demo] [--light] [--he|--en]`:
     /// one tab of the settings window, from the current listing — and exits.
     func snapshotSettings(to path: String) {
         let args = CommandLine.arguments
@@ -5823,6 +5964,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         }
         runEngine(["list"]) { data in
             if let data = data, let listing = try? JSONDecoder().decode(HListing.self, from: data) { self.model.listing = listing }
+            // --demo: as if Clockwize's tool were on this Mac and the switch on (the installed engine may predate it).
+            if args.contains("--demo") {
+                self.model.listing.settings?.sourceStatus = [HSource(type: "clockwize", enabled: true, cli: "clockwize", found: true)]
+            }
             self.settingsModel.load(self.model.listing.settings)
             runEngine(["prompts"]) { data in
                 self.takePrompts(data)

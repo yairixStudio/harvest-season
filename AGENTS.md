@@ -25,7 +25,7 @@ Nothing personal goes into `harvest/`. Who the owner is — name, language, emai
 - The engine and the installer have tests; both must pass:
   `python3 harvest/home/bin/test_harvest.py` and `python3 harvest/test_install.py` (the latter only ever touches throwaway homes).
 - The app has no test suite. Build it with zero warnings (`swiftc -O -o HarvestSeason HarvestSeason.swift`) and look at it — the snapshot flags render a window into a PNG and exit, from saved data, without touching the running app or the network:
-  `--snapshot <png> [--expand] [--not-installed] [--demo]` (the panel; `--demo` uses made-up data, as in `docs/`), `--snapshot-menubar`, `--snapshot-help`, `--snapshot-settings`, `--snapshot-setup [--review] [--done]`, `--snapshot-tasks [--filter <tab>] [--select <row>] [--demo]` (the all-tasks window); `--rejecting [all]` opens the reject form, `--scheduling` the dates form of the row chosen by `--select`, and `--confirming unqueue|clear` an inline question, in `--snapshot` and `--snapshot-tasks`; each takes `--light` and `--he` / `--en`. Open the images and read them.
+  `--snapshot <png> [--expand] [--not-installed] [--demo]` (the panel; `--demo` uses made-up data, as in `docs/`), `--snapshot-menubar`, `--snapshot-help`, `--snapshot-settings [--demo]`, `--snapshot-setup [--review] [--done]`, `--snapshot-tasks [--filter <tab>] [--select <row>] [--demo]` (the all-tasks window); `--rejecting [all]` opens the reject form, `--scheduling` the dates form of the row chosen by `--select`, and `--confirming unqueue|clear` an inline question, in `--snapshot` and `--snapshot-tasks`; each takes `--light` and `--he` / `--en`. Open the images and read them.
 - Only one copy may run: two double the API polling and stack two panels. `./start` quits the previous bare build; the launchd copy is managed by `./install`.
 - A running app: `kill -USR1 $(pgrep -x HarvestSeason)` shows or hides the panel; `kill -USR2 …` runs the queue now or stops a run.
 - `HarvestSeason`, `HarvestSeason.app` and `__pycache__` are build output — never commit them.
@@ -54,7 +54,7 @@ Nothing personal goes into `harvest/`. Who the owner is — name, language, emai
 
 - Tokens are never logged or printed. The access token goes only to `api.anthropic.com`; the refresh token is never used.
 - The app only reads Claude Code's login and never renews or writes it: a refresh grant rotates the refresh token, and every running `claude` holding the old one gets signed out (the repeated sign-outs fixed 2026-10-12). A lapsed token waits, yellow, for Claude Code to renew it.
-- No analytics, no crash reporting, no network calls to anyone but Anthropic.
+- No analytics, no crash reporting, no network calls to anyone but Anthropic. The one opt-in exception: an outside task source (`pull`, off by default) — the harvest runs that service's own command-line tool, which holds its own sign-in; the harvest never stores or sends a token of it. Nothing personal about any service goes into this repository.
 - Harvest runs are unattended: they keep `HARVEST_UNATTENDED=1`, their own process group (so Stop reaches every child) and `--permission-mode auto`. No flag that skips permissions; the app never pushes, merges or deletes.
 
 ## Commits

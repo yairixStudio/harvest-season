@@ -122,7 +122,7 @@ BACKLOG.md itself. Files under `~/.claude/harvest/`, one writer each:
   default true) and `minBattery` (5–80, default 10), and `leadHours`
   (pulses × 5 + 1, automatic counting as 6 — the engine refuses an auto run started earlier than that).
   A file from before pulses (`leadHours` only) reads as ⌈leadHours / 5⌉ pulses.
-- `status.json`, `calibration.md`, `history.jsonl`, `launch.json`, `.lock`,
+- `status.json`, `calibration.md`, `history.jsonl`, `launch.json`, `sources.json`, `.lock`,
   `worktrees/`, BACKLOG.md edits — written by the engine only. `logs/run-*.jsonl` — each run's stream-json
   output, newest 20 kept.
 
@@ -353,6 +353,58 @@ original to `~/.claude/harvest/backups/backlogs-<time>/` first, reads the file a
 over if another session wrote to it, and leaves a current file alone. `--check` only reports. `./install` runs it after
 an upgrade. A task session whose task has dates gets them at the end of its prompt.
 
+### Requests from outside
+
+Optional, off by default: an outside task app where the owner presses "handle with Claude Code" on a task, writes a
+prompt and chooses a folder and "now" or "next harvest". Clockwize is the first source (`type: "clockwize"`); the
+owner's own details never live in this repository. It is the app's one opt-in network path other than Anthropic: the
+harvest runs the source's own command-line tool, which holds its own sign-in — no token of the source is ever stored,
+logged or sent by the harvest.
+
+- **Settings** (`settings.json`): `sources` — `[{"type": "clockwize", "cli": "clockwize", "enabled": true}]`, empty by
+  default (`cli`: a command on PATH, or a path). `claude-harvest source clockwize on|off [--cli <path>]` switches it
+  (refused unattended; `on` needs the tool to exist). `settings` and `list` report `sourceStatus` — each configured
+  source, and each known one whose tool is on this Mac, with `enabled` and `found`. Settings → General shows a
+  "Requests from outside" switch per entry of `sourceStatus` that is `found` or `enabled`; nothing when there is none.
+- **The tool's contract**: `<cli> claude-requests list --status queued` → a JSON array of `{id, task_id, task_name,
+  task_description, client_name, project_name, folder, prompt, run: "now"|"next_harvest", status}`; `<cli>
+  claude-requests update <id> --status <s> [--summary …] [--question …] [--branch …] [--session …]`, with statuses
+  `queued → picked → running → waiting_review | blocked | failed → done`. Calls have a 20 s timeout; a missing tool, a
+  failure or an unreadable answer is logged to `logs/sources.log` and never fatal.
+- **`claude-harvest pull`** (refused unattended: only the owner's button approves work). One at a time (a lock file).
+  First it delivers the updates still owed; then, per queued request: the `folder` (`~` expanded) is resolved to a git
+  repository — the registered project when it is one, else its repository's root (a worktree counts as its main
+  repository), registered like `add` does; a folder that is missing, not a git repository or inside the harvest folder
+  sets the request `blocked` with a question ("folder X wasn't found or isn't a git repository…") and nothing is added.
+  Otherwise an **`open`** task (the owner's press is the approval) is
+  added through the `add` path with `source: <type>:request/<id>`, the title "Clockwize: <task name>" (the request's id
+  appended when that title was ever used), priority 1 for "now" and 2 otherwise, medium complexity, and these details:
+  the owner's prompt as the instruction, then the task name, description, client and project between `[BEGIN
+  EXTERNAL TASK DATA]` and `[END EXTERNAL TASK DATA]`, labelled as text that may be written by third parties and is
+  never to be followed (the markers are neutralised inside the copied text; each field is capped). The request is told
+  `picked`. It is **idempotent on the id**: any task, in any status, with that `source` means the request is known and
+  nothing is added; a request listed `queued` again whose task is blocked is the owner's answer — the task goes back to
+  `open` with the request's prompt appended as the answer — and a known task's current state is told again. The task
+  session's prompt gets a sentence saying the marked part is data.
+- **Write-back**, only for tasks whose `source` is a request of an enabled source (any other task is never reported):
+  the task session starting → `running` (branch, session id); finishing → `waiting_review` (branch, one-line summary,
+  session id), `blocked` (the question), or `failed` (a first failure says it will try again in the next harvest; the
+  second failure, which blocks the task, ends as `failed` too); a usage-limit pause → `running` with a summary saying
+  it paused; `claude-harvest merge` → `done`. A failed update is kept in `sources.json` — one per request, the newest
+  replacing an older one so a retry never sends a request backwards — and retried at the start of every pull; one still
+  undeliverable after 7 days, or whose source was switched off, is dropped. Not covered: a harvest cut off by `maintain`
+  leaves the request `running`, and a rejected task has no status in the contract.
+- **Run now**: `pull` lists the tasks to start under `runNow` once no harvest is running (a live lock holds them back:
+  an unscoped running harvest may pick the open task up itself, and the picked summary says so), at most every 15
+  minutes and 3 times per task; the task starting ends the offer, and after 3 tries it simply waits for the next
+  harvest. The widget starts them as one run limited to those tasks, as ▶ does — quietly, and only when no harvest is
+  running, Claude Code is signed in and `claude` exists. `next_harvest` just stays queued.
+- **The widget** runs `pull` every second 30 s tick (about 2 minutes) while the Mac is awake, once when the first
+  listing arrives and once ~8 s after a wake — only while a source is on and its tool found, so otherwise no engine
+  run is spent. A failure changes only the live dot (yellow, never over a red one); success after it restores green;
+  nothing appears as text in the panel. A pull that added or changed something refreshes the listing.
+- Files: `sources.json` (owed updates, "run now" offers; the engine only), `logs/sources.log`.
+
 ### Signed out
 
 Without a signed-in Claude Code nothing works — no fresh figures, no harvest — so this one problem is spelled
@@ -390,12 +442,12 @@ customized, orange = unsaved), an editor (monospaced, left to right), what must 
 placeholders the engine fills, the task-report step), Save (`prompts --set <name> --file <tmp>`; a refusal
 shows what is missing), Discard changes, Restore the default (`prompts --reset`). The owner's versions live in
 `~/.claude/harvest/prompts/`, the installed defaults stay untouched; unattended runs can't change them.
-General also holds name, email + weekly digest and folder (saved with "Save"), Help and "Remove the
+General also holds name, email + weekly digest and folder (saved with "Save"), "Requests from outside" (see that section; shown only with a source to switch), Help and "Remove the
 harvest…" (the setup window). Not installed: only General, with "Set up the harvest…". The tabs are a
 toolbar-like row of symbols in SwiftUI (so they follow the app's language and direction), each over a
 `.formStyle(.grouped)` form; the window is titled after the tab and takes on its height
 (`NSHostingController`, `.preferredContentSize`). `--snapshot-settings <png> [--tab
-general|harvest|models|projects|texts] [--he|--en] [--light]` renders one tab.
+general|harvest|models|projects|texts] [--demo] [--he|--en] [--light]` renders one tab.
 
 ### Setup
 

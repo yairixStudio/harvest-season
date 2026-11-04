@@ -16,6 +16,7 @@ In Hebrew or English. [עברית](README.he.md)
 - **When a quota runs out.** A model with its own weekly quota (Fable) gives way to another at the percent you set — before a task, and mid-task too, the session going on with its context intact. When the shared 5-hour or weekly limit runs out, the task stops at once, keeps its work on its branch and goes on from there in the next pulse.
 - **Live, and on your phone.** Every run is published through Remote Control, so it appears in the Claude app — and on your phone — while it works, and you can write to it.
 - **You merge.** Each task ends on its own `backlog/…` branch in its project. Nothing is pushed or merged by the harvest. "Waiting for you" opens a session that shows the change and merges it when you approve; a reminder comes if something waits too long.
+- **Requests from outside (optional).** If you use Clockwize (a task app), pressing "Handle with Claude Code" on a task there, with a prompt, a folder and "now" or "next harvest", makes the widget pick the request up (every two minutes while the Mac is awake): it becomes an open task in that project's queue, runs like any other, and every step — started, waiting for review, blocked, failed, merged — is reported back. Off until you turn it on in Settings → General, and only offered when Clockwize's command-line tool is installed; it keeps its own sign-in, the harvest stores no key of it.
 
 ## Requirements
 
@@ -68,7 +69,7 @@ Anything it replaces is backed up first. At the end it offers a short getting-st
 
 ## Privacy and safety
 
-- Your Claude credentials never leave your Mac except to Anthropic: the access token only to `api.anthropic.com`; the widget only reads your login and never renews it — Claude Code does. Nothing is logged, no analytics, no other network calls.
+- Your Claude credentials never leave your Mac except to Anthropic (the one other link is the optional, off-by-default "Requests from outside", which runs the service's own command-line tool): the access token only to `api.anthropic.com`; the widget only reads your login and never renews it — Claude Code does. Nothing is logged, no analytics, no other network calls.
 - The harvest never pushes, merges, deploys or deletes. Agents can't approve tasks for themselves. Text inside your code and backlog is treated as data, not instructions.
 
 ## Remove
