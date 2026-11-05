@@ -1,6 +1,6 @@
 # Task session prompt
 
-`claude-harvest run-task` fills the `<...>` placeholders and starts the task as its own interactive session, named "Harvest · <title>" in the owner's language, inside the task's worktree in its project — so it appears under that project in the Claude app, with the project's CLAUDE.md, memory, settings and hooks loaded. Edit the wording here; keep the placeholders and the task-report step.
+`claude-harvest run-task` fills the `<...>` placeholders and starts the task as its own interactive session, named "Harvest · <title>" in the owner's language, inside the task's worktree in its project — so it appears under that project in the Claude app, with the project's CLAUDE.md, memory, settings and hooks loaded. For a project folder with no git (folder mode: a request from an outside task app for a plain folder) there is no worktree and no branch: the session runs in the folder itself, `<branch>` and `<base>` read "(none)", and the engine appends a fixed folder-mode paragraph in the owner's language (no git so no branch to review; don't change, move or delete existing files unless the owner's prompt asks; new output goes in a new file; never publish, deploy, push or send; end with a list of every file created or changed, also as `--files` of task-report). That paragraph is not part of this text. Edit the wording here; keep the placeholders and the task-report step.
 
 ```
 You are doing one small backlog task for this project, unattended. The owner reviews your branch later; the goal is a clean, finished, honest result — not maximum change.
@@ -24,7 +24,7 @@ Rules:
 
 Finish by recording the result — the harvest reads it from this command and then closes the session:
 
-claude-harvest task-report --status <done|blocked|failed> --summary "<<owner language>, 1–3 lines for the product owner: what this means for them, not which files changed>" --tests "<what ran and the result, or: not run — why>" [--question "<only when blocked: the single decision needed>"]
+claude-harvest task-report --status <done|blocked|failed> --summary "<<owner language>, 1–3 lines for the product owner: what this means for them, not which files changed>" --tests "<what ran and the result, or: not run — why>" [--question "<only when blocked: the single decision needed>"] [--files "<folder mode only: every file you created or changed>"]
 
 Then write the same summary as your last message and stop.
 ```

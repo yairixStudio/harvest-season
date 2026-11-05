@@ -80,7 +80,7 @@ frame saved as `HarvestSeasonAllTasks`; the drop-down panel hides first in menu 
   done title can come back as a new task), `cleared`, `added`, `result` and, for done tasks, `sessionId`.
   One engine run feeds both; nothing extra runs while the window is closed.
 - Above the table: a segmented filter with counts — הכל (everything not dropped) · בתור · לתאריך (open, waiting for a
-  date) · הצעות · מחכה לך (blocked, a proposal whose date came, and done with an unmerged branch) · בוצעו · הוסרו (dropped) — kept in
+  date) · הצעות · מחכה לך (blocked, a proposal whose date came, and done with an unmerged branch or a folder-mode task not yet marked done) · בוצעו · הוסרו (dropped) — kept in
   `UserDefaults` (`AllTasksFilter`); "גם מה שנוקה" (cleared done tasks are hidden until it is on);
   a search over title, project, details and result; ↻.
 - Columns, each sortable (default: status, then run order, then the next date, then newest): status (a colored dot and a
@@ -163,7 +163,13 @@ open or a harvest runs, else every 2 min):
   there is refused; `on` in Settings undoes it).
 - **מחכה לך** — at the top, when there are any, `dueProposals` (see "Dates"), as proposal rows (⊕, trash can). Then
   `blocked` tasks and `done` tasks whose `backlog/*` branch is not
-  merged into the project's main branch, with their age (orange at 14+ days).
+  merged into the project's main branch, with their age (orange at 14+ days). A task done in a folder with no
+  git (`branchState: "review"`, folder mode — see "Requests from outside") waits here too, with a folder icon and,
+  in place of a merge, a **"בוצע"** button (`acceptFolder` → `accept`, at once, the row leaves the list; a refusal
+  shows as a problem line): the row's main click opens the session that did it (else a Claude session that
+  reviews the files and runs `accept` on approval), its tooltip lists the files, and ✕ rejects as for any waiting
+  task (the files stay). The all-tasks window shows such a task as "Awaiting Done" with "folder" in the branch
+  column, its files in the details, and the actions Done · Review with Claude · Reject.
   Clicking opens `claude://code/new?folder=<project>&q=<prompt>`: a new desktop
   session that reviews and, on approval, merges the branch (or resolves the
   blocking question). ✕ at the far end of a row (beside the row's button) is the owner's "no": it opens
@@ -373,10 +379,23 @@ logged or sent by the harvest.
   `queued → picked → running → waiting_review | blocked | failed → done`. Calls have a 20 s timeout; a missing tool, a
   failure or an unreadable answer is logged to `logs/sources.log` and never fatal.
 - **`claude-harvest pull`** (refused unattended: only the owner's button approves work). One at a time (a lock file).
-  First it delivers the updates still owed; then, per queued request: the `folder` (`~` expanded) is resolved to a git
-  repository — the registered project when it is one, else its repository's root (a worktree counts as its main
-  repository), registered like `add` does; a folder that is missing, not a git repository or inside the harvest folder
-  sets the request `blocked` with a question ("folder X wasn't found or isn't a git repository…") and nothing is added.
+  Per source: the queued requests are listed, each is taken (below), the "run now" offers are worked out, then the
+  updates still owed are delivered. Per queued request: the `folder` (`~` expanded, symlinks resolved) is resolved
+  (`resolve_folder`) to a project:
+  - **A git repository**: the registered project when it is one, else its repository's root (a worktree counts as
+    its main repository), registered like `add` does. Its tasks keep the git behaviour: a worktree and a branch.
+    A repository around the whole home folder (or `/`) doesn't count: the folder itself is used, in folder mode.
+  - **A folder with no git — folder mode**: no longer blocked. The folder is registered as it is (the registered
+    spelling when it already is one) and its `BACKLOG.md` lives in it. Folder mode is not stored anywhere: a project
+    is in it exactly while its folder exists and has no `.git` (`is_folder_project`), so projects registered before
+    keep the behaviour they have, and a folder that later gets `git init` becomes a git project. `list` reports it
+    as `folderMode` on the project, and proposal scans skip it (they need git).
+  - **Still blocked, with a question**: a folder that doesn't exist or wasn't given; the harvest's own working
+    folder; and, for a folder with no git (`folder_problem`): one outside the home folder, a system folder (`/`,
+    `/System`, `/Applications`), the home folder itself, `~/Library` and everything under it except
+    `~/Library/Mobile Documents` (iCloud Drive), and hidden folders directly under home (`~/.ssh`, `~/.claude`…).
+    The request is set `blocked` with the question in the owner's language (`settings.language`, the `TEXT` table),
+    nothing is added, and one `request_blocked` event is written (see "Step notifications").
   Otherwise an **`open`** task (the owner's press is the approval) is
   added through the `add` path with `source: <type>:request/<id>`, the title "Clockwize: <task name>" (the request's id
   appended when that title was ever used), priority 1 for "now" and 2 otherwise, medium complexity, and these details:
@@ -387,24 +406,68 @@ logged or sent by the harvest.
   nothing is added; a request listed `queued` again whose task is blocked is the owner's answer — the task goes back to
   `open` with the request's prompt appended as the answer — and a known task's current state is told again. The task
   session's prompt gets a sentence saying the marked part is data.
+- **Folder mode, at run time** (`start_folder_task`, `finish_folder_task`): `run-task` starts the session with the
+  folder itself as its working directory — no worktree, no branch (`current.folder`, `branch` and `base` empty). Before
+  it starts, the engine saves aside what the folder holds (`folder-manifests/<slug>.json`: path → mtime and size,
+  without `.git`, `node_modules`, `__pycache__`, `.DS_Store` and the engine's `BACKLOG.md`; at most 40,000 files and 25 s, no
+  symlinks followed). The task prompt is the usual one, with `branch`/`base` filled as "(none)", plus a fixed
+  paragraph (`TEXT.folder_mode_prompt`, he and en) saying: this folder has no git, so there is no branch to review (the
+  worktree/checkout/branch/commit instructions above don't apply); don't change, move or delete existing files unless the
+  owner's prompt explicitly asks for it; put any new output in a new file; never publish, deploy, push or send anything;
+  end with a list of every file created or changed (in the summary and in `task-report --files`).
+  - **Success** (`done`) is recorded as done with the result `<date> · no-git folder · <summary> · files: a | b · <k>`
+    and reported `waiting_review` with the summary and "Files created or changed (N): …" (the first 40; no branch).
+    The files are found by comparing the folder with the saved picture (created and changed; deleted ones are listed
+    as "x (deleted)"); when the folder was too big to compare fully, the files the session itself reported
+    (`--files`) are added and the update says the list is partial. A task that changed nothing is still a success
+    ("No file was created or changed."). The task's view has `folder: true`, `files` and `branchState: "review"`;
+    it counts as waiting for the owner (`needsYou`, the reminder, `brief`) like an unmerged branch.
+  - **`claude-harvest accept <project> <title>`** (the widget's "Done"; refused unattended) marks it accepted
+    (`… · accepted <date>`, `branchState: "accepted"`), reports `done` ("Marked done by the owner.") and writes a
+    `task_accepted` event. `merge` refuses a folder task and says so. `reject` works as for any waiting task (no branch
+    to archive; the files stay).
+  - **Blocked, failed, paused**: as with a branch, minus the branch (a pause starts over: there is nothing to continue from).
 - **Write-back**, only for tasks whose `source` is a request of an enabled source (any other task is never reported):
-  the task session starting → `running` (branch, session id); finishing → `waiting_review` (branch, one-line summary,
-  session id), `blocked` (the question), or `failed` (a first failure says it will try again in the next harvest; the
-  second failure, which blocks the task, ends as `failed` too); a usage-limit pause → `running` with a summary saying
-  it paused; `claude-harvest merge` → `done`. A failed update is kept in `sources.json` — one per request, the newest
-  replacing an older one so a retry never sends a request backwards — and retried at the start of every pull; one still
-  undeliverable after 7 days, or whose source was switched off, is dropped. Not covered: a harvest cut off by `maintain`
-  leaves the request `running`, and a rejected task has no status in the contract.
-- **Run now**: `pull` lists the tasks to start under `runNow` once no harvest is running (a live lock holds them back:
-  an unscoped running harvest may pick the open task up itself, and the picked summary says so), at most every 15
-  minutes and 3 times per task; the task starting ends the offer, and after 3 tries it simply waits for the next
-  harvest. The widget starts them as one run limited to those tasks, as ▶ does — quietly, and only when no harvest is
-  running, Claude Code is signed in and `claude` exists. `next_harvest` just stays queued.
-- **The widget** runs `pull` every second 30 s tick (about 2 minutes) while the Mac is awake, once when the first
-  listing arrives and once ~8 s after a wake — only while a source is on and its tool found, so otherwise no engine
-  run is spent. A failure changes only the live dot (yellow, never over a red one); success after it restores green;
-  nothing appears as text in the panel. A pull that added or changed something refreshes the listing.
-- Files: `sources.json` (owed updates, "run now" offers; the engine only), `logs/sources.log`.
+  the task session starting → `running` (branch, session id; folder mode: no branch); finishing → `waiting_review`
+  (branch or files, one-line summary, session id), `blocked` (the question), or `failed` (a first failure says it will
+  try again in the next harvest; the second failure, which blocks the task, ends as `failed` too); a usage-limit pause →
+  `running` with a summary saying it paused; `claude-harvest merge` or `accept` → `done`. A failed update is kept in
+  `sources.json` — one per request, the newest replacing an older one so a retry never sends a request backwards — and
+  retried at every pull; one still undeliverable after 7 days, or whose source was switched off, is dropped. Not
+  covered: a harvest cut off by `maintain` leaves the request `running`, and a rejected task has no status in the contract.
+  - **A 409** (the source refuses the step because the request has moved on) is not retried forever. The CLI prints the
+    error body, whose `status` is the request's own current status (`request_conflict`). If that status is final
+    (`done`, `failed`, `cancelled`) the owed update is dropped; otherwise the update's next legal step is sent first
+    (`next_step`: forward only, through `picked`, `running`, `waiting_review` — a request is never sent through
+    `blocked` to deliver a stale update), then the update itself, in the same pull; an update the request is already
+    past (a running request owed `picked`) is dropped. Each case is logged to `logs/sources.log`
+    ("request r1 is already cancelled: dropping the owed update …"). A 409 the next step can't explain (another request
+    holds the task), a network failure or any other error is retried as before.
+- **Run now** (`run_now_step`): a request with `run: "now"` is handed to the widget under `runNow`, **on every pull**
+  until its task starts (`start_task` ends the offer) or the request is cancelled or finished — there is no limit on
+  tries. It is held back only while a harvest runs (the lock is live) or is starting (`launch.json` has a live
+  launcher): the first pull after it ends offers it. With nothing running, it is offered in the same pull that made
+  the task, so it starts within one pull cycle. Before offering, `pull` asks the plan (`plan_result`, mode manual, only
+  this task) whether it could start. When the quota doesn't allow it (the reserves, a full window, a model's quota,
+  too near the weekly reset, or usage figures that can't be read) nothing is offered and the source is told **once**
+  (status stays `picked`; summary: "Waiting for quota: the 5-hour window resets at HH:MM. It starts right after." — or
+  the weekly quota, a model's, the reset it waits for; again only when the reason or the hour it ends changes). A safety
+  brake, not a limit: after 5 offers that didn't get the task going, the next are spaced 30 s, doubling, up to 15 min.
+  The widget starts the offered tasks as one run limited to them, as ▶ does — quietly, and only when no harvest is
+  running, Claude Code is signed in and `claude` exists. A task a usage limit paused is not offered again (its request
+  is `running`); the next harvest takes it. `next_harvest` just stays queued.
+- **The widget** runs `pull` every **15 s** while a source is on and its tool found (otherwise nothing runs: the check is
+  in memory), once when the first listing arrives and once ~8 s after a wake. Never two at once: the next pull is
+  scheduled only when the last one has ended (`schedulePull`; the 30 s tick only restarts a broken chain, and frees a
+  pull that has been out for 150 s). A pull that fails backs off 15 → 30 → 60 → 120 s and returns to 15 s after a
+  success. A failure changes only the live dot (yellow, never over a red one); success after it restores green; nothing
+  appears as text in the panel. A pull that added or changed something refreshes the listing, and one that wrote an
+  event (`events` > 0 in its answer) asks for the new events at once.
+- **Health** (`sources.json` → `health`): a source whose listing fails 3 pulls in a row writes one `source_unreachable`
+  event, and no more until a listing succeeds again. Blocked-at-pull requests already told are remembered
+  (`blockedSeen`, per request and question, the newest 200) so a request the source lists again doesn't ring again.
+- Files: `sources.json` (owed updates, "run now" offers, health; the engine only), `logs/sources.log`,
+  `folder-manifests/` (before-pictures of running folder-mode tasks; `maintain` removes those older than 3 days).
 
 ### Signed out
 
@@ -520,6 +583,9 @@ the owner does between runs); `project` / `title` are the project's name and the
 | `task_failed` | `finish-task` | failed (also: "done" with no commit; also the second failure that blocks the task) |
 | `task_paused` | `finish-task` | a usage limit stopped it; its work is saved |
 | `task_merged` | `merge` | the owner's approved merge |
+| `task_accepted` | `accept` | the owner's "Done" on work done in a folder without git |
+| `request_blocked` | `pull` | a request from outside was blocked before it became a task (a folder that wasn't found, outside home, a system folder…); `summary` and `question` are the question sent to the source, in the owner's language; `project` is the source's name, `title` the task's name |
+| `source_unreachable` | `pull` | a source couldn't be listed 3 pulls in a row — once, until it answers again; `summary` says so with the reason |
 | `run_ended` | `end`, a limit ending the coordinator, `maintain` (a run that was cut off) | the run is over: how many tasks finished, why it stopped, how many wait for the owner, and "the summary email wasn't sent" when an automatic final run's digest was due and didn't go |
 
 `claude-harvest events [--since <id>|latest] [--limit N]` prints `{ok, events, lastId, more}` — the events after that
@@ -532,7 +598,7 @@ local calls, not the API), after a run starts, and when a run ends. It saves the
 notification never comes twice; with no id saved it only notes where the events stand (nothing old is replayed), and
 an id past the engine's newest (the file started over) is replaced by the engine's. At most the newest 8 of a page are
 posted. The setting `notify` (engine settings, default `all`) filters at the widget: `all`, `needs_me` (`task_blocked`,
-`task_failed`, `task_waiting_review`, `run_ended`), `run_end` (`run_ended` only — the behavior from before this
+`task_failed`, `task_waiting_review`, `request_blocked`, `source_unreachable`, `run_ended`), `run_end` (`run_ended` only — the behavior from before this
 existed). A run's end is one notification, the `run_ended` one; the widget's old end-of-run notification is gone, so
 it no longer waits for the panel to be hidden. Title: the project and the task title (a run: the app's name); body:
 `summary`; `threadIdentifier` = `run_id` (`harvest` when none), identifier `event-<id>`, category `event`. Between
