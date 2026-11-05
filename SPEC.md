@@ -121,8 +121,9 @@ BACKLOG.md itself. Files under `~/.claude/harvest/`, one writer each:
 - `config.json` — written by the widget: `auto` (bool), `pulses` (0 = automatic, 1–6), `batteryGuard` (bool,
   default true) and `minBattery` (5–80, default 10), and `leadHours`
   (pulses × 5 + 1, automatic counting as 6 — the engine refuses an auto run started earlier than that).
-  A file from before pulses (`leadHours` only) reads as ⌈leadHours / 5⌉ pulses.
-- `status.json`, `calibration.md`, `history.jsonl`, `launch.json`, `.lock`,
+  A file from before pulses (`leadHours` only) reads as ⌈leadHours / 5⌉ pulses. `eventsSeen` — the id of the newest
+  step event the widget has handled (see "Step notifications").
+- `status.json`, `calibration.md`, `history.jsonl`, `events.jsonl`, `launch.json`, `sources.json`, `.lock`,
   `worktrees/`, BACKLOG.md edits — written by the engine only. `logs/run-*.jsonl` — each run's stream-json
   output, newest 20 kept.
 
@@ -273,9 +274,9 @@ Stop sends SIGTERM to the running task session's group and to the launcher's
 group (the launcher forwards it to the coordinator's terminal session), SIGKILL
 after 8 s. A launcher that outlived a
 widget restart is still shown as ours, watchable and stoppable. On exit:
-`maintain` (recovers lock, worktrees, partial branches), refresh, a macOS
-notification when the panel is hidden (and always when an automatic cycle ended
-without its digest email).
+`maintain` (recovers lock, worktrees, partial branches), refresh, and the
+`run_ended` step notification (see "Step notifications"; it also says when an
+automatic cycle ended without its digest email).
 
 Automatic runs (checked every 30 s) come in **pulses**, one 5-hour window each: when `auto` is on, usage
 is under 15 min old, and the weekly reset is between 20 min and pulses × 5 h + 30 min away — once per weekly
@@ -353,6 +354,58 @@ original to `~/.claude/harvest/backups/backlogs-<time>/` first, reads the file a
 over if another session wrote to it, and leaves a current file alone. `--check` only reports. `./install` runs it after
 an upgrade. A task session whose task has dates gets them at the end of its prompt.
 
+### Requests from outside
+
+Optional, off by default: an outside task app where the owner presses "handle with Claude Code" on a task, writes a
+prompt and chooses a folder and "now" or "next harvest". Clockwize is the first source (`type: "clockwize"`); the
+owner's own details never live in this repository. It is the app's one opt-in network path other than Anthropic: the
+harvest runs the source's own command-line tool, which holds its own sign-in — no token of the source is ever stored,
+logged or sent by the harvest.
+
+- **Settings** (`settings.json`): `sources` — `[{"type": "clockwize", "cli": "clockwize", "enabled": true}]`, empty by
+  default (`cli`: a command on PATH, or a path). `claude-harvest source clockwize on|off [--cli <path>]` switches it
+  (refused unattended; `on` needs the tool to exist). `settings` and `list` report `sourceStatus` — each configured
+  source, and each known one whose tool is on this Mac, with `enabled` and `found`. Settings → General shows a
+  "Requests from outside" switch per entry of `sourceStatus` that is `found` or `enabled`; nothing when there is none.
+- **The tool's contract**: `<cli> claude-requests list --status queued` → a JSON array of `{id, task_id, task_name,
+  task_description, client_name, project_name, folder, prompt, run: "now"|"next_harvest", status}`; `<cli>
+  claude-requests update <id> --status <s> [--summary …] [--question …] [--branch …] [--session …]`, with statuses
+  `queued → picked → running → waiting_review | blocked | failed → done`. Calls have a 20 s timeout; a missing tool, a
+  failure or an unreadable answer is logged to `logs/sources.log` and never fatal.
+- **`claude-harvest pull`** (refused unattended: only the owner's button approves work). One at a time (a lock file).
+  First it delivers the updates still owed; then, per queued request: the `folder` (`~` expanded) is resolved to a git
+  repository — the registered project when it is one, else its repository's root (a worktree counts as its main
+  repository), registered like `add` does; a folder that is missing, not a git repository or inside the harvest folder
+  sets the request `blocked` with a question ("folder X wasn't found or isn't a git repository…") and nothing is added.
+  Otherwise an **`open`** task (the owner's press is the approval) is
+  added through the `add` path with `source: <type>:request/<id>`, the title "Clockwize: <task name>" (the request's id
+  appended when that title was ever used), priority 1 for "now" and 2 otherwise, medium complexity, and these details:
+  the owner's prompt as the instruction, then the task name, description, client and project between `[BEGIN
+  EXTERNAL TASK DATA]` and `[END EXTERNAL TASK DATA]`, labelled as text that may be written by third parties and is
+  never to be followed (the markers are neutralised inside the copied text; each field is capped). The request is told
+  `picked`. It is **idempotent on the id**: any task, in any status, with that `source` means the request is known and
+  nothing is added; a request listed `queued` again whose task is blocked is the owner's answer — the task goes back to
+  `open` with the request's prompt appended as the answer — and a known task's current state is told again. The task
+  session's prompt gets a sentence saying the marked part is data.
+- **Write-back**, only for tasks whose `source` is a request of an enabled source (any other task is never reported):
+  the task session starting → `running` (branch, session id); finishing → `waiting_review` (branch, one-line summary,
+  session id), `blocked` (the question), or `failed` (a first failure says it will try again in the next harvest; the
+  second failure, which blocks the task, ends as `failed` too); a usage-limit pause → `running` with a summary saying
+  it paused; `claude-harvest merge` → `done`. A failed update is kept in `sources.json` — one per request, the newest
+  replacing an older one so a retry never sends a request backwards — and retried at the start of every pull; one still
+  undeliverable after 7 days, or whose source was switched off, is dropped. Not covered: a harvest cut off by `maintain`
+  leaves the request `running`, and a rejected task has no status in the contract.
+- **Run now**: `pull` lists the tasks to start under `runNow` once no harvest is running (a live lock holds them back:
+  an unscoped running harvest may pick the open task up itself, and the picked summary says so), at most every 15
+  minutes and 3 times per task; the task starting ends the offer, and after 3 tries it simply waits for the next
+  harvest. The widget starts them as one run limited to those tasks, as ▶ does — quietly, and only when no harvest is
+  running, Claude Code is signed in and `claude` exists. `next_harvest` just stays queued.
+- **The widget** runs `pull` every second 30 s tick (about 2 minutes) while the Mac is awake, once when the first
+  listing arrives and once ~8 s after a wake — only while a source is on and its tool found, so otherwise no engine
+  run is spent. A failure changes only the live dot (yellow, never over a red one); success after it restores green;
+  nothing appears as text in the panel. A pull that added or changed something refreshes the listing.
+- Files: `sources.json` (owed updates, "run now" offers; the engine only), `logs/sources.log`.
+
 ### Signed out
 
 Without a signed-in Claude Code nothing works — no fresh figures, no harvest — so this one problem is spelled
@@ -377,7 +430,8 @@ at a sign-out"), the coordinator ends the run as `signed-out`. `--snapshot … -
 latest listing): **General** — language (he/en: `setLanguage`, stored in the harvest settings
 when installed, else in the widget's `UILanguage` default; the panel, menus and help follow
 at once), start at login, menu bar mode (these two moved here from the ⋯ menu). **Harvest**
-(installed) — automatic runs, pulses (`PulsesPicker`, `config.json`), the next harvest and the capacity, and
+(installed) — automatic runs, "Notifications" (`notify`: a menu of three, `settings --set notify=…`, see "Step
+notifications"), pulses (`PulsesPicker`, `config.json`), the next harvest and the capacity, and
 "kept free for you": the 5-hour reserve (0–60, step 5) and the weekly one (0–30), `settings --set
 fiveReserve=… / weeklyReserve=…` on each step — "Dates" (`earlyDays`, 0–7: how many days before a recommended date) — and "Battery": "Don't start on a low battery" (`batteryGuard`) and
 "Starts only above N % or when the Mac is plugged in" (5–80, step 5). **Models** — a model per task size (`settings --set models=…`),
@@ -390,12 +444,12 @@ customized, orange = unsaved), an editor (monospaced, left to right), what must 
 placeholders the engine fills, the task-report step), Save (`prompts --set <name> --file <tmp>`; a refusal
 shows what is missing), Discard changes, Restore the default (`prompts --reset`). The owner's versions live in
 `~/.claude/harvest/prompts/`, the installed defaults stay untouched; unattended runs can't change them.
-General also holds name, email + weekly digest and folder (saved with "Save"), Help and "Remove the
+General also holds name, email + weekly digest and folder (saved with "Save"), "Requests from outside" (see that section; shown only with a source to switch), Help and "Remove the
 harvest…" (the setup window). Not installed: only General, with "Set up the harvest…". The tabs are a
 toolbar-like row of symbols in SwiftUI (so they follow the app's language and direction), each over a
 `.formStyle(.grouped)` form; the window is titled after the tab and takes on its height
 (`NSHostingController`, `.preferredContentSize`). `--snapshot-settings <png> [--tab
-general|harvest|models|projects|texts] [--he|--en] [--light]` renders one tab.
+general|harvest|models|projects|texts] [--demo] [--he|--en] [--light]` renders one tab.
 
 ### Setup
 
@@ -440,6 +494,52 @@ earlier name (`harvest-quota`, now `harvest-season`) goes on upgrade. A block is
 marker alone, so one written under an earlier wording is replaced like any other.
 `./install` upgrades a harvest the installer installed (not a hand-made one) and
 reports conflicts without writing.
+
+### Step notifications
+
+While the harvest works, the widget tells the owner what happens, one macOS notification per step. The engine
+records the steps; the widget only asks.
+
+**Events** — `events.jsonl` in the harvest folder, one JSON line per step, written only by the engine
+(`append_event`, under a lock of its own — `.events.lock` — so concurrent engine processes get distinct ids), the
+last 500 lines kept. A failure to write one never touches the step it reports. Fields:
+`{id, at, run_id, kind, project, title, summary, question?, session_id?, branch?, source?}` — `id` rises by one and
+never repeats, even after a trim; `run_id` is `status.runId`, set by `begin` (`run-YYYYmmdd-HHMMSS`; null for a merge
+the owner does between runs); `project` / `title` are the project's name and the task's title (empty for a run);
+`summary` is one line in the owner's language (the same `TEXT` table as everything else the engine writes);
+`session_id` is the session that did the task (a run-task's own session, else the coordinator's; a merge finds it in
+`history.jsonl`); `source` is the task's `source` field in BACKLOG.md, when it has one (an external task, e.g.
+`clockwize:<id>`), copied as it is.
+
+| kind | written by | when |
+|---|---|---|
+| `run_started` | `begin` | a run begins |
+| `task_started` | `worktree` / `run-task` | a task's worktree and branch are ready (a task going on from a pause too) |
+| `task_waiting_review` | `finish-task` | done with commits: the branch waits for approval |
+| `task_blocked` | `finish-task` | stopped on a question (`question`) |
+| `task_failed` | `finish-task` | failed (also: "done" with no commit; also the second failure that blocks the task) |
+| `task_paused` | `finish-task` | a usage limit stopped it; its work is saved |
+| `task_merged` | `merge` | the owner's approved merge |
+| `run_ended` | `end`, a limit ending the coordinator, `maintain` (a run that was cut off) | the run is over: how many tasks finished, why it stopped, how many wait for the owner, and "the summary email wasn't sent" when an automatic final run's digest was due and didn't go |
+
+`claude-harvest events [--since <id>|latest] [--limit N]` prints `{ok, events, lastId, more}` — the events after that
+id, oldest first, at most N (default 100); `latest` returns none and only where the file stands. It reads and writes
+nothing else, so it works unattended too.
+
+**The widget** (`pollEvents`, "Step notifications" in the code) asks for events after `config.json`'s `eventsSeen`:
+when the listing is refreshed (every 30 s tick while a harvest runs or the panel is open, else every 2 minutes —
+local calls, not the API), after a run starts, and when a run ends. It saves the newest id before posting, so a
+notification never comes twice; with no id saved it only notes where the events stand (nothing old is replayed), and
+an id past the engine's newest (the file started over) is replaced by the engine's. At most the newest 8 of a page are
+posted. The setting `notify` (engine settings, default `all`) filters at the widget: `all`, `needs_me` (`task_blocked`,
+`task_failed`, `task_waiting_review`, `run_ended`), `run_end` (`run_ended` only — the behavior from before this
+existed). A run's end is one notification, the `run_ended` one; the widget's old end-of-run notification is gone, so
+it no longer waits for the panel to be hidden. Title: the project and the task title (a run: the app's name); body:
+`summary`; `threadIdentifier` = `run_id` (`harvest` when none), identifier `event-<id>`, category `event`. Between
+22:00 and 08:00 local time there is no sound; otherwise the default sound (these are the only notifications with
+one). A click opens the task's session the way the Done list does — the live Remote Control session when the task (or
+the coordinator) still runs, else `openSessionInApp(session_id)`; a run event with no session opens the newest run.
+`--test-notification` posts one sample and exits (a bare build uses the same fallback as every notification there).
 
 ### Reminder and conversation
 

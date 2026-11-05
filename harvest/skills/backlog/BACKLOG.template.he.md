@@ -14,5 +14,6 @@ complexity: low · medium · high   (picks the model — `models` in the setting
 tokens:     rough estimate of total agent tokens incl. ~60k fixed overhead (low ≈ 100k, medium ≈ 200k, high ≈ 400k)
 details:    what to do and what counts as done; name files/areas
 result:     filled by the agent — date · branch · what changed (in the owner's language) · actual tokens
+source:     set by the engine on a task that came from an outside task app (`<type>:request/<id>`); the harvest reports its progress back there. Never write it by hand
 cleared:    set when the owner clears a done task from the widget's done list (date); the task stays here
 -->

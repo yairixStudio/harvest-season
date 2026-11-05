@@ -493,6 +493,46 @@ struct HStatus: Decodable, Equatable {
     let limits: [String: HLimit]?
 }
 
+/// One step of a run or a task, as the engine's `events` reports it (events.jsonl, which only the engine reads
+/// and writes): what the notifications are made of.
+struct HEvent: Decodable, Equatable {
+    let id: Int
+    let kind: String
+    let runId: String?
+    let project: String?
+    let title: String?
+    let summary: String?
+    let question: String?
+    let sessionId: String?
+    enum CodingKeys: String, CodingKey {
+        case id, kind, project, title, summary, question
+        case runId = "run_id"
+        case sessionId = "session_id"
+    }
+}
+
+struct HEvents: Decodable {
+    var events: [HEvent]?
+    var lastId: Int?
+    var more: Bool?
+}
+
+/// Whether the owner's `notify` setting lets this kind of step through: `all`, `needs_me` (a question, a
+/// failure, work waiting for approval, the end of a run) or `run_end` (the end of a run only).
+func eventShown(_ kind: String, mode: String?) -> Bool {
+    switch mode ?? "all" {
+    case "run_end": return kind == "run_ended"
+    case "needs_me": return ["task_blocked", "task_failed", "task_waiting_review", "run_ended"].contains(kind)
+    default: return true
+    }
+}
+
+/// 22:00–08:00: notifications arrive without a sound.
+func inQuietHours(_ date: Date = Date()) -> Bool {
+    let hour = Calendar.current.component(.hour, from: date)
+    return hour >= 22 || hour < 8
+}
+
 struct HRatio: Decodable, Equatable {
     let weekly: Double
     let five: Double
@@ -532,7 +572,30 @@ struct HSettings: Decodable, Equatable {
     var weeklyReserve: Double?
     /// How many days before its recommended date a task may run.
     var earlyDays: Int?
+    /// The outside task sources (Clockwize) this Mac can use, and whether each is on.
+    var sourceStatus: [HSource]?
+    /// Which steps notify: all · needs_me · run_end.
+    var notify: String?
 }
+
+/// A source of requests from outside (`claude-harvest pull`): its tool is `cli`; `found` = the tool exists.
+struct HSource: Decodable, Equatable {
+    var type: String
+    var enabled: Bool
+    var cli: String?
+    var found: Bool
+}
+
+/// What `claude-harvest pull` answered: whether every source could be asked, and the tasks to start now.
+struct HPullResult: Decodable {
+    struct RunNow: Decodable { var project: String; var title: String }
+    var ok: Bool?
+    var busy: Bool?
+    var requests: [HPullRequest]?
+    var runNow: [RunNow]?
+}
+
+struct HPullRequest: Decodable { var outcome: String? }
 
 struct HFallback: Codable, Equatable {
     var to: String
@@ -590,6 +653,9 @@ struct HarvestConfig: Equatable {
     /// nearly empty battery dies with the Mac). "Run now" always starts.
     var batteryGuard = true
     var minBattery = 10
+    /// The newest step notification already handled (`pollEvents`); nil until the first look, which
+    /// only notes where the engine's events stand instead of replaying them.
+    var eventsSeen: Int?
 }
 
 let maxPulses = 6
@@ -601,6 +667,7 @@ func loadHarvestConfig() -> HarvestConfig {
         if let auto = saved["auto"] as? Bool { c.auto = auto }
         if let guardOn = saved["batteryGuard"] as? Bool { c.batteryGuard = guardOn }
         if let minimum = jsonNumber(saved["minBattery"]) { c.minBattery = min(max(Int(minimum), 5), 80) }
+        if let seen = jsonNumber(saved["eventsSeen"]) { c.eventsSeen = max(Int(seen), 0) }
         if let pulses = jsonNumber(saved["pulses"]) {
             c.pulses = min(max(Int(pulses), 0), maxPulses)
         } else if let lead = jsonNumber(saved["leadHours"]) {
@@ -621,9 +688,10 @@ func saveHarvestConfig(_ c: HarvestConfig) {
     // The engine reads only leadHours (in auto mode it refuses a run started earlier than that); the
     // widget schedules the pulses, so it gives the engine the widest lead they can need.
     let pulses = c.pulses == 0 ? maxPulses : c.pulses
-    writeJSONFile(["auto": c.auto, "pulses": c.pulses, "leadHours": pulses * 5 + 1,
-                   "batteryGuard": c.batteryGuard, "minBattery": c.minBattery],
-                  to: harvestHome.appendingPathComponent("config.json"))
+    var obj: [String: Any] = ["auto": c.auto, "pulses": c.pulses, "leadHours": pulses * 5 + 1,
+                              "batteryGuard": c.batteryGuard, "minBattery": c.minBattery]
+    if let seen = c.eventsSeen { obj["eventsSeen"] = seen }
+    writeJSONFile(obj, to: harvestHome.appendingPathComponent("config.json"))
 }
 
 func isoString(_ d: Date) -> String {
@@ -886,12 +954,16 @@ var clickableNotifications = false
 /// beside a bare binary again, which would hand it the installed app's settings.
 let runsAsApp = Bundle.main.bundleURL.pathExtension == "app" && Bundle.main.bundleIdentifier != nil
 
-func notify(title: String, body: String, category: String? = nil, id: String? = nil) {
+func notify(title: String, body: String, category: String? = nil, id: String? = nil,
+            thread: String? = nil, sound: Bool = false, userInfo: [String: String] = [:]) {
     if clickableNotifications {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         if let category = category { content.categoryIdentifier = category }
+        if let thread = thread { content.threadIdentifier = thread }
+        if sound { content.sound = .default }
+        if !userInfo.isEmpty { content.userInfo = userInfo }
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: id ?? UUID().uuidString, content: content, trigger: nil))
         return
@@ -1146,6 +1218,7 @@ protocol WidgetActions: AnyObject {
     func showSettings()
     func removeProposal(_ task: HTask)
     func setProposals(project: String, name: String, on: Bool)
+    func setSource(_ type: String, on: Bool)
     func setLanguage(hebrew: Bool)
     func saveHarvestSettings(_ values: [String])
     func loadPrompts()
@@ -2980,11 +3053,17 @@ struct HelpView: View {
         ]),
         ("הגדרות", [
             "חמש לשוניות בראש החלון.",
-            "**כללי:** שפה, הפעלה בכניסה למחשב, בשורת התפריט או כווידג'ט צף; השם שלך, מייל לסיכום שבועי ותיקיית הקציר (שומרים ב\"שמור\"); עזרה והסרת הקציר.",
-            "**קציר:** קציר אוטומטי, כמה פעימות לפני האיפוס, **שמירת מקום בשבילך** — כמה אחוזים הקציר לא ייגע בהם בחלון ה־5 שעות (כדי שתוכל לעבוד) ובמכסה השבועית — **תאריכים**: כמה ימים לפני מועד מומלץ הקציר יכול לקחת משימה — ו**סוללה**: לא להתחיל אוטומטית על סוללה חלשה, ומאיזה אחוז.",
+            "**כללי:** שפה, הפעלה בכניסה למחשב, בשורת התפריט או כווידג'ט צף; השם שלך, מייל לסיכום שבועי ותיקיית הקציר (שומרים ב\"שמור\"); **בקשות מבחוץ** (רק כשהכלי של Clockwize מותקן); עזרה והסרת הקציר.",
+            "**קציר:** קציר אוטומטי, **התראות** (על כל שלב, רק כשצריכים אותי, או רק בסוף ריצה), כמה פעימות לפני האיפוס, **שמירת מקום בשבילך** — כמה אחוזים הקציר לא ייגע בהם בחלון ה־5 שעות (כדי שתוכל לעבוד) ובמכסה השבועית — **תאריכים**: כמה ימים לפני מועד מומלץ הקציר יכול לקחת משימה — ו**סוללה**: לא להתחיל אוטומטית על סוללה חלשה, ומאיזה אחוז.",
             "**מודלים:** מודל לכל גודל משימה, ו**מעבר בין מודלים** — מאיזה אחוז של המכסה של Fable עוברים, לאיזה מודל (או \"בלי\": המשימות יחכו), והאם לעבור גם באמצע משימה.",
             "**פרויקטים:** מתג \"הצעות\" לכל פרויקט רשום — כבוי = בלי הצעות ממנו.",
             "**טקסטים:** ההנחיות שהקציר נותן לסוכנים — משימה, סריקת הצעות, השיחות, מייל הסיכום וההודעה במעבר מודל. אפשר לערוך כל אחת; נקודה כחולה = מותאם אישית, כתומה = שינוי שלא נשמר. מה שחייב להישאר בטקסט כתוב מתחתיו, ושמירה בלעדיו נדחית. \"שחזר ברירת מחדל\" מחזיר את המקור.",
+        ]),
+        ("התראות", [
+            "בזמן שהקציר עובד מגיעות התראות על מה שקורה: **משימה התחילה**, **מחכה לאישור שלך** (יש ענף), **נתקעה בשאלה**, **נכשלה**, **נעצרה במגבלת שימוש** (העבודה נשמרת וממשיכה אחר כך), **מוזגה**, וגם **תחילת ריצה וסיומה**. הכותרת היא הפרויקט והמשימה, והטקסט הוא שורה אחת על מה שקרה.",
+            "**לחיצה על התראה** פותחת את הסשן של אותה משימה באפליקציית Claude (בהתראה על ריצה: את סשן המתאם).",
+            "בהגדרות ← קציר בוחרים כמה לקבל: **על כל שלב** (ברירת המחדל), **רק כשצריכים אותי** — שאלה, כישלון, עבודה שמחכה לאישור וסיום ריצה — או **רק בסוף ריצה**. התראה אחת לסיום ריצה, לא שתיים.",
+            "**בין 22:00 ל־08:00** ההתראות מגיעות בלי צליל. ההתראות של אותה ריצה מקובצות יחד במרכז ההתראות.",
         ]),
         ("הגדרה והתקנה", [
             "כשהקציר לא מותקן, הווידג'ט מראה רק את המדדים וכפתור **\"הגדר את הקציר…\"**.",
@@ -2996,6 +3075,13 @@ struct HelpView: View {
             "כל סשן של Claude או Codex יכול לרשום משימה לבקלוג של הפרויקט — גם כשאתה אומר לו \"תוסיף לבקלוג\" או \"לא עכשיו\".",
             "כשאתה נוכח ומסכים היא נכנסת **לתור**. כשסוכן עובד לבד היא נכנסת **להצעות**.",
             "אפשר לתת לה זמן: \"תכניס לבקלוג בדיקה עוד חודש\". קלוד רושם תאריך מדויק, המשימה ממתינה ב\"ממתינות לתאריך\" ורצה לבד כשהוא מגיע.",
+        ]),
+        ("בקשות מבחוץ", [
+            "אם אתה עובד עם Clockwize (אפליקציית המשימות), אפשר ללחוץ שם **\"טפל עם Claude Code\"** על משימה, לכתוב מה לעשות, לבחור תיקייה ו**עכשיו** או **בקציר הבא**. הווידג'ט שולף את הבקשה, והיא נכנסת **לתור** של הפרויקט — הלחיצה שלך היא האישור.",
+            "זה כבוי כברירת מחדל, ומדליקים ב**הגדרות ← כללי ← בקשות מבחוץ**. המתג מופיע רק כשהכלי של Clockwize בשורת הפקודה מותקן במק. הקציר מדבר איתו דרך הכלי הזה, שמחזיק את ההתחברות בעצמו — הקציר לא שומר שם שום מפתח. זה הקשר היחיד של הקציר עם שירות חיצוני, והוא פועל אחת לשתי דקות כשהמק ער.",
+            "ההוראה היא מה שכתבת. מה ש-Clockwize יודע על המשימה (שם, תיאור, לקוח) מצורף כמידע בלבד: הסוכן לא מבצע הוראות שכתובות שם.",
+            "כל שלב חוזר ל-Clockwize: התחיל, מחכה לבדיקה (עם הענף והסשן), שאלה, כישלון, ומוזג. תיקייה שלא נמצאה, או שאינה ריפו git, מחזירה שאלה לשם.",
+            "**עכשיו** מריץ רק את המשימה הזאת מיד. אם קציר רץ באותו רגע היא תרוץ בו או מיד אחריו; אם אין מכסה או שאין חיבור ל-Claude Code, היא נשארת בתור לקציר הבא. כשאין חיבור לשירות, הנקודה למעלה הופכת לצהובה והעדכון נשלח שוב בהמשך.",
         ]),
     ]
 
@@ -3072,11 +3158,17 @@ struct HelpView: View {
         ]),
         ("Settings", [
             "Five tabs at the top of the window.",
-            "**General:** language, start at login, the menu bar or a floating widget; your name, an email for the weekly summary and the harvest folder (kept with \"Save\"); help and removing the harvest.",
-            "**Harvest:** the automatic harvest, how many pulses before the reset, **kept free for you** — how many percent the harvest leaves alone in the 5-hour window (so you can work) and in the weekly quota — **dates**: how many days before a recommended date the harvest may take a task — and **battery**: don't start automatically on a low battery, and from what percent.",
+            "**General:** language, start at login, the menu bar or a floating widget; your name, an email for the weekly summary and the harvest folder (kept with \"Save\"); **requests from outside** (only when Clockwize's tool is installed); help and removing the harvest.",
+            "**Harvest:** the automatic harvest, **notifications** (about every step, only when I'm needed, or only when a run ends), how many pulses before the reset, **kept free for you** — how many percent the harvest leaves alone in the 5-hour window (so you can work) and in the weekly quota — **dates**: how many days before a recommended date the harvest may take a task — and **battery**: don't start automatically on a low battery, and from what percent.",
             "**Models:** a model per task size, and **switching models** — from what percent of Fable's own quota to switch, to which model (or \"None\": the tasks wait), and whether to switch mid-task too.",
             "**Projects:** a \"Proposals\" switch per registered project — off = no proposals from it.",
             "**Texts:** the instructions the harvest gives its agents — a task, the proposal scan, the conversations, the summary email and the message on a model switch. Each can be edited; a blue dot = customized, orange = unsaved changes. What must stay in a text is listed under it, and saving without it is refused. \"Restore the default\" brings back the original.",
+        ]),
+        ("Notifications", [
+            "While the harvest works, notifications tell you what happens: a task **started**, is **waiting for your approval** (there is a branch), **stopped on a question**, **failed**, **stopped at a usage limit** (the work is saved and goes on later), was **merged** — and a run's **start and end**. The title is the project and the task; the text is one line about what happened.",
+            "**A click on a notification** opens that task's session in the Claude app (for a run: the coordinating session).",
+            "In Settings → Harvest you choose how many: **about every step** (the default), **only when I'm needed** — a question, a failure, work waiting for approval and the end of a run — or **only when a run ends**. A run's end is one notification, not two.",
+            "**Between 22:00 and 08:00** notifications come without a sound. The notifications of one run are grouped together in the notification center.",
         ]),
         ("Setup and install", [
             "While the harvest isn't installed, the widget shows only the meters and a **\"Set up the harvest…\"** button.",
@@ -3088,6 +3180,13 @@ struct HelpView: View {
             "Any Claude or Codex session can add a task to the project's backlog — also when you tell it \"add to backlog\" or \"not now\".",
             "When you're there and agree, it goes into the **Queue**. When an agent works on its own, it goes into **Proposals**.",
             "You can give it a time: \"put a check on this in the backlog in a month\". Claude records an exact date, the task sits in \"Waiting for a date\" and runs by itself when it comes.",
+        ]),
+        ("Requests from outside", [
+            "If you use Clockwize (the task app), you can press **\"Handle with Claude Code\"** on a task there, write what to do, choose a folder and **now** or **next harvest**. The widget picks the request up, and it goes into the project's **Queue** — your press is the approval.",
+            "It is off by default; turn it on in **Settings → General → Requests from outside**. The switch shows only when Clockwize's command-line tool is installed on this Mac. The harvest talks to Clockwize through that tool, which keeps its own sign-in — the harvest stores no key of it. This is the harvest's only link to an outside service, and it runs once every two minutes while the Mac is awake.",
+            "The instruction is what you wrote. What Clockwize knows about the task (name, description, client) is attached as information only: the agent never follows instructions written there.",
+            "Every step goes back to Clockwize: started, waiting for review (with the branch and the session), a question, a failure, and merged. A folder that wasn't found, or isn't a git repository, sends a question back.",
+            "**Now** runs only that task right away. If a harvest is running at that moment it runs in it or right after it; if there is no quota or Claude Code is signed out, it stays queued for the next harvest. When the service can't be reached, the dot at the top turns yellow and the update is sent again later.",
         ]),
     ]
 
@@ -3423,7 +3522,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var height: CGFloat {
         switch self {
         case .general: return 610
-        case .harvest: return 760
+        case .harvest: return 800
         case .models: return 540
         case .projects: return 420
         case .texts: return 580
@@ -3446,6 +3545,7 @@ final class SettingsModel: ObservableObject {
     @Published var fiveReserve = 15
     @Published var weeklyReserve = 2
     @Published var earlyDays = 3
+    @Published var notify = "all"
     @Published var saved = false
     @Published var prompts: [HPrompt] = []
     @Published var promptName = "task"
@@ -3466,6 +3566,7 @@ final class SettingsModel: ObservableObject {
         fiveReserve = Int(settings?.fiveReserve ?? 15)
         weeklyReserve = Int(settings?.weeklyReserve ?? 2)
         earlyDays = settings?.earlyDays ?? 3
+        notify = settings?.notify ?? "all"
         saved = false
     }
 
@@ -3548,6 +3649,12 @@ struct SettingsView: View {
     static let width: CGFloat = 600
 
     var tabs: [SettingsTab] { m.harvestInstalled ? SettingsTab.allCases : [.general] }
+    /// The outside sources worth showing: their tool is on this Mac, or the owner already turned them on.
+    var sources: [HSource] { (m.listing.settings?.sourceStatus ?? []).filter { $0.found || $0.enabled } }
+    var tabHeight: CGFloat {
+        let tab = tabs.contains(s.tab) ? s.tab : .general
+        return tab.height + (tab == .general && m.harvestInstalled && !sources.isEmpty ? 130 : 0)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -3563,7 +3670,7 @@ struct SettingsView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: Self.width, height: (tabs.contains(s.tab) ? s.tab : .general).height)
+        .frame(width: Self.width, height: tabHeight)
         .font(.system(size: 13))
         .environment(\.layoutDirection, uiHebrew ? .rightToLeft : .leftToRight)
         .focusEffectDisabled()
@@ -3619,6 +3726,23 @@ struct SettingsView: View {
                         .buttonStyle(.borderedProminent)
                     }
                 }
+                if !sources.isEmpty {
+                    Section {
+                        ForEach(sources, id: \.type) { source in
+                            Toggle(isOn: Binding(get: { source.enabled }, set: { m.actions?.setSource(source.type, on: $0) })) {
+                                titled(sourceTitle(source.type),
+                                       L("בקשות \"טפל עם Claude Code\" שמשם נכנסות לתור, והקציר מדווח לשם.",
+                                         "\"Handle with Claude Code\" requests from there join the queue, and the harvest reports back."))
+                            }
+                        }
+                    } header: {
+                        Text(L("בקשות מבחוץ", "Requests from outside"))
+                    } footer: {
+                        Text(L("כבוי עד שמדליקים. הקשר עובר דרך הכלי של השירות בשורת הפקודה, שמחזיק את ההתחברות בעצמו; הקציר לא שומר מפתח. אחת לשתי דקות כשהמק ער.",
+                               "Off until you turn it on. The link goes through the service's own command-line tool, which keeps its own sign-in; the harvest stores no key. Once every two minutes while the Mac is awake."))
+                            .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 Section {
                     HStack {
                         Button(L("עזרה", "Help")) { m.actions?.showHelp() }
@@ -3648,6 +3772,20 @@ struct SettingsView: View {
                     titled(L("קציר אוטומטי", "Automatic harvest"),
                            L("רץ לבד לפני האיפוס השבועי. \"הרץ עכשיו\" בווידג'ט עובד תמיד.",
                              "Runs by itself before the weekly reset. \"Run now\" in the widget always works."))
+                }
+            }
+            Section {
+                Picker(selection: Binding(get: { s.notify }, set: { v in
+                    s.notify = v
+                    m.actions?.saveHarvestSettings(["notify=" + v])
+                })) {
+                    Text(L("על כל שלב", "About every step")).tag("all")
+                    Text(L("רק כשצריכים אותי", "Only when I'm needed")).tag("needs_me")
+                    Text(L("רק בסוף ריצה", "Only when a run ends")).tag("run_end")
+                } label: {
+                    titled(L("התראות", "Notifications"),
+                           L("בין 22:00 ל־08:00 הן מגיעות בלי צליל. לחיצה על התראה פותחת את הסשן.",
+                             "Between 22:00 and 08:00 they come without a sound. A click opens the session."))
                 }
             }
             Section {
@@ -3725,6 +3863,13 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    func sourceTitle(_ type: String) -> String {
+        switch type {
+        case "clockwize": return "Clockwize"
+        default: return type.capitalized
+        }
     }
 
     // MARK: Models
@@ -4113,6 +4258,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     /// to catch it while it was running.
     var handledLaunchId: String?
     var listingLoaded = false
+    var pulling = false
+    var pulledOnce = false
+    var pullProblem = false
+    /// An `events` question is out (see `pollEvents`).
+    var eventsBusy = false
     /// `--pretend-weekly-reset-in <minutes>`: test hook that moves the weekly
     /// reset close, so the automatic harvest can be exercised on any day.
     var pretendWeeklyReset: Date?
@@ -4159,6 +4309,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             }
             return
         }
+        if args.contains("--test-notification") {
+            testNotification()
+            return
+        }
         if let i = args.firstIndex(of: "--snapshot-menubar"), i + 1 < args.count {
             snapshotMenuBar(to: args[i + 1])
             exit(0)
@@ -4197,7 +4351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         refresh()
         refreshUserLine()
         checkCLISignIn()
-        runEngine(["maintain"]) { [weak self] _ in self?.refreshListing() }
+        runEngine(["maintain"]) { [weak self] _ in self?.refreshListing { [weak self] in self?.pollEvents() } }
         // The 30 s tick refreshes relative times, the harvest listing and the
         // automatic harvest trigger, and doubles as the poll watchdog:
         // scheduling is a chain (each attempt schedules the next), so a single
@@ -4207,6 +4361,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         }
         tick.tolerance = 5
         pollAgainAfterWake()
+        pullAfterWake()
         closeDropDownOnOutsideClick()
         signal(SIGUSR1, SIG_IGN)
         let usr1 = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
@@ -4270,13 +4425,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         runner.checkExited()
         tickCount += 1
         let every = (panel.isVisible || model.harvestActive) ? 1 : 4
-        if tickCount % every == 0 { refreshListing() }
+        if tickCount % every == 0 {
+            refreshListing { [weak self] in self?.pollEvents() }
+        }
         updateAutoPlan()
         autoHarvestTick()
         refreshNotificationPermission()
         nudgeTick()
         dateNudgeTick()
         signInTick()
+        pullTick()
     }
 
     /// The right-click menu — built only here, the same in both modes except that menu bar mode
@@ -4742,6 +4900,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         return parseDate(obj["fetchedAt"])
     }
 
+    // MARK: Requests from outside
+
+    /// A source (Clockwize) is on and its tool is there: only then is anything asked, so a Mac without it
+    /// never starts an engine run for this.
+    var sourcesOn: Bool { model.listing.settings?.sourceStatus?.contains { $0.enabled && $0.found } == true }
+
+    /// Every 4th tick (about 2 minutes), and once as soon as the first listing is in.
+    func pullTick() {
+        guard listingLoaded, model.harvestInstalled else { return }
+        if !pulledOnce || tickCount % 4 == 0 {
+            pulledOnce = true
+            pullRequests()
+        }
+    }
+
+    /// When the Mac wakes: a pull a few seconds later, once the network is back.
+    func pullAfterWake() {
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { self?.pullRequests() }
+        }
+    }
+
+    /// `claude-harvest pull`: quietly. One at a time; a failure changes only the live dot — yellow, and never
+    /// over a red one (which is about Claude Code, and needs the owner).
+    func pullRequests() {
+        guard model.harvestInstalled, sourcesOn, !pulling else { return }
+        pulling = true
+        runEngine(["pull"]) { [weak self] data in
+            guard let self else { return }
+            self.pulling = false
+            let result = data.flatMap { try? JSONDecoder().decode(HPullResult.self, from: $0) }
+            self.pullEnded(result)
+        }
+    }
+
+    func pullEnded(_ result: HPullResult?) {
+        let fine = result?.ok == true || result?.busy == true
+        if !fine {
+            pullProblem = true
+            if model.dotColor != .systemRed {
+                setStatus(.systemYellow, L("אין חיבור לבקשות מבחוץ — מנסה שוב", "Can't reach the outside requests — trying again"))
+            }
+            return
+        }
+        if pullProblem {
+            pullProblem = false
+            if model.dotColor == .systemYellow, pollProblem == nil { setStatus(.systemGreen, L("מחובר", "Connected")) }
+        }
+        if (result?.requests ?? []).contains(where: { $0.outcome != "known" }) || !(result?.runNow ?? []).isEmpty {
+            refreshListing { [weak self] in self?.startRequested(result?.runNow ?? []) }
+        }
+    }
+
+    /// The requests that asked to run now: one run, limited to those tasks (the same as ▶ on each), started
+    /// only when nothing stands in the way — otherwise the engine offers them again in a while.
+    func startRequested(_ wanted: [HPullResult.RunNow]) {
+        let tasks = model.listing.queue.filter { t in wanted.contains { $0.project == t.project && $0.title == t.title } }
+        guard !tasks.isEmpty, !runner.isRunning, !model.harvestActive, model.signIn == nil, claudeExecutable() != nil else { return }
+        launchHarvest(mode: "manual", only: tasks)
+    }
+
+    func setSource(_ type: String, on: Bool) {
+        runEngine(["source", type, on ? "on" : "off"]) { [weak self] _ in
+            self?.refreshListing { [weak self] in
+                guard let self else { return }
+                if on { self.pullRequests() }
+            }
+        }
+    }
+
     // MARK: Harvest
 
     func refreshListing(then: (() -> Void)? = nil) {
@@ -4849,6 +5077,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
             }
             self.flash(nil)
             self.refreshListing()
+            // The engine records the run's start a moment after the launch: look for it then too.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.pollEvents() }
         }
     }
 
@@ -4887,8 +5117,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
                 if digestMissing {
                     body += L(" · מייל הסיכום לא נשלח — פרטים בדוח", " · the summary email wasn't sent — details in the report")
                 }
-                if !self.panel.isVisible || digestMissing { notify(title: appName, body: body) }
+                // The notification for a run's end comes from its `run_ended` event (`pollEvents`): the engine
+                // wrote it with the same figures, and a run that was cut off gets one too.
                 self.flash(body)
+                self.pollEvents()
                 // A run the owner started by hand ends where they can read it: the Claude app.
                 if self.model.listing.launch?.mode == "manual", self.model.lastRunInApp,
                    let sid = self.model.listing.launch?.sessionId {
@@ -5533,7 +5765,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .list])
+        completionHandler(notification.request.content.sound == nil ? [.banner, .list] : [.banner, .list, .sound])
     }
 
     /// The reminder: a click on it (or "כן, בוא נדבר") opens the conversation, "מחר" snoozes it a day.
@@ -5544,6 +5776,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         DispatchQueue.main.async { [weak self] in
             if category == "signin" {
                 if action != UNNotificationDismissActionIdentifier { self?.startSignIn() }
+            } else if category == "event" {
+                if action == UNNotificationDefaultActionIdentifier { self?.openEvent(response.notification.request.content.userInfo) }
             } else if category == "waiting" {
                 if action == "later" {
                     UserDefaults.standard.set(Date().addingTimeInterval(24 * 3600).timeIntervalSince1970,
@@ -5605,6 +5839,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
                      "\"\(first.title)\" is past its deadline. It's first in the queue for the next harvest.")
         }
         notify(title: appName, body: body)
+    }
+
+    // MARK: Step notifications
+
+    /// The engine writes one event per step of a run or a task (`events.jsonl`); this asks it for what is new
+    /// since the last one handled and posts a notification for each that the owner's `notify` setting lets
+    /// through. A local call, not the API, so while a harvest runs the 30 s tick can ask every time; otherwise it
+    /// follows the listing's slower pace. One at a time, and the last id handled is saved before anything is
+    /// posted, so a notification never comes twice. The first look (no id saved yet) only notes where the events
+    /// stand — an old night's events are not replayed.
+    func pollEvents() {
+        guard listingLoaded, !eventsBusy, FileManager.default.fileExists(atPath: harvestEngine.path) else { return }
+        eventsBusy = true
+        let seen = model.config.eventsSeen
+        runEngine(["events", "--since", seen.map(String.init) ?? "latest", "--limit", "50"]) { [weak self] data in
+            guard let self else { return }
+            self.eventsBusy = false
+            guard let data = data, let page = try? JSONDecoder().decode(HEvents.self, from: data),
+                  let last = page.lastId else { return }
+            self.handleEvents(page.events ?? [], lastId: last, more: page.more ?? false, seen: seen)
+        }
+    }
+
+    func handleEvents(_ events: [HEvent], lastId: Int, more: Bool, seen: Int?) {
+        var config = model.config
+        guard let seen = seen, lastId >= seen else {
+            // Nothing handled yet, or the engine's file starts over (its ids are lower than ours): start from where it stands.
+            config.eventsSeen = lastId
+            setConfig(config)
+            return
+        }
+        guard let newest = events.map({ $0.id }).max() else { return }
+        config.eventsSeen = newest
+        setConfig(config)
+        // A night's worth at once (the Mac was asleep) is the newest few, not a flood.
+        let shown = events.sorted { $0.id < $1.id }
+            .filter { eventShown($0.kind, mode: model.listing.settings?.notify) }.suffix(8)
+        for event in shown { postEvent(event) }
+        if more { pollEvents() }
+    }
+
+    /// Title: the project and the task (for a run: the app's name); body: the engine's one-line summary, in the
+    /// owner's language. Grouped by run, silent between 22:00 and 08:00.
+    func postEvent(_ e: HEvent) {
+        let isRun = e.kind.hasPrefix("run_")
+        let title = isRun ? appName : [e.project, e.title].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+        var info = ["kind": e.kind, "eventId": String(e.id)]
+        if let sid = e.sessionId { info["sessionId"] = sid }
+        notify(title: title.isEmpty ? appName : title, body: e.summary ?? e.question ?? "", category: "event",
+               id: "event-\(e.id)", thread: e.runId ?? "harvest", sound: !inQuietHours(), userInfo: info)
+    }
+
+    /// A click on a step's notification: a live session by its Remote Control id (the task's, or the
+    /// coordinator's), else the finished one the way the Done list opens it. A run's start or end with no session
+    /// recorded opens the newest run, as the footer's link does.
+    func openEvent(_ info: [AnyHashable: Any]) {
+        let sid = info["sessionId"] as? String
+        let current = model.listing.status?.current, launch = model.listing.launch
+        if let sid = sid {
+            if current?.sessionId == sid, let bridge = current?.bridgeSessionId {
+                openInClaudeApp(bridge)
+            } else if launch?.sessionId == sid, launch?.endedAt == nil, let bridge = launch?.bridgeSessionId {
+                openInClaudeApp(bridge)
+            } else {
+                openSessionInApp(sid)
+            }
+        } else if (info["kind"] as? String)?.hasPrefix("run_") == true {
+            if launch?.endedAt == nil { watchRun() } else { openLastRun() }
+        }
+    }
+
+    /// `--test-notification`: one sample step notification, then exit — to see how it looks and sounds. A bare
+    /// build can't use the notification center, so there it goes the way every notification of a bare build goes.
+    func testNotification() {
+        let post = {
+            notify(title: "alpha · " + L("עדכון התיעוד", "Update the docs"),
+                   body: L("ממתינה לאישור שלך · נוסף תיעוד", "Waiting for your approval · Added the docs"),
+                   category: "event", id: "event-test", thread: "test", sound: !inQuietHours(),
+                   userInfo: ["kind": "task_waiting_review", "eventId": "0"])
+            print(runsAsApp ? "posted through the notification center (sound: \(!inQuietHours()))"
+                            : "posted the way a bare build does (no notification center)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { exit(0) }
+        }
+        guard runsAsApp else { post(); return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
+            print("granted:", granted, "error:", error.map { String(describing: $0) } ?? "none")
+            DispatchQueue.main.async { clickableNotifications = granted; post() }
+        }
     }
 
     var talkPid: pid_t = 0
@@ -5810,7 +6132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         }
     }
 
-    /// `--snapshot-settings <png> [--tab general|harvest|models|projects|texts] [--light] [--he|--en]`:
+    /// `--snapshot-settings <png> [--tab general|harvest|models|projects|texts] [--demo] [--light] [--he|--en]`:
     /// one tab of the settings window, from the current listing — and exits.
     func snapshotSettings(to path: String) {
         let args = CommandLine.arguments
@@ -5823,6 +6145,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         }
         runEngine(["list"]) { data in
             if let data = data, let listing = try? JSONDecoder().decode(HListing.self, from: data) { self.model.listing = listing }
+            // --demo: as if Clockwize's tool were on this Mac and the switch on (the installed engine may predate it).
+            if args.contains("--demo") {
+                self.model.listing.settings?.sourceStatus = [HSource(type: "clockwize", enabled: true, cli: "clockwize", found: true)]
+            }
             self.settingsModel.load(self.model.listing.settings)
             runEngine(["prompts"]) { data in
                 self.takePrompts(data)
