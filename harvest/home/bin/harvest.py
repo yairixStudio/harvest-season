@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import date, datetime, timedelta, timezone
 
 HOME = os.path.expanduser(os.environ.get("HARVEST_HOME", "~/.claude/harvest"))
@@ -42,6 +43,8 @@ EVENTS_CAP = 500
 # The owner's own order for the queue (dragged in the widget): task keys "<project>::<title>", first to run first.
 QUEUE_ORDER = os.path.join(HOME, "queue-order.json")
 MERGED_RE = re.compile(r"merged (\d{4}-\d{2}-\d{2})")
+ACCEPTED_RE = re.compile(r"accepted (\d{4}-\d{2}-\d{2})")     # the owner's "Done" on a folder task (no branch to merge)
+FILES_PREFIX = "files: "
 DONE_LIST_DAYS = 30
 DONE_LIST_MAX = 40
 
@@ -340,6 +343,88 @@ def move_branch(repo, branch, target):
 
 def is_git(repo):
     return os.path.isdir(repo) and git(repo, "rev-parse", "--git-dir").returncode == 0
+
+
+# Folder mode: a project folder that exists but has no git. Its tasks run in the folder itself (no worktree, no
+# branch), edit nothing the owner didn't ask for, and end waiting for the owner's "Done" instead of a merge.
+FOLDER_MARK = "no-git folder"                       # a done folder task's result carries this part instead of a branch
+MANIFEST_DIR = os.path.join(HOME, "folder-manifests")
+MANIFEST_SKIP = {".git", "node_modules", "__pycache__", ".DS_Store"}
+MANIFEST_MAX_FILES = 40000
+MANIFEST_MAX_SECONDS = 25
+FILES_LISTED = 40                            # how many changed files a result / an update names
+
+
+def is_folder_project(repo):
+    """A project folder in folder mode: it exists and has no git at all. A folder with a `.git` entry (even one git
+    can't read right now, e.g. an iCloud file not downloaded) keeps the git behaviour."""
+    return os.path.isdir(repo) and not os.path.lexists(os.path.join(repo, ".git")) and not is_git(repo)
+
+
+def home_dir():
+    return os.path.realpath(os.path.expanduser("~"))
+
+
+def folder_problem(path):
+    """Why the harvest won't work in this (real) path, as a TEXT key, or None. Folder mode runs a session with the
+    folder as its working directory, so it stays inside the home folder and away from system folders, the home
+    folder itself, ~/Library (but not iCloud Drive's ~/Library/Mobile Documents) and hidden folders in home."""
+    home = home_dir()
+    for system in ("/System", "/Applications"):
+        if path == system or path.startswith(system + os.sep):
+            return "src_folder_system"
+    if path == os.sep or path == home:
+        return "src_folder_system"
+    if not path.startswith(home + os.sep):
+        return "src_folder_outside"
+    first = path[len(home) + 1:].split(os.sep)[0]
+    if first == "Library":
+        iCloud = os.path.join(home, "Library", "Mobile Documents")
+        return None if path == iCloud or path.startswith(iCloud + os.sep) else "src_folder_system"
+    if first.startswith("."):
+        return "src_folder_system"
+    return None
+
+
+def folder_manifest(path):
+    """What is in a folder now, to tell afterwards what a session created or changed: {relative path: [mtime, size]},
+    without .git / node_modules and the engine's own BACKLOG.md. Capped (files and seconds): `truncated` says the
+    picture is partial. Symlinks are not followed."""
+    out, started, truncated = {}, time.time(), False
+    stack = [path]
+    while stack and not truncated:
+        here = stack.pop()
+        try:
+            entries = list(os.scandir(here))
+        except OSError:
+            continue
+        for e in entries:
+            if len(out) >= MANIFEST_MAX_FILES or time.time() - started > MANIFEST_MAX_SECONDS:
+                truncated = True
+                break
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if e.name not in MANIFEST_SKIP:
+                        stack.append(e.path)
+                elif e.name not in MANIFEST_SKIP:
+                    rel = os.path.relpath(e.path, path)
+                    if rel == "BACKLOG.md":
+                        continue
+                    st = e.stat(follow_symlinks=False)
+                    out[rel] = [st.st_mtime, st.st_size]
+            except OSError:
+                continue
+    return out, truncated
+
+
+def manifest_file(slug):
+    return os.path.join(MANIFEST_DIR, slug + ".json")
+
+
+def changed_files(before, after):
+    """(created or changed, deleted) relative paths between two manifests, sorted."""
+    touched = sorted(r for r, v in after.items() if before.get(r) != v)
+    return touched, sorted(r for r in before if r not in after)
 
 
 def branch_exists(repo, branch):
@@ -914,10 +999,17 @@ def task_view(repo, t, r):
     if v["status"] == "done":
         parts = [x.strip() for x in result.split("·")]
         rest = [x for x in parts if x and not DATE_RE.fullmatch(x) and not BRANCH_RE.fullmatch(x)
-                and not re.fullmatch(r"\d+k", x) and not x.startswith("archived") and not MERGED_RE.fullmatch(x)]
+                and not re.fullmatch(r"\d+k", x) and not x.startswith("archived") and not MERGED_RE.fullmatch(x)
+                and x != FOLDER_MARK and not x.startswith(FILES_PREFIX) and not ACCEPTED_RE.fullmatch(x)]
         v["summary"] = " · ".join(rest)
         b = BRANCH_RE.search(result)
-        if b:
+        if FOLDER_MARK in parts:
+            # A task done in a folder without git: no branch, and the owner's "Done" takes the place of a merge.
+            v["folder"] = True
+            listed = next((x for x in parts if x.startswith(FILES_PREFIX)), "")
+            v["files"] = [x.strip() for x in listed[len(FILES_PREFIX):].split(" | ") if x.strip()]
+            v["branchState"] = "accepted" if ACCEPTED_RE.search(result) else "review"
+        elif b:
             v["branch"] = b.group(1)
             if v["branch"].startswith("backlog-") or "archived" in result:
                 v["branchState"] = "archived"
@@ -1053,7 +1145,7 @@ def history():
 # ---------- events (the widget's notifications) ----------
 
 EVENT_KINDS = ("run_started", "run_ended", "task_started", "task_waiting_review", "task_blocked", "task_failed",
-               "task_paused", "task_merged")
+               "task_paused", "task_merged", "task_accepted", "request_blocked", "source_unreachable")
 
 
 def event_lines():
@@ -1122,9 +1214,15 @@ def stop_reason_text(reason):
     return tr(key) if key in TEXT else reason
 
 
+def awaits_owner(t):
+    """A task that waits for the owner: blocked on a question, or done and not yet approved — a branch to merge,
+    or (folder mode) work in a folder with no git to mark Done."""
+    return t["status"] == "blocked" or (t["status"] == "done" and t.get("branchState") in ("unmerged", "review"))
+
+
 def waiting_count():
     tasks, _ = all_tasks(ratio())
-    return sum(1 for t in tasks if t["status"] == "blocked" or (t["status"] == "done" and t.get("branchState") == "unmerged"))
+    return sum(1 for t in tasks if awaits_owner(t))
 
 
 def run_summary(last):
@@ -1182,6 +1280,7 @@ def all_tasks(r):
         info = {"path": repo, "name": display_name(repo), "exists": os.path.isdir(repo), "proposalsOff": proposals_off(repo)}
         if info["exists"]:
             info["git"] = is_git(repo)
+            info["folderMode"] = not info["git"] and not os.path.lexists(os.path.join(repo, ".git"))
             lines, tasks = parse_backlog(repo)
             info["backlog"] = lines is not None
             for t in tasks:
@@ -1234,8 +1333,7 @@ def cmd_list(a):
         "proposals": sorted([t for t in tasks if t["status"] == "proposed" and not due_proposal(t)], key=by_priority),
         "dueProposals": sorted([t for t in tasks if due_proposal(t)], key=by_date),
         "deadlineRun": deadline_run(queue, usage),
-        "needsYou": [t for t in tasks if t["status"] == "blocked"
-                     or (t["status"] == "done" and t.get("branchState") == "unmerged")],
+        "needsYou": [t for t in tasks if awaits_owner(t)],
         "done": done_list(tasks),
         "ratio": r, "config": config(), "status": status(),
         "lock": dict(lk, live=lock_is_live(lk)) if lk else None,
@@ -1620,26 +1718,32 @@ def limit_fallback(hit, model):
 
 
 def cmd_plan(a):
+    emit(plan_result(a.mode, a.only, a.usage_json))
+
+
+def plan_result(mode, only_keys, usage_json):
+    """What `plan` answers: whether to harvest now, the next thing to do, or why not. `pull` asks it too, to know
+    whether a "run now" request can start before it hands the request to the widget."""
     cfg, r, st = config(), ratio(), status()
-    u, err = load_usage(a.usage_json)
+    u, err = load_usage(usage_json)
     res = {"harvest": False, "reason": None, "final": True, "next": None, "deferred": [],
-           "usage": u, "ratio": r, "config": cfg, "mode": a.mode}
+           "usage": u, "ratio": r, "config": cfg, "mode": mode}
     if not u:
         res["reason"] = "usage-unreadable: " + err
-        emit(res)
+        return res
     t = now()
     reset = parse_iso(u["weekly"].get("resetsAt"))
     if not reset:
         res["reason"] = "usage-unreadable: weekly reset time unknown"
-        emit(res)
+        return res
     hours_left = (reset - t).total_seconds() / 3600
     res["weeklyResetsInHours"] = round(hours_left, 2)
-    if a.mode == "auto" and hours_left > cfg["leadHours"] + AUTO_SLACK_H:
+    if mode == "auto" and hours_left > cfg["leadHours"] + AUTO_SLACK_H:
         res["reason"] = "too-early"
-        emit(res)
+        return res
     if hours_left * 60 <= CUTOFF_GUARD_MIN:
         res["reason"] = "cutoff-near"
-        emit(res)
+        return res
 
     s = settings()
     weekly_room = 100 - float(u["weekly"]["pct"]) - float(s["weeklyReserve"])
@@ -1656,7 +1760,7 @@ def cmd_plan(a):
                 "budgetTokens": int(budget), "limitedBy": "5h" if five_budget < weekly_budget else "weekly"})
 
     tasks, infos = all_tasks(r)
-    only = set(a.only or [])
+    only = set(only_keys or [])
     # A task waiting for its date stays out, unless the owner named it ("run it now anyway").
     candidates = [x for x in tasks if x["status"] == "open" and (task_key(x) in only if only else not x["waits"])]
     candidates = ordered_queue(candidates)
@@ -1684,7 +1788,7 @@ def cmd_plan(a):
                            "title": c["title"], "details": c["details"], "priority": c["priority"],
                            "complexity": c["complexity"], "tokens": c["tokens"], "model": model,
                            "scheduled": c["scheduled"], "deadline": c["deadline"], "overdue": c["overdue"]}
-    if res["next"] is None and a.mode == "auto" and not only and st.get("scansThisRun", 0) < MAX_SCANS_PER_RUN:
+    if res["next"] is None and mode == "auto" and not only and st.get("scansThisRun", 0) < MAX_SCANS_PER_RUN:
         open_or_proposed = {x["project"] for x in tasks if x["status"] in ("open", "proposed")}
         scanned = set(st.get("scannedThisRun", []))
         for info in infos:
@@ -1697,7 +1801,7 @@ def cmd_plan(a):
                 break
     if res["next"]:
         res["harvest"] = True
-        emit(res)
+        return res
     if not candidates:
         res["reason"] = "queue-empty"
     elif deferred_budget:
@@ -1711,7 +1815,7 @@ def cmd_plan(a):
         session_reset = parse_iso(st["limits"]["five"].get("until"))
     if res["reason"] == "5h-full" and session_reset and session_reset + timedelta(minutes=30) < reset:
         res["final"] = False
-    emit(res)
+    return res
 
 
 def cmd_begin(a):
@@ -1757,6 +1861,8 @@ def start_task(repo, title, model, usage_json, session_id=None):
     _, t = find_task(repo, title)
     if (t["fields"].get("status") or "open") != "open":
         fail("only open tasks can be started")
+    if is_folder_project(repo):
+        return start_folder_task(repo, t, title, model, usage_json, session_id)
     if not is_git(repo):
         fail("not a git repository: " + repo)
     base = base_branch(repo)
@@ -1779,18 +1885,8 @@ def start_task(repo, title, model, usage_json, session_id=None):
         r = git(repo, "worktree", "add", "-b", branch, path, base)
     if r.returncode:
         fail("git worktree add failed: " + r.stderr.strip())
-    u, _ = load_usage(usage_json)
-    current = {"project": repo, "projectName": display_name(repo), "title": title, "slug": slug,
-               "branch": branch, "base": base, "worktree": path, "model": model,
-               "tokens": tokens_of(t["fields"].get("tokens"), t["fields"].get("complexity")),
-               "details": t["fields"].get("details", ""), "priority": int_or(t["fields"].get("priority"), 2),
-               "complexity": t["fields"].get("complexity") or "medium", "added": t["fields"].get("added", ""),
-               "scheduled": t["fields"].get("scheduled", ""), "deadline": t["fields"].get("deadline", ""),
-               "source": t["fields"].get("source", ""),
-               "startedAt": iso(now()), "usageBefore": u, "resumed": bool(resumed)}
-    st = status()
-    st["current"] = current
-    save_status(st)
+    current = task_current(repo, t, title, model, usage_json,
+                           {"slug": slug, "branch": branch, "base": base, "worktree": path, "resumed": bool(resumed)})
     forget_run_now(t["fields"])
     report_source(t["fields"], "running", summary=tr("src_started", branch), branch=branch, session=session_id or "")
     append_event("task_started", run_id=current_run_id(), project=display_name(repo), title=title,
@@ -1799,9 +1895,46 @@ def start_task(repo, title, model, usage_json, session_id=None):
     return current
 
 
+def task_current(repo, t, title, model, usage_json, extra):
+    """The `current` record of a task being started (status.json), the same for a branch and for a folder."""
+    u, _ = load_usage(usage_json)
+    f = t["fields"]
+    current = {"project": repo, "projectName": display_name(repo), "title": title, "model": model,
+               "tokens": tokens_of(f.get("tokens"), f.get("complexity")),
+               "details": f.get("details", ""), "priority": int_or(f.get("priority"), 2),
+               "complexity": f.get("complexity") or "medium", "added": f.get("added", ""),
+               "scheduled": f.get("scheduled", ""), "deadline": f.get("deadline", ""),
+               "source": f.get("source", ""), "startedAt": iso(now()), "usageBefore": u}
+    current.update(extra)
+    st = status()
+    st["current"] = current
+    save_status(st)
+    return current
+
+
+def start_folder_task(repo, t, title, model, usage_json, session_id):
+    """Folder mode: the session works in the folder itself — no worktree, no branch. What is in the folder now is
+    saved aside (a manifest), so the end of the task can say which files it created or changed."""
+    stem = slugify(title, repo)
+    slug, n = stem, 2
+    while os.path.exists(manifest_file(slug)):
+        slug, n = "%s-%d" % (stem, n), n + 1
+    before, truncated = folder_manifest(repo)
+    write_json(manifest_file(slug), {"project": repo, "title": title, "files": before, "truncated": truncated})
+    current = task_current(repo, t, title, model, usage_json,
+                           {"slug": slug, "branch": "", "base": "", "worktree": repo, "folder": True, "resumed": False})
+    forget_run_now(t["fields"])
+    report_source(t["fields"], "running", summary=tr("src_started_folder"), session=session_id or "")
+    append_event("task_started", run_id=current_run_id(), project=display_name(repo), title=title,
+                 summary=tr("ev_task_started_on", model) if model else tr("ev_task_started"),
+                 session_id=session_id or live_launch_session(), source=t["fields"].get("source"))
+    return current
+
+
 def cmd_worktree(a):
     cur = start_task(os.path.abspath(a.project), a.title, a.model, a.usage_json)
-    emit({"ok": True, "path": cur["worktree"], "branch": cur["branch"], "base": cur["base"], "slug": cur["slug"]})
+    emit({"ok": True, "path": cur["worktree"], "branch": cur["branch"], "base": cur["base"], "slug": cur["slug"],
+          "folder": bool(cur.get("folder"))})
 
 
 def paused_branch(result):
@@ -1832,11 +1965,33 @@ def remove_worktree(repo, path):
     git(repo, "worktree", "prune")
 
 
-def finish_task(repo, title, outcome, summary, question, tokens, usage_json, session_id, tests=None):
+def record_finish(repo, title, cur, outcome, summary, tokens, usage_json, session_id, tests, updates, branch):
+    """The part of ending a task that is the same with a branch and in a folder: calibration, history, the run's
+    tally in status.json. Returns the history record."""
+    after, _ = load_usage(usage_json)
+    append_calibration(repo, cur["slug"], cur.get("model") or "", cur.get("tokens") or "",
+                       tokens or 0, cur.get("usageBefore"), after)
+    record = {"project": repo, "projectName": display_name(repo), "title": title,
+              "outcome": outcome if outcome in ("done", "paused") else updates["status"],
+              "branch": branch, "summary": summary, "tokens": tokens or 0}
+    append_history(dict(record, sessionId=session_id, tests=tests))
+    st = status()
+    st["doneThisRun"] = st.get("doneThisRun", []) + [record]
+    if st.get("cycle"):
+        key = {"done": "done", "blocked": "blocked", "paused": "paused"}.get(record["outcome"], "failed")
+        st["cycle"].setdefault(key, []).append(record)
+    st["current"] = None
+    save_status(st)
+    return record
+
+
+def finish_task(repo, title, outcome, summary, question, tokens, usage_json, session_id, tests=None, files=None):
     st = status()
     cur = st.get("current") or {}
     if cur.get("project") != repo or cur.get("title") != title:
         fail("finish-task does not match the task that was started", current=cur)
+    if cur.get("folder"):
+        return finish_folder_task(repo, title, cur, outcome, summary, question, tokens, usage_json, session_id, tests, files)
     branch, base = cur["branch"], cur["base"]
     if outcome == "paused":
         snapshot_worktree(cur["worktree"])
@@ -1883,21 +2038,8 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
     else:
         retry = updates["status"] == "open"
         report_source(t["fields"], "failed", summary=tr("src_retry", summary) if retry else summary, session=session_id or "")
-    after, _ = load_usage(usage_json)
-    append_calibration(repo, cur["slug"], cur.get("model") or "", cur.get("tokens") or "",
-                       tokens or 0, cur.get("usageBefore"), after)
-    record = {"project": repo, "projectName": display_name(repo), "title": title,
-              "outcome": outcome if outcome in ("done", "paused") else updates["status"],
-              "branch": branch if outcome == "done" or (outcome == "blocked" and commits) else None,
-              "summary": summary, "tokens": tokens or 0}
-    append_history(dict(record, sessionId=session_id, tests=tests))
-    st = status()
-    st["doneThisRun"] = st.get("doneThisRun", []) + [record]
-    if st.get("cycle"):
-        key = {"done": "done", "blocked": "blocked", "paused": "paused"}.get(record["outcome"], "failed")
-        st["cycle"].setdefault(key, []).append(record)
-    st["current"] = None
-    save_status(st)
+    record = record_finish(repo, title, cur, outcome, summary, tokens, usage_json, session_id, tests, updates,
+                           branch if outcome == "done" or (outcome == "blocked" and commits) else None)
     kept = branch if outcome == "done" or (outcome in ("blocked", "paused") and commits) else None
     kind, text = {"done": ("task_waiting_review", tr("ev_waiting_review", summary)),
                   "blocked": ("task_blocked", tr("ev_blocked", question if outcome == "blocked" else "")),
@@ -1909,9 +2051,105 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
             "branch": record["branch"], "summary": summary}
 
 
+def listed_files(files, limit=FILES_LISTED):
+    """A list of paths as one line for a person: the first `limit`, then how many more."""
+    shown = ", ".join(files[:limit])
+    return shown + (" " + tr("src_files_more", len(files) - limit) if len(files) > limit else "")
+
+
+def reported_files(repo, text):
+    """The files a task session named in its report (`--files`: commas or lines), as paths inside the folder."""
+    out = []
+    for raw in re.split(r"[\n,]+", text or ""):
+        raw = raw.strip().strip("`'\"")
+        if not raw:
+            continue
+        rel = os.path.relpath(raw, repo) if os.path.isabs(raw) else os.path.normpath(raw)
+        if not rel.startswith("..") and rel not in out:
+            out.append(rel)
+    return out
+
+
+def finish_folder_task(repo, title, cur, outcome, summary, question, tokens, usage_json, session_id, tests, reported):
+    """The end of a task done in a folder without git. Nothing to commit or merge: a success is `waiting_review`
+    with the summary and the files the session created or changed (found by comparing the folder with how it was
+    at the start, plus what the session itself reported when the folder was too big to compare fully), and it
+    waits for the owner's "Done". A failure, a question or a pause work as with a branch, minus the branch."""
+    summary = (summary or "").strip().replace("\n", " ")
+    saved = read_json(manifest_file(cur["slug"]), {}) or {}
+    files, deleted, partial = [], [], False
+    if outcome == "done":
+        after, truncated = folder_manifest(repo)
+        touched, gone = changed_files(saved.get("files", {}), after)
+        partial = bool(saved.get("truncated")) or truncated
+        files = touched + [r for r in reported_files(repo, reported) if partial and r not in touched]
+        deleted = gone
+    try:
+        os.remove(manifest_file(cur["slug"]))
+    except OSError:
+        pass
+    _, t = find_task(repo, title)
+    previous = t["fields"].get("result", "")
+    k = "%dk" % round((tokens or 0) / 1000.0)
+    listing = files + ["%s (deleted)" % r for r in deleted]
+    if outcome == "paused":
+        updates = {"status": "open", "result": tr("paused_empty", today(), summary)}
+    elif outcome == "done":
+        parts = [today(), FOLDER_MARK, summary]
+        if listing:
+            parts.append(FILES_PREFIX + " | ".join(listing[:FILES_LISTED] + (["…"] if len(listing) > FILES_LISTED else [])))
+        updates = {"status": "done", "result": " · ".join(parts + [k])}
+    elif outcome == "blocked":
+        question = (question or summary or tr("needs_decision")).replace("\n", " ")
+        updates = {"status": "blocked", "result": "%s · %s" % (today(), question)}
+    elif any(m in previous for m in FAILED_MARKERS):
+        updates = {"status": "blocked", "result": tr("failed_twice", today(), summary)}
+    else:
+        updates = {"status": "open", "result": tr("failed", today(), summary)}
+    set_fields(repo, title, updates)
+    if outcome == "done":
+        said = [tr("src_files", len(listing), listed_files(listing))] if listing else [tr("src_no_files")]
+        if partial:
+            said.append(tr("src_files_partial"))
+        report_source(t["fields"], "waiting_review", summary=" ".join([summary] + said), session=session_id or "")
+    elif outcome == "paused":
+        report_source(t["fields"], "running", summary=updates["result"], session=session_id or "")
+    elif outcome == "blocked":
+        report_source(t["fields"], "blocked", summary=summary, question=question, session=session_id or "")
+    else:
+        retry = updates["status"] == "open"
+        report_source(t["fields"], "failed", summary=tr("src_retry", summary) if retry else summary, session=session_id or "")
+    record = record_finish(repo, title, cur, outcome, summary, tokens, usage_json, session_id, tests, updates, None)
+    kind, text = {"done": ("task_waiting_review", tr("ev_waiting_review", summary)),
+                  "blocked": ("task_blocked", tr("ev_blocked", question if outcome == "blocked" else "")),
+                  "paused": ("task_paused", tr("ev_paused", summary))}.get(outcome, ("task_failed", tr("ev_failed", summary)))
+    append_event(kind, run_id=current_run_id(), project=display_name(repo), title=title, summary=text,
+                 question=question if outcome == "blocked" else None, session_id=session_id,
+                 source=t["fields"].get("source"))
+    return {"ok": True, "outcome": record["outcome"], "commits": 0, "backlog": updates, "branch": None,
+            "summary": summary, "folder": True, "files": listing, "partial": partial}
+
+
+def cmd_accept(a):
+    """The owner's "Done" on a task finished in a folder without git: there is no branch to merge, so this marks the
+    work approved and tells the source it is done. Only the owner."""
+    if os.environ.get("HARVEST_UNATTENDED"):
+        fail("only the owner marks work done")
+    repo = os.path.abspath(a.project)
+    _, t = find_task(repo, a.title)
+    v = task_view(repo, t, ratio())
+    if v["status"] != "done" or v.get("branchState") != "review":
+        fail("only a task done in a folder without git, and not yet marked done, can be accepted", project=repo, title=v["title"])
+    set_fields(repo, v["title"], {"result": v["result"] + " · accepted " + today()})
+    report_source(t["fields"], "done", summary=tr("src_accepted"))
+    append_event("task_accepted", run_id=current_run_id(), project=display_name(repo), title=v["title"],
+                 summary=tr("ev_accepted"), session_id=task_session(repo, v["title"]), source=t["fields"].get("source"))
+    emit({"ok": True, "project": repo, "title": v["title"], "files": v.get("files", [])})
+
+
 def cmd_finish_task(a):
     emit(finish_task(os.path.abspath(a.project), a.title, a.outcome, a.summary, a.question,
-                     a.tokens, a.usage_json, live_launch_session()))
+                     a.tokens, a.usage_json, live_launch_session(), files=a.files))
 
 
 def cmd_finish_scan(a):
@@ -2040,6 +2278,15 @@ def cmd_maintain(a):
                 set_fields(t["project"], t["title"], {"result": t["result"].replace(t["branch"], target) + " · archived " + today()})
                 report["archived"].append({"project": t["project"], "title": t["title"], "branch": target})
     report["relocated"] = relocate_missing()
+    # The before-pictures of folder-mode tasks that never ended (a cut-off run): a few days is plenty.
+    if not lock_is_live(read_lock()) and os.path.isdir(MANIFEST_DIR):
+        for name in os.listdir(MANIFEST_DIR):
+            path = os.path.join(MANIFEST_DIR, name)
+            try:
+                if time.time() - os.path.getmtime(path) > 3 * 24 * 3600:
+                    os.remove(path)
+            except OSError:
+                pass
     emit(report)
 
 
@@ -2139,8 +2386,21 @@ SOURCE_LOG = os.path.join(HOME, "logs", "sources.log")
 SOURCE_CLI_TIMEOUT = 20
 SOURCE_LOG_CAP = 200 * 1024
 PENDING_MAX_DAYS = 7          # an update that still can't be delivered after this long is dropped
-RUN_NOW_RETRY_MIN = 15        # a "run now" request is handed to the widget again after this many minutes...
-RUN_NOW_ATTEMPTS = 3          # ...at most this many times; then the task just waits for the next harvest
+# A "run now" request is handed to the widget on every pull until the task starts (or the request is cancelled or
+# finished). Only a safety brake: after RUN_NOW_BRAKE_AFTER offers that did not get the task going, the next ones
+# are spaced out (30 s, doubling, up to 15 min) so a run that fails at once can't loop through sessions.
+RUN_NOW_BRAKE_AFTER = 5
+RUN_NOW_BRAKE_S = 30
+RUN_NOW_BRAKE_MAX_S = 900
+SOURCE_FAILS_BEFORE_EVENT = 3  # a source that can't be reached this many pulls in a row is reported once
+SEEN_CAP = 200
+# What the source's contract lets the harvest report, from each status to the next ones; done, failed and
+# cancelled are final.
+REQUEST_STEPS = {"queued": ["picked", "blocked", "failed"], "picked": ["running", "blocked", "failed"],
+                 "running": ["waiting_review", "blocked", "failed"], "waiting_review": ["done", "running"],
+                 "blocked": ["queued", "running", "failed"]}
+REQUEST_FINAL = ("done", "failed", "cancelled")
+REQUEST_FORWARD = ("picked", "running", "waiting_review")    # the only statuses worth passing through on the way
 REQUEST_SOURCE = re.compile(r"^([a-z]+):request/([A-Za-z0-9._-]{1,80})$")
 DATA_BEGIN, DATA_END = "[BEGIN EXTERNAL TASK DATA]", "[END EXTERNAL TASK DATA]"
 DATA_FIELD_CAP = 1500
@@ -2151,13 +2411,53 @@ TEXT.update({
                            "en": "Added to the backlog of %s. A harvest is running: it runs in it or right after it."},
     "src_picked_next": {"he": "נוסף לבקלוג של %s. ירוץ בקציר הבא.", "en": "Added to the backlog of %s. It runs in the next harvest."},
     "src_started": {"he": "המשימה התחילה בענף %s.", "en": "Started on branch %s."},
+    "src_started_folder": {"he": "המשימה התחילה לעבוד בתיקייה עצמה (אין בה git, ולכן אין ענף).",
+                           "en": "Started working in the folder itself (it has no git, so there is no branch)."},
     "src_merged": {"he": "מוזג ל-%s.", "en": "Merged into %s."},
+    "src_accepted": {"he": "סומנה כבוצעה על ידי הבעלים.", "en": "Marked done by the owner."},
     "src_retry": {"he": "%s (ינסה שוב בקציר הבא)", "en": "%s (it will try again in the next harvest)"},
-    "src_no_folder": {"he": "התיקייה %s לא נמצאה או שאינה ריפו git. לאיזו תיקייה לשייך את הבקשה?",
-                      "en": "The folder %s wasn't found or isn't a git repository. Which folder is this request for?"},
+    "src_no_folder": {"he": "התיקייה %s לא נמצאה. לאיזו תיקייה לשייך את הבקשה?",
+                      "en": "The folder %s wasn't found. Which folder is this request for?"},
     "src_no_folder_given": {"he": "לא צוינה תיקייה לבקשה. לאיזו תיקייה לשייך אותה?",
                             "en": "No folder was given for this request. Which folder is it for?"},
+    "src_folder_outside": {"he": "התיקייה %s נמצאת מחוץ לתיקיית הבית, והקציר לא עובד שם. באיזו תיקייה בתוך תיקיית הבית נמצאת העבודה?",
+                           "en": "The folder %s is outside your home folder, and the harvest doesn't work there. Which folder inside your home folder holds the work?"},
+    "src_folder_system": {"he": "התיקייה %s היא תיקיית מערכת או תיקיית הבית עצמה, והקציר לא עובד בה. באיזו תיקיית פרויקט נמצאת העבודה?",
+                          "en": "The folder %s is a system folder or the home folder itself, and the harvest doesn't work in it. Which project folder holds the work?"},
+    "src_folder_own": {"he": "התיקייה %s היא תיקיית העבודה של הקציר עצמו. באיזו תיקיית פרויקט נמצאת העבודה?",
+                       "en": "The folder %s is the harvest's own working folder. Which project folder holds the work?"},
     "src_reopened": {"he": "חזר לתור אחרי תשובתך.", "en": "Back in the queue after your answer."},
+    "src_files": {"he": "קבצים שנוצרו או שונו (%d): %s", "en": "Files created or changed (%d): %s"},
+    "src_files_more": {"he": "ועוד %d", "en": "and %d more"},
+    "src_files_partial": {"he": "הרשימה חלקית: התיקייה גדולה מדי לסריקה מלאה", "en": "the list is partial: the folder is too big to scan fully"},
+    "src_no_files": {"he": "לא נוצר ולא שונה אף קובץ.", "en": "No file was created or changed."},
+    "src_wait_five": {"he": "ממתין למכסה: חלון 5 השעות מתאפס ב-%s. יתחיל מיד אחרי.",
+                      "en": "Waiting for quota: the 5-hour window resets at %s. It starts right after."},
+    "src_wait_weekly": {"he": "ממתין למכסה: המכסה השבועית מתאפסת ב-%s. יתחיל מיד אחרי.",
+                        "en": "Waiting for quota: the weekly quota resets at %s. It starts right after."},
+    "src_wait_usage": {"he": "ממתין: הקציר לא מצליח לקרוא כרגע את נתוני השימוש שלך ב-Claude. יתחיל ברגע שיצליח.",
+                       "en": "Waiting: the harvest can't read your Claude usage figures right now. It starts as soon as it can."},
+    "src_wait_model": {"he": "ממתין למכסה של המודל המתאים: היא מתאפסת ב-%s. יתחיל מיד אחרי.",
+                       "en": "Waiting for the quota of the model it needs: it resets at %s. It starts right after."},
+    "src_wait_cutoff": {"he": "ממתין למכסה: קרוב מדי לאיפוס השבועי כדי להתחיל. יתחיל אחרי האיפוס, ב-%s.",
+                        "en": "Waiting for quota: too close to the weekly reset to start. It starts after the reset, at %s."},
+    "ev_source_unreachable": {"he": "אין חיבור ל-%s (%d ניסיונות נכשלו ברצף): %s. בקשות חדשות לא יגיעו עד שהחיבור יחזור.",
+                              "en": "Can't reach %s (%d tries in a row failed): %s. New requests won't arrive until it is back."},
+    "ev_accepted": {"he": "סומנה כבוצעה", "en": "Marked done"},
+    "folder_mode_prompt": {
+        "he": ("מצב תיקייה: בתיקייה הזו אין git, ולכן אין ענף לבדיקה. ההוראות למעלה על worktree, על התיקייה של הבעלים, על ענף, על staging ועל commit "
+               "לא חלות: הסשן עובד בתיקייה עצמה, וזו התיקייה היחידה שלו.\n"
+               "- אל תשנה, תעביר או תמחק קבצים קיימים, אלא אם ההוראה של הבעלים מבקשת זאת במפורש.\n"
+               "- כל תוצר חדש נכתב לקובץ חדש.\n"
+               "- לעולם אל תפרסם, תעלה לאוויר, תדחוף או תשלח משהו.\n"
+               "- סיים ברשימה של כל קובץ שיצרת או שינית, גם בסיכום וגם ב-`--files` של task-report."),
+        "en": ("Folder mode: this folder has no git, so there is no branch to review. The instructions above about the worktree, "
+               "the owner's checkout, the branch, staging and commits do not apply: the session works in the folder itself, "
+               "which is its only place.\n"
+               "- Don't change, move or delete existing files unless the owner's prompt explicitly asks for it.\n"
+               "- Put any new output in a new file.\n"
+               "- Never publish, deploy, push or send anything.\n"
+               "- End with a list of every file you created or changed, in your summary and in the `--files` flag of task-report.")},
 })
 
 
@@ -2218,7 +2518,7 @@ def run_source_cli(src, args):
     except OSError as e:
         return False, str(e)
     if r.returncode != 0:
-        return False, ("exit %d: %s" % (r.returncode, (r.stderr or r.stdout).strip()))[:300]
+        return False, ("exit %d: %s" % (r.returncode, (r.stderr or r.stdout).strip()))[:1000]
     return True, r.stdout
 
 
@@ -2239,6 +2539,8 @@ def source_state():
     st = read_json(SOURCE_STATE, {}) or {}
     st.setdefault("pending", {})
     st.setdefault("runNow", {})
+    st.setdefault("blockedSeen", {})
+    st.setdefault("health", {})
     return st
 
 
@@ -2268,9 +2570,75 @@ def update_args(request_id, update):
     return args
 
 
+def request_conflict(why):
+    """The request's status a 409 reports, from the CLI's error text: the answer is JSON whose `status` is the
+    request's own current status (it replaces the HTTP code in the CLI's output). None when `why` isn't that."""
+    start, end = why.find("{"), why.rfind("}")
+    if start < 0 or end < start:
+        return None
+    try:
+        body = json.loads(why[start:end + 1])
+    except ValueError:
+        return None
+    cur = body.get("status") if isinstance(body, dict) else None
+    return cur if isinstance(cur, str) and (cur in REQUEST_STEPS or cur in REQUEST_FINAL) else None
+
+
+def next_step(cur, goal):
+    """The first status to report to get a request from `cur` to `goal` through the contract's steps — forward only
+    (picked, running, waiting_review): a running request is never sent through blocked to deliver a stale update —
+    or None when there is no way (the request is already past it)."""
+    seen, frontier = {cur}, [(cur, None)]
+    while frontier:
+        nxt = []
+        for here, first in frontier:
+            for to in REQUEST_STEPS.get(here, []):
+                if to == goal:
+                    return first or to
+                if to not in seen and to in REQUEST_FORWARD:
+                    seen.add(to)
+                    nxt.append((to, first or to))
+        frontier = nxt
+    return None
+
+
+def deliver_update(src, e):
+    """Tells the source one owed update. Returns (`delivered` | `dropped` | `failed`, why). The request may have
+    moved on since the update was written (the owner cancelled it, another run finished it): a 409 that says so is
+    not retried forever — a final request makes the update pointless (dropped), and one still going is brought to
+    the update's status by its next legal step first."""
+    rid, update = e["id"], e["update"]
+    ok, why = run_source_cli(src, update_args(rid, update))
+    stuck_at = None
+    for _ in range(4):
+        if ok:
+            return "delivered", ""
+        cur = request_conflict(why)
+        if cur is None or cur == stuck_at:
+            return "failed", why
+        stuck_at = cur
+        goal = update["status"]
+        if cur in REQUEST_FINAL:
+            source_log("request %s is already %s: dropping the owed update %s" % (rid, cur, goal))
+            return "dropped", why
+        step = next_step(cur, goal)
+        if step is None:
+            source_log("request %s is %s, past the owed update %s: dropping it" % (rid, cur, goal))
+            return "dropped", why
+        if step == goal:
+            return "failed", why        # a legal step that was refused anyway (another request holds the task): later
+        source_log("request %s is %s, not where the owed update %s expects: reporting %s first" % (rid, cur, goal, step))
+        ok, why = run_source_cli(src, update_args(rid, dict(update, status=step, question="")))
+        if not ok:
+            continue
+        ok, why = run_source_cli(src, update_args(rid, update))
+    return "failed", why
+
+
 def flush_updates(only=None):
     """Delivers the undelivered updates (`only`: one request's key). A failure is logged and stays for the next
-    pull; one that has stayed a week is dropped. Returns how many are still waiting."""
+    pull; one that has stayed a week is dropped, and so is one the source says can no longer apply (see
+    `deliver_update`). Returns how many are still waiting."""
     with StateLock():
         todo = [dict(e) for k, e in source_state()["pending"].items() if only is None or k == only]
     delivered, dropped, failed = [], [], {}
@@ -2280,9 +2648,11 @@ def flush_updates(only=None):
         if not src:
             dropped.append(e)           # the source was switched off: nothing more to tell it
             continue
-        ok, why = run_source_cli(src, update_args(e["id"], e["update"]))
-        if ok:
+        outcome, why = deliver_update(src, e)
+        if outcome == "delivered":
             delivered.append(e)
+        elif outcome == "dropped":
+            dropped.append(e)
         elif age >= PENDING_MAX_DAYS:
             source_log("giving up on %s %s after %d days: %s" % (e["update"]["status"], e["id"], age, why))
             dropped.append(e)
@@ -2353,29 +2723,40 @@ def request_details(kind, req):
 
 
 def resolve_folder(folder):
-    """The project a request's folder belongs to: the registered path when the folder is one, else its repository's
-    root (a worktree counts as its main repository). None when there is no such git repository, or the folder is the
-    harvest's own."""
-    if not (folder or "").strip():
-        return None
-    folder = os.path.realpath(os.path.expanduser(folder.strip()))
-    if not os.path.isdir(folder) or git(folder, "rev-parse", "--git-dir").returncode != 0:
-        return None
-    for p in projects():
-        if os.path.realpath(p) == folder:
-            return p
-    top = git(folder, "rev-parse", "--show-toplevel").stdout.strip() or folder
-    common = git(top, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
-    if common.endswith("/.git"):
-        top = os.path.dirname(common)
-    top = os.path.realpath(top)
+    """The project a request's folder belongs to, as (project, None); or (None, the question to ask the source).
+    A git repository: the registered path when the folder is one, else the repository's root (a worktree counts as
+    its main repository). A folder with no git is a project in folder mode, as it is — if it is inside the home
+    folder and not a system folder (`folder_problem`). Missing folders and the harvest's own folder are refused."""
+    raw = (folder or "").strip()
+    if not raw:
+        return None, tr("src_no_folder_given")
+    path = os.path.realpath(os.path.expanduser(raw))
+    if not os.path.isdir(path):
+        return None, tr("src_no_folder", raw)
     work = os.path.realpath(WORKDIR)
-    if top == work or top.startswith(work + os.sep):
-        return None
+    if path == work or path.startswith(work + os.sep):
+        return None, tr("src_folder_own", raw)
     for p in projects():
-        if os.path.realpath(p) == top:
-            return p
-    return top
+        if os.path.realpath(p) == path:
+            return p, None
+    if git(path, "rev-parse", "--git-dir").returncode == 0:
+        top = git(path, "rev-parse", "--show-toplevel").stdout.strip() or path
+        common = git(top, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+        if common.endswith("/.git"):
+            top = os.path.dirname(common)
+        top = os.path.realpath(top)
+        # A repository around the whole home folder (dotfiles) is not the project: the folder itself is.
+        if top not in (home_dir(), os.sep):
+            if top == work or top.startswith(work + os.sep):
+                return None, tr("src_folder_own", raw)
+            for p in projects():
+                if os.path.realpath(p) == top:
+                    return p, None
+            return top, None
+    problem = folder_problem(path)
+    if problem:
+        return None, tr(problem, raw)
+    return path, None
 
 
 def find_request_task(kind, request_id):
@@ -2403,8 +2784,30 @@ def task_update(repo, t):
     if v["status"] == "done":
         if v.get("branchState") == "unmerged":
             return {"status": "waiting_review", "summary": v.get("summary", ""), "branch": v.get("branch", "")}
+        if v.get("branchState") == "review":
+            files = v.get("files", [])
+            said = tr("src_files", len(files), listed_files(files)) if files else tr("src_no_files")
+            return {"status": "waiting_review", "summary": " ".join([v.get("summary", ""), said])}
         return {"status": "done", "summary": v.get("summary", ""), "branch": v.get("branch", "")}
     return None
+
+
+def tell_request_blocked(kind, rid, title, question, state_result):
+    """A request blocked at pull never became a task, so nothing else would tell the owner: one `request_blocked`
+    event (the widget notifies for it) with the question as its body. Once per request and question — a request the
+    source lists again because the update couldn't be delivered doesn't ring again."""
+    key = "%s/%s/%s" % (kind, rid, hashlib.sha1(question.encode("utf-8")).hexdigest()[:10])
+    with StateLock():
+        st = source_state()
+        if key in st["blockedSeen"]:
+            return
+        st["blockedSeen"][key] = iso(now())
+        for old in sorted(st["blockedSeen"], key=st["blockedSeen"].get)[:-SEEN_CAP]:
+            del st["blockedSeen"][old]
+        write_json(SOURCE_STATE, st)
+    if append_event("request_blocked", project=kind.capitalize(), title=title,
+                    summary=question, question=question, source="%s:request/%s" % (kind, rid)):
+        state_result["events"] += 1
 
 
 def take_request(kind, req, state_result):
@@ -2444,13 +2847,13 @@ def take_request(kind, req, state_result):
         if req.get("run") == "now" and (t["fields"].get("status") or "open") == "open":
             state_result["wantRunNow"].append((kind, rid, repo, t["title"]))
         return row
-    repo = resolve_folder(req.get("folder"))
+    repo, question = resolve_folder(req.get("folder"))
+    name = neutral(req.get("task_name"), 120) or "request " + rid
+    base = "Clockwize: " + name
     if not repo:
-        folder = str(req.get("folder") or "").strip()
-        queue_update(kind, rid, {"status": "blocked",
-                                 "question": tr("src_no_folder", folder) if folder else tr("src_no_folder_given")})
-        return dict(row, outcome="blocked", folder=folder)
-    base = "Clockwize: " + (neutral(req.get("task_name"), 120) or "request " + rid)
+        queue_update(kind, rid, {"status": "blocked", "question": question})
+        tell_request_blocked(kind, rid, name, question, state_result)
+        return dict(row, outcome="blocked", folder=str(req.get("folder") or "").strip())
     _, existing = parse_backlog(repo)
     title = base
     if any(x["title"] == title for x in existing or []):
@@ -2461,7 +2864,8 @@ def take_request(kind, req, state_result):
     except Refused as e:
         source_log("request %s not added: %s" % (rid, e))
         return dict(row, outcome="refused", error=str(e))
-    row.update(outcome="added", project=repo, title=out["title"], registered=out["registered"], runNow=run_now)
+    row.update(outcome="added", project=repo, title=out["title"], registered=out["registered"], runNow=run_now,
+               folderMode=is_folder_project(repo))
     live = lock_is_live(read_lock())
     summary = tr("src_picked_running" if run_now and live else "src_picked_now" if run_now else "src_picked_next",
                  display_name(repo))
@@ -2481,22 +2885,135 @@ def pull_lock():
     return f
 
 
+def note_health(kind, ok, why, state_result):
+    """Counts the pulls in a row that couldn't ask the source. The third failure in a row is one `source_unreachable`
+    event — the widget only changes a dot, so without it a request could wait unseen — and no more until the source
+    answers again."""
+    with StateLock():
+        st = source_state()
+        h = st["health"].setdefault(kind, {"fails": 0, "notified": False})
+        if ok:
+            if not h["fails"] and not h["notified"]:
+                return
+            h.update(fails=0, notified=False)
+            fire = False
+        else:
+            h["fails"] += 1
+            fire = h["fails"] >= SOURCE_FAILS_BEFORE_EVENT and not h["notified"]
+            h["notified"] = h["notified"] or fire
+        write_json(SOURCE_STATE, st)
+        fails = h["fails"]
+    if fire and append_event("source_unreachable", project=kind.capitalize(),
+                             summary=tr("ev_source_unreachable", kind.capitalize(), fails, " ".join(why.split())[:140])):
+        state_result["events"] += 1
+
+
+def quota_wait(res):
+    """For a "run now" task the plan won't start: (key, text) — the same key while the reason and the hour it ends
+    are the same — or None when the reason isn't about quota."""
+    reason, u = res.get("reason") or "", res.get("usage") or {}
+    if reason.startswith("usage-unreadable"):
+        return "usage", tr("src_wait_usage")
+    weekly = parse_iso((u.get("weekly") or {}).get("resetsAt"))
+    five = parse_iso((u.get("session") or {}).get("resetsAt"))
+    st = status()
+    if limit_active(st, "five"):
+        five = parse_iso(st["limits"]["five"].get("until")) or five
+    scoped = parse_iso((u.get("scoped") or {}).get("resetsAt")) or weekly
+    kind, when = {"5h-full": ("five", five), "weekly-full": ("weekly", weekly), "model-full": ("model", scoped),
+                  "cutoff-near": ("cutoff", weekly)}.get(reason, (None, None))
+    if not kind or not when:
+        return None
+    local = when.astimezone()
+    shown = local.strftime("%H:%M") if local.date() == datetime.now().astimezone().date() else local.strftime("%d.%m %H:%M")
+    return "%s/%s" % (kind, when.strftime("%Y-%m-%dT%H")), tr("src_wait_" + kind, shown)
+
+
+def run_now_gap(attempts):
+    """Seconds to leave between offers: none at first, then the safety brake."""
+    if attempts < RUN_NOW_BRAKE_AFTER:
+        return 0
+    return min(RUN_NOW_BRAKE_S * 2 ** (attempts - RUN_NOW_BRAKE_AFTER), RUN_NOW_BRAKE_MAX_S)
+
+
+def run_now_step(wanted, report):
+    """The tasks whose request says "now". Each one is offered to the widget on every pull until it starts (the
+    task starting, or its request being cancelled or finished, ends the offer) — but only when nothing stands in
+    the way: not while a harvest runs or is starting (it begins right after that one ends), and not when the plan
+    says the quota won't allow it. That last case is told to the source once (status stays `picked`) instead of
+    sending the widget to start a run that would end at once."""
+    with StateLock():
+        st = source_state()
+        dirty = False
+        for kind, rid, repo, title in wanted:
+            if pending_key(kind, rid) not in st["runNow"]:
+                st["runNow"][pending_key(kind, rid)] = {"project": repo, "title": title, "attempts": 0, "emittedAt": None}
+                dirty = True
+        entries = {}
+        for key, e in list(st["runNow"].items()):
+            lines, tasks = parse_backlog(e["project"])
+            t = next((x for x in tasks or [] if x["title"] == e["title"]
+                      and x["fields"].get("source", "").endswith("request/" + key.split("/", 1)[1])), None)
+            if t is None or (t["fields"].get("status") or "open") != "open":
+                del st["runNow"][key]       # started, finished, cancelled or gone
+                dirty = True
+            else:
+                entries[key] = dict(e)
+        if dirty:
+            write_json(SOURCE_STATE, st)
+    if not entries:
+        return
+    if lock_is_live(read_lock()) or live_launch_session():
+        return
+    offered, waiting = [], {}
+    for key, e in entries.items():
+        last = parse_iso(e.get("emittedAt"))
+        if last and (now() - last).total_seconds() < run_now_gap(e["attempts"]):
+            continue
+        res = plan_result("manual", [e["project"] + "::" + e["title"]], None)
+        if res["harvest"]:
+            offered.append(key)
+            continue
+        wait = quota_wait(res)
+        report.setdefault("runNowWaiting", []).append({"project": e["project"], "title": e["title"],
+                                                       "reason": res.get("reason")})
+        if wait:
+            waiting[key] = wait
+    told = []
+    with StateLock():
+        st = source_state()
+        for key in offered:
+            if key in st["runNow"]:
+                st["runNow"][key]["emittedAt"] = iso(now())
+                st["runNow"][key]["attempts"] += 1
+                st["runNow"][key].pop("waitKey", None)
+                report["runNow"].append({"project": st["runNow"][key]["project"], "title": st["runNow"][key]["title"]})
+        for key, (wait_key, text) in waiting.items():
+            if key in st["runNow"] and st["runNow"][key].get("waitKey") != wait_key:
+                st["runNow"][key]["waitKey"] = wait_key
+                told.append((key, text))
+        write_json(SOURCE_STATE, st)
+    for key, text in told:
+        kind, rid = key.split("/", 1)
+        queue_update(kind, rid, {"status": "picked", "summary": text})
+
+
 def cmd_pull(a):
-    """For each enabled source: hand over what the owner asked of Claude there. First the updates that couldn't be
-    delivered earlier; then each queued request becomes an open task (see `take_request`); then the requests that
-    want to run now are listed under `runNow` for the widget to start (`launch --only`) — once no harvest is
-    running, and again after RUN_NOW_RETRY_MIN minutes while the task is still waiting. Quiet and safe to run
-    often. Not for unattended runs: only the owner's own button approves work."""
+    """For each enabled source: hand over what the owner asked of Claude there. First the requests that are queued
+    there become open tasks (see `take_request`) — a folder with no git is a project in folder mode; then the
+    updates that couldn't be delivered earlier go out; then the requests that want to run now are listed under
+    `runNow` for the widget to start (`launch --only`), on every pull until the task starts. Quiet and safe to run
+    often (the widget runs it every 15 s). Not for unattended runs: only the owner's own button approves work."""
     if os.environ.get("HARVEST_UNATTENDED"):
         fail("unattended runs cannot pull requests")
     sources = enabled_sources()
-    report = {"ok": True, "sources": [], "requests": [], "runNow": [], "pending": 0}
+    report = {"ok": True, "sources": [], "requests": [], "runNow": [], "pending": 0, "events": 0}
     if not sources:
         emit(report)
     guard = pull_lock()
     if guard is None:
         emit(dict(report, busy=True))
-    state_result = {"wantRunNow": []}
+    state_result = {"wantRunNow": [], "events": 0}
     for src in sources:
         row = {"type": src["type"], "ok": True}
         ok, out = run_source_cli(src, ["claude-requests", "list", "--status", "queued"])
@@ -2517,27 +3034,11 @@ def cmd_pull(a):
             for req in listed:
                 if isinstance(req, dict):
                     report["requests"].append(take_request(src["type"], req, state_result))
+        note_health(src["type"], ok, "" if ok else out, state_result)
         report["sources"].append(row)
+    run_now_step(state_result["wantRunNow"], report)
     report["pending"] = flush_updates()
-    live = lock_is_live(read_lock())
-    with StateLock():
-        st = source_state()
-        for kind, rid, repo, title in state_result["wantRunNow"]:
-            st["runNow"].setdefault(pending_key(kind, rid),
-                                    {"project": repo, "title": title, "attempts": 0, "emittedAt": None})
-        for key, e in list(st["runNow"].items()):
-            lines, tasks = parse_backlog(e["project"])
-            t = next((x for x in tasks or [] if x["title"] == e["title"]
-                      and x["fields"].get("source", "").endswith("request/" + key.split("/", 1)[1])), None)
-            if t is None or (t["fields"].get("status") or "open") != "open" or e["attempts"] >= RUN_NOW_ATTEMPTS:
-                del st["runNow"][key]       # started, finished, gone — or tried enough: it waits for the next harvest
-                continue
-            last = parse_iso(e.get("emittedAt"))
-            if not live and (last is None or (now() - last).total_seconds() > RUN_NOW_RETRY_MIN * 60):
-                e["emittedAt"] = iso(now())
-                e["attempts"] += 1
-                report["runNow"].append({"project": e["project"], "title": e["title"]})
-        write_json(SOURCE_STATE, st)
+    report["events"] = state_result["events"]
     guard.close()
     emit(report)
 
@@ -2905,8 +3406,8 @@ def branch_brief(repo, branch):
 
 def cmd_brief(a):
     """What the harvest left waiting for the owner, oldest first, compact enough to read instead of exploring
-    the repositories: every unmerged harvest branch (with branch_brief), every blocked question, and every
-    proposal whose date has come."""
+    the repositories: every unmerged harvest branch (with branch_brief), every task done in a folder without git
+    (its files), every blocked question, and every proposal whose date has come."""
     tasks, _ = all_tasks(ratio())
     tests = {}
     for h in history():
@@ -2918,6 +3419,9 @@ def cmd_brief(a):
         if t["status"] == "done" and t.get("branchState") == "unmerged":
             item.update(summary=t.get("summary"), branch=t["branch"], tests=tests.get((t["project"], t["title"])))
             item.update(branch_brief(t["project"], t["branch"]))
+        elif t["status"] == "done" and t.get("branchState") == "review":
+            item.update(summary=t.get("summary"), folder=True, files=t.get("files", []),
+                        tests=tests.get((t["project"], t["title"])))
         elif t["status"] == "blocked":
             item.update(question=t.get("question"), details=t.get("details"))
         elif due_proposal(t):
@@ -2937,6 +3441,9 @@ def cmd_merge(a):
     _, t = find_task(repo, a.title)
     v = task_view(repo, t, ratio())
     branch = v.get("branch")
+    if v.get("branchState") == "review":
+        fail("this task was done in a folder without git: there is no branch to merge — `claude-harvest accept` marks it done",
+             project=repo, title=v["title"])
     if v["status"] != "done" or not branch:
         fail("only a done task with a harvest branch can be merged", project=repo, title=v["title"])
     if v.get("branchState") != "unmerged":
@@ -2972,7 +3479,8 @@ class Refused(Exception):
 
 
 def waiting_task(repo, title, r=None):
-    """The task under this title that waits for the owner: done with an unmerged harvest branch, or blocked.
+    """The task under this title that waits for the owner: done with an unmerged harvest branch (or, in a folder
+    without git, work not yet marked Done), or blocked.
     A title can come back as a new task once the old one is done, so it's the section in that state."""
     lines, tasks = parse_backlog(repo)
     if lines is None:
@@ -2981,7 +3489,7 @@ def waiting_task(repo, title, r=None):
     for t in reversed(tasks):
         if t["title"] == title.strip():
             v = task_view(repo, t, r)
-            if v["status"] == "blocked" or (v["status"] == "done" and v.get("branchState") == "unmerged"):
+            if awaits_owner(v):
                 return lines, t, v
     raise Refused("nothing waits for the owner under this title: " + title, project=repo)
 
@@ -3021,8 +3529,7 @@ def cmd_reject(a):
         if a.project or a.title:
             fail("--all takes no project or title")
         r = ratio()
-        waiting = [t for t in all_tasks(r)[0]
-                   if t["status"] == "blocked" or (t["status"] == "done" and t.get("branchState") == "unmerged")]
+        waiting = [t for t in all_tasks(r)[0] if awaits_owner(t)]
         rejected, refused = [], []
         for t in waiting:
             try:
@@ -3320,7 +3827,8 @@ def update_current(extra):
 
 
 def cmd_run_task(a):
-    """One task, start to finish: a worktree inside its project, a session there named "Harvest · <title>" (in the owner's language) that
+    """One task, start to finish: a worktree inside its project (a project folder without git: the folder itself,
+    no worktree and no branch), a session there named "Harvest · <title>" (in the owner's language) that
     does the task and reports with task-report, then the result recorded (backlog, branch, calibration,
     history). Takes minutes — run it in the background and wait for it."""
     import uuid
@@ -3329,10 +3837,14 @@ def cmd_run_task(a):
     cur = start_task(repo, a.title, a.model, a.usage_json, session_id)
     os.makedirs(TASK_RESULTS, exist_ok=True)
     result_path = os.path.join(TASK_RESULTS, session_id + ".json")
+    folder = bool(cur.get("folder"))
     prompt = fill_template("task-agent-prompt.md", {
-        "project path": repo, "worktree path": cur["worktree"], "branch": cur["branch"], "base": cur["base"],
+        "project path": repo, "worktree path": cur["worktree"],
+        "branch": "(none: no git here)" if folder else cur["branch"], "base": "(none)" if folder else cur["base"],
         "title": a.title, "priority": cur["priority"], "complexity": cur["complexity"],
         "tokens": cur["tokens"], "details": cur["details"]})
+    if folder:
+        prompt += "\n\n" + tr("folder_mode_prompt")
     if cur.get("resumed"):
         prompt += ("\n\nAn earlier attempt at this task stopped at a usage limit. Its work is already on this branch"
                    " (`git log %s..HEAD`; the last commit may be a WIP snapshot the harvest made of uncommitted"
@@ -3367,7 +3879,7 @@ def cmd_run_task(a):
     record_session(repo, cur["complexity"], stats)
     tokens = stats["total"]
     out = finish_task(repo, a.title, res.get("status", "failed"), res.get("summary"), res.get("question"),
-                      tokens, a.usage_json, info["sessionId"], tests=res.get("tests"))
+                      tokens, a.usage_json, info["sessionId"], tests=res.get("tests"), files=res.get("files"))
     emit(dict(out, sessionId=info["sessionId"], sessionName=info["name"], tokens=tokens, tests=res.get("tests"),
               question=res.get("question"), closedIdle=info.get("closedIdle", False),
               switches=info["switches"], limitHit=info.get("limitHit")))
@@ -3416,7 +3928,7 @@ def cmd_task_report(a):
     if not path:
         fail("task-report runs only inside a harvest task session")
     write_json(path, {"status": a.status, "summary": a.summary, "question": a.question,
-                      "tests": a.tests, "at": iso(now())})
+                      "tests": a.tests, "files": a.files, "at": iso(now())})
     emit({"ok": True, "status": a.status})
 
 
@@ -3545,6 +4057,10 @@ def main():
     p.add_argument("project"); p.add_argument("title")
     p.set_defaults(fn=cmd_merge)
 
+    p = sub.add_parser("accept", help="the owner's Done on a task finished in a folder without git")
+    p.add_argument("project"); p.add_argument("title")
+    p.set_defaults(fn=cmd_accept)
+
     p = sub.add_parser("reject")
     p.add_argument("project", nargs="?"); p.add_argument("title", nargs="?")
     p.add_argument("--all", action="store_true", help="everything that waits for the owner")
@@ -3607,6 +4123,7 @@ def main():
     p.add_argument("--outcome", choices=("done", "blocked", "failed", "paused"), required=True)
     p.add_argument("--summary", default=""); p.add_argument("--question")
     p.add_argument("--tokens", type=int, default=0); p.add_argument("--usage-json")
+    p.add_argument("--files", help="folder mode: the files the session reported (used when the folder is too big to compare)")
     p.set_defaults(fn=cmd_finish_task)
 
     p = sub.add_parser("finish-scan")
@@ -3648,6 +4165,7 @@ def main():
     p = sub.add_parser("task-report")
     p.add_argument("--status", choices=("done", "blocked", "failed"), required=True)
     p.add_argument("--summary", required=True); p.add_argument("--question"); p.add_argument("--tests")
+    p.add_argument("--files", help="folder mode: every file you created or changed, comma- or line-separated")
     p.set_defaults(fn=cmd_task_report)
 
     p = sub.add_parser("watch")

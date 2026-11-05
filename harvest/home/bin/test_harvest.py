@@ -1354,10 +1354,25 @@ if args[:2] == ["claude-requests", "list"]:
 elif args[:2] == ["claude-requests", "update"]:
     flags = {args[i][2:]: args[i + 1] for i in range(3, len(args) - 1, 2)}
     call = dict(flags, id=args[2])
+    row = next(r for r in data["requests"] if r["id"] == args[2])
+    data.setdefault("attempts", []).append([args[2], flags["status"]])
+    if os.environ.get("FAKE_CW_STRICT"):
+        # The service's own rules: queued > picked > running > waiting_review > done, blocked and failed on the side.
+        # Its 409 answer reaches the command line as JSON whose `status` is the request's status.
+        steps = {"queued": ["picked", "blocked", "failed"], "picked": ["running", "blocked", "failed"],
+                 "running": ["waiting_review", "blocked", "failed"], "waiting_review": ["done", "running"],
+                 "blocked": ["queued", "running", "failed"]}
+        cur, to = row["status"], flags["status"]
+        allowed = steps.get(cur)
+        if to != cur and (allowed is None or to not in allowed):
+            json.dump(data, open(db, "w"))
+            body = {"status": cur, "error": "no way from %%s to %%s" %% (cur, to)}
+            if allowed is not None:
+                body["allowed"] = allowed
+            sys.stderr.write(json.dumps(dict(body)) + "\\n")
+            sys.exit(1)
     data.setdefault("updates", []).append(call)
-    for r in data["requests"]:
-        if r["id"] == args[2]:
-            r["status"] = flags["status"]
+    row["status"] = flags["status"]
     json.dump(data, open(db, "w"))
 else:
     sys.exit(2)
@@ -1508,17 +1523,16 @@ class Sources(unittest.TestCase):
                          ["Clockwize: Fix the footer", "Clockwize: Fix the footer (bbbbbbbb)"])
 
     def test_a_missing_folder_blocks_the_request_with_a_question(self):
-        plain = os.path.join(self.tmp, "plain")
-        os.makedirs(plain)
-        self.setup_source([self.request("r1", folder="/nowhere/at/all"), self.request("r2", folder=plain),
+        self.env["HOME"] = self.tmp
+        self.setup_source([self.request("r1", folder="/nowhere/at/all"), self.request("r2", folder="~/not-here"),
                            self.request("r3", folder="")])
         out = self.pull()
         self.assertEqual([r["outcome"] for r in out["requests"]], ["blocked"] * 3)
         self.assertEqual(self.updates(), [("r1", "blocked"), ("r2", "blocked"), ("r3", "blocked")])
         self.assertIn("/nowhere/at/all", self.data()["updates"][0]["question"])
+        self.assertIn("wasn't found", self.data()["updates"][0]["question"])
         self.assertFalse(os.path.exists(os.path.join(self.repo, "BACKLOG.md")))
         self.assertEqual(self.run_engine("list")["queue"], [])
-        self.assertFalse(os.path.exists(os.path.join(plain, "BACKLOG.md")))
 
     def test_a_new_project_is_registered_and_a_subfolder_means_its_repository(self):
         beta = self.make_repo("beta")
@@ -1537,55 +1551,76 @@ class Sources(unittest.TestCase):
         again = self.pull()
         self.assertEqual((again["requests"][0]["project"], again["requests"][0]["registered"]), (self.repo, False))
 
-    def test_run_now_is_handed_to_the_widget_until_the_task_starts(self):
+    def test_run_now_is_handed_to_the_widget_on_every_pull_until_the_task_starts(self):
+        self.usage()
         self.setup_source([self.request(run="now")])
         out = self.pull()
         self.assertEqual([(os.path.realpath(r["project"]), r["title"]) for r in out["runNow"]],
                          [(os.path.realpath(self.repo), "Clockwize: Fix the footer")])
         self.assertIn("Starting now", self.last()["summary"])
         self.assertEqual(self.run_engine("list")["queue"][0]["priority"], 1)
-        self.assertEqual(self.pull()["runNow"], [])      # just handed over: not again at once
-        st = self.state()
-        st["runNow"]["clockwize/r1"]["emittedAt"] = "2020-01-01T00:00:00Z"
-        with open(os.path.join(self.home, "sources.json"), "w") as f:
-            json.dump(st, f)
-        self.assertEqual(len(self.pull()["runNow"]), 1)   # the widget didn't start it: offered again
-        # a running harvest holds it back (it may pick the task up itself); the task starting ends the offer
-        st = self.state()
-        st["runNow"]["clockwize/r1"]["emittedAt"] = "2020-01-01T00:00:00Z"
-        with open(os.path.join(self.home, "sources.json"), "w") as f:
-            json.dump(st, f)
+        # the widget didn't start it (or it hasn't begun yet): the very next pull offers it again — no waiting
+        self.assertEqual(len(self.pull()["runNow"]), 1)
+        # a running harvest holds it back (it may pick the task up itself)...
         with open(os.path.join(self.home, ".lock"), "w") as f:
             json.dump({"pid": os.getpid(), "at": iso(datetime.now(timezone.utc))}, f)
         self.assertEqual(self.pull()["runNow"], [])
+        # ...and the first pull after it ends offers it
         os.remove(os.path.join(self.home, ".lock"))
-        self.usage()
-        self.run_engine("worktree", self.repo, "Clockwize: Fix the footer")
+        self.assertEqual(len(self.pull()["runNow"]), 1)
+        # a launch that has begun but has not taken the lock yet holds it back too
+        with open(os.path.join(self.home, "launch.json"), "w") as f:
+            json.dump({"sessionId": "s", "launcherPid": os.getpid(), "endedAt": None}, f)
+        self.assertEqual(self.pull()["runNow"], [])
+        os.remove(os.path.join(self.home, "launch.json"))
+        self.run_engine("worktree", self.repo, "Clockwize: Fix the footer")     # the task starts: the offer ends
         self.assertEqual(self.state()["runNow"], {})
         self.assertEqual(self.pull()["runNow"], [])
 
-    def test_run_now_while_a_harvest_runs_says_so_and_gives_up_after_a_few_tries(self):
-        with open(os.path.join(self.home, ".lock"), "w") as f:
-            json.dump({"pid": os.getpid(), "at": iso(datetime.now(timezone.utc))}, f)
+    def test_run_now_never_gives_up_but_a_run_that_keeps_failing_is_spaced_out(self):
+        self.usage()
+        self.setup_source([self.request(run="now")])
+        offers = 0
+        for _ in range(12):
+            st = self.state() if os.path.exists(os.path.join(self.home, "sources.json")) else {"runNow": {}}
+            for e in st["runNow"].values():
+                e["emittedAt"] = "2020-01-01T00:00:00Z"        # long ago: the brake's gap has passed
+            with open(os.path.join(self.home, "sources.json"), "w") as f:
+                json.dump(st, f)
+            offers += len(self.pull()["runNow"])
+        self.assertEqual(offers, 12, "the old limit was 3 offers")
+        self.assertEqual(self.state()["runNow"]["clockwize/r1"]["attempts"], 12)
+        self.assertEqual(self.pull()["runNow"], [])             # offered just now, after many failed starts: the brake
+        self.assertEqual(len(self.run_engine("list")["queue"]), 1)
+
+    def test_run_now_that_the_quota_does_not_allow_is_told_once_and_starts_when_it_does(self):
+        self.usage(weekly=99, reset_in_h=30)
         self.setup_source([self.request(run="now")])
         out = self.pull()
         self.assertEqual(out["runNow"], [])
-        self.assertIn("harvest is running", self.last()["summary"])
-        os.remove(os.path.join(self.home, ".lock"))
-        for attempt in range(3):
-            st = self.state()
-            for e in st["runNow"].values():
-                e["emittedAt"] = "2020-01-01T00:00:00Z"
-            with open(os.path.join(self.home, "sources.json"), "w") as f:
-                json.dump(st, f)
-            self.assertEqual(len(self.pull()["runNow"]), 1, attempt)
-        st = self.state()
-        st["runNow"]["clockwize/r1"]["emittedAt"] = "2020-01-01T00:00:00Z"
-        with open(os.path.join(self.home, "sources.json"), "w") as f:
-            json.dump(st, f)
+        picked = [u for u in self.data()["updates"] if u["status"] == "picked"]
+        self.assertEqual(len(picked), 1, "the 'starting now' note was replaced before it went out")
+        self.assertIn("Waiting for quota: the weekly quota resets at", picked[0]["summary"])
+        self.assertEqual(self.updates(), [("r1", "picked")])
+        self.pull()
+        self.pull()
+        self.assertEqual(self.updates(), [("r1", "picked")], "told once, not on every pull")
+        # the 5-hour window fills up instead: a new reason is told once more
+        self.usage(five=95, reset_in_h=30)
         self.assertEqual(self.pull()["runNow"], [])
-        self.assertEqual(self.state()["runNow"], {})
-        self.assertEqual(len(self.run_engine("list")["queue"]), 1)    # still queued for the next harvest
+        self.assertEqual(len(self.updates()), 2)
+        self.assertIn("5-hour window resets at", self.last()["summary"])
+        # room again: handed to the widget
+        self.usage(five=10, weekly=10, reset_in_h=30)
+        self.assertEqual(len(self.pull()["runNow"]), 1)
+        self.assertEqual(len(self.updates()), 2)
+
+    def test_the_quota_wait_is_told_in_the_owners_language(self):
+        self.run_engine("settings", "--set", "language=he")
+        self.usage(weekly=99, reset_in_h=30)
+        self.setup_source([self.request(run="now")])
+        self.pull()
+        self.assertIn("ממתין למכסה: המכסה השבועית מתאפסת ב", self.last()["summary"])
 
     def test_every_step_of_a_task_is_reported(self):
         self.setup_source([self.request()])
@@ -1681,6 +1716,296 @@ class Sources(unittest.TestCase):
         self.assertIn("The one in the shop page.", task["details"])
         self.assertEqual(self.last()["status"], "picked")
         self.assertEqual(self.backlog().count("## Clockwize:"), 1)
+
+    def plain_folder(self, name="clients/plain"):
+        """A folder with no git, inside the (pretend) home folder, with one file of the owner's in it."""
+        self.env["HOME"] = self.tmp
+        path = os.path.join(self.tmp, *name.split("/"))
+        os.makedirs(path)
+        with open(os.path.join(path, "notes.txt"), "w") as f:
+            f.write("the owner's notes\n")
+        return path
+
+    def events(self, kind=None):
+        return [e for e in self.run_engine("events", "--since", "0")["events"] if kind in (None, e["kind"])]
+
+    def test_a_folder_without_git_is_a_project_in_folder_mode_and_runs_in_place(self):
+        plain = self.plain_folder()
+        self.usage()
+        self.setup_source([self.request("r1", folder=plain, task_name="Summarise the notes")])
+        out = self.pull()
+        row = out["requests"][0]
+        self.assertEqual((row["outcome"], row["folderMode"], row["registered"]), ("added", True, True))
+        self.assertEqual(os.path.realpath(row["project"]), os.path.realpath(plain))
+        self.assertIn("- source: clockwize:request/r1", self.backlog(plain))      # BACKLOG.md lives in the folder
+        self.assertEqual(self.updates(), [("r1", "picked")])
+        info = next(i for i in self.run_engine("list")["projects"] if os.path.realpath(i["path"]) == os.path.realpath(plain))
+        self.assertEqual((info["git"], info["folderMode"]), (False, True))
+        title = "Clockwize: Summarise the notes"
+        project = row["project"]
+        # started: the folder itself, no worktree, no branch
+        started = self.run_engine("worktree", project, title)
+        self.assertEqual((os.path.realpath(started["path"]), started["branch"], started["folder"]),
+                         (os.path.realpath(plain), "", True))
+        self.assertFalse(os.path.exists(os.path.join(plain, ".claude")))
+        running = self.last("running")
+        self.assertNotIn("branch", running)
+        self.assertIn("no git", running["summary"])
+        # the session's work: one new file, one existing file changed (and BACKLOG.md, which is the engine's)
+        with open(os.path.join(plain, "summary.md"), "w") as f:
+            f.write("summary\n")
+        with open(os.path.join(plain, "notes.txt"), "w") as f:
+            f.write("the owner's notes, edited by the session\n")
+        done = self.run_engine("finish-task", project, title, "--outcome", "done", "--summary", "Wrote summary.md")
+        self.assertEqual((done["outcome"], done["branch"], done["folder"]), ("done", None, True))
+        self.assertEqual(sorted(done["files"]), ["notes.txt", "summary.md"])
+        review = self.last("waiting_review")
+        self.assertNotIn("branch", review)
+        self.assertIn("Wrote summary.md", review["summary"])
+        self.assertIn("Files created or changed (2): notes.txt, summary.md", review["summary"])
+        # it waits for the owner's Done, not for a merge
+        listing = self.run_engine("list")
+        need = listing["needsYou"][0]
+        self.assertEqual((need["title"], need["branchState"], need["folder"], need["files"]),
+                         (title, "review", True, ["notes.txt", "summary.md"]))
+        self.assertEqual(need["summary"], "Wrote summary.md")
+        self.assertNotIn("branch", need)
+        self.assertEqual(self.run_engine("brief")["items"][0]["files"], ["notes.txt", "summary.md"])
+        self.run_engine("merge", project, title, code=2)
+        # the events say the same
+        kinds = [e["kind"] for e in self.events()]
+        self.assertEqual(kinds[-2:], ["task_started", "task_waiting_review"])
+        self.assertNotIn("branch", self.events("task_waiting_review")[0])
+        # Done: reported to the source, and the task leaves the owner's list
+        self.run_engine("accept", project, title, env=dict(self.env, HARVEST_UNATTENDED="1"), code=2)
+        out = self.run_engine("accept", project, title)
+        self.assertEqual(out["files"], ["notes.txt", "summary.md"])
+        finished = self.last()
+        self.assertEqual((finished["status"], finished["summary"]), ("done", "Marked done by the owner."))
+        listing = self.run_engine("list")
+        self.assertEqual(listing["needsYou"], [])
+        self.assertEqual((listing["done"][0]["branchState"], listing["done"][0]["summary"]), ("accepted", "Wrote summary.md"))
+        self.assertEqual(self.events()[-1]["kind"], "task_accepted")
+        self.run_engine("accept", project, title, code=2)       # nothing is left to accept
+        self.assertEqual(self.pull()["pending"], 0)
+
+    def test_a_folder_task_that_changed_nothing_still_reports_and_a_rejection_works_as_before(self):
+        plain = self.plain_folder()
+        self.usage()
+        self.setup_source([self.request("r1", folder=plain, task_name="Read only")])
+        project = self.pull()["requests"][0]["project"]
+        title = "Clockwize: Read only"
+        self.run_engine("worktree", project, title)
+        out = self.run_engine("finish-task", project, title, "--outcome", "done", "--summary", "Nothing to change")
+        self.assertEqual(out["files"], [])
+        self.assertIn("No file was created or changed.", self.last("waiting_review")["summary"])
+        self.assertEqual(self.run_engine("list")["needsYou"][0]["files"], [])
+        rejected = self.run_engine("reject", project, title, "--reason", "not needed")
+        self.assertEqual((rejected["was"], rejected["archivedBranch"]), ("done", None))
+        self.assertEqual(self.run_engine("list")["needsYou"], [])
+        self.assertTrue(os.path.exists(os.path.join(plain, "notes.txt")))
+
+    def test_a_blocked_failed_or_paused_folder_task_is_reported_without_a_branch(self):
+        plain = self.plain_folder()
+        self.usage()
+        self.setup_source([self.request("r1", folder=plain, task_name="A"), self.request("r2", folder=plain, task_name="B"),
+                           self.request("r3", folder=plain, task_name="C")])
+        project = self.pull()["requests"][0]["project"]
+        for name, outcome in (("A", "blocked"), ("B", "failed"), ("C", "paused")):
+            self.run_engine("worktree", project, "Clockwize: " + name)
+            args = ["finish-task", project, "Clockwize: " + name, "--outcome", outcome, "--summary", "because"]
+            if outcome == "blocked":
+                args += ["--question", "Which one?"]
+            self.assertIsNone(self.run_engine(*args)["branch"])
+        statuses = {u["id"]: u["status"] for u in self.data()["updates"] if u["status"] not in ("picked",)}
+        self.assertEqual(statuses, {"r1": "blocked", "r2": "failed", "r3": "running"})
+        self.assertEqual(self.run_engine("list")["needsYou"][0]["question"], "Which one?")
+        tasks = {t["title"]: t["status"] for t in self.run_engine("list", "--all")["all"]}
+        self.assertEqual(tasks, {"Clockwize: A": "blocked", "Clockwize: B": "open", "Clockwize: C": "open"})
+        self.assertFalse(os.path.exists(os.path.join(plain, ".claude")))
+
+    def test_a_project_with_git_keeps_its_worktree_and_branch(self):
+        beta = self.make_repo("beta")
+        self.env["HOME"] = self.tmp
+        self.usage()
+        self.setup_source([self.request("r1", folder="~/beta")])
+        out = self.pull()
+        self.assertEqual((out["requests"][0]["outcome"], out["requests"][0]["folderMode"]), ("added", False))
+        started = self.run_engine("worktree", os.path.realpath(beta), "Clockwize: Fix the footer")
+        self.assertFalse(started["folder"])
+        self.assertTrue(started["branch"].startswith("backlog/"))
+        self.assertIn(os.path.join(".claude", "worktrees"), started["path"])
+        self.assertTrue(os.path.isdir(started["path"]))
+        self.assertIn("branch", self.last("running"))
+
+    def test_folders_the_harvest_will_not_work_in_block_with_a_question_in_the_owners_language(self):
+        self.plain_folder("anything")
+        os.makedirs(os.path.join(self.tmp, "Library", "Caches"))
+        os.makedirs(os.path.join(self.tmp, "Library", "Mobile Documents", "com~apple~CloudDocs", "Client"))
+        os.makedirs(os.path.join(self.tmp, ".ssh"))
+        cases = {"/": "system", "~": "system", "~/Library": "system", "~/Library/Caches": "system",
+                 "/System": "system", "/Applications": "system", "~/.ssh": "system", "/usr": "outside home",
+                 "/private/tmp": "outside home", "~/missing": "wasn't found"}
+        requests = [self.request("f%d" % i, folder=folder) for i, folder in enumerate(cases)]
+        requests.append(self.request("icloud", folder="~/Library/Mobile Documents/com~apple~CloudDocs/Client",
+                                     task_name="Allowed"))
+        self.setup_source(requests)
+        out = self.pull()
+        outcomes = {r["id"]: r["outcome"] for r in out["requests"]}
+        self.assertEqual(outcomes["icloud"], "added", "iCloud Drive is the one part of ~/Library that is allowed")
+        blocked = {u["id"]: u["question"] for u in self.data()["updates"] if u["status"] == "blocked"}
+        self.assertEqual(len(blocked), len(cases))
+        for i, (folder, why) in enumerate(cases.items()):
+            question = blocked["f%d" % i]
+            self.assertEqual(outcomes["f%d" % i], "blocked", folder)
+            self.assertTrue(question.endswith("?"), question)
+            if why == "system":
+                self.assertIn("system folder or the home folder itself", question, folder)
+            elif why == "outside home":
+                self.assertIn("outside your home folder", question, folder)
+            else:
+                self.assertIn("wasn't found", question, folder)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "BACKLOG.md")))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "Library", "BACKLOG.md")))
+        # the same, asked in Hebrew
+        self.run_engine("settings", "--set", "language=he")
+        self.set_requests([self.request("h1", folder="/System"), self.request("h2", folder="~/missing"),
+                           self.request("h3", folder="/usr"), self.request("h4", folder="")], self.data()["updates"])
+        self.pull()
+        he = {u["id"]: u["question"] for u in self.data()["updates"] if u["id"].startswith("h")}
+        self.assertIn("תיקיית מערכת", he["h1"])
+        self.assertIn("לא נמצאה", he["h2"])
+        self.assertIn("מחוץ לתיקיית הבית", he["h3"])
+        self.assertIn("לא צוינה תיקייה", he["h4"])
+        self.assertTrue(all(not q.isascii() for q in he.values()))
+
+    def test_a_request_blocked_at_pull_makes_one_notification_event_with_the_question(self):
+        self.env["HOME"] = self.tmp
+        self.setup_source([self.request("r1", folder="~/missing", task_name="Fix the sink")])
+        self.pull()
+        events = self.events("request_blocked")
+        self.assertEqual(len(events), 1)
+        e = events[0]
+        self.assertEqual((e["project"], e["title"], e["source"]), ("Clockwize", "Fix the sink", "clockwize:request/r1"))
+        self.assertEqual(e["summary"], self.last("blocked")["question"])
+        self.assertIn("wasn't found", e["summary"])
+        # listed as queued again with the same problem (the update didn't go out): no second notification
+        reqs = self.data()["requests"]
+        reqs[0]["status"] = "queued"
+        self.set_requests(reqs, self.data()["updates"])
+        self.pull()
+        self.assertEqual(len(self.events("request_blocked")), 1)
+        # a different problem with the same request is a new thing to tell
+        reqs[0].update(status="queued", folder="/usr")
+        self.set_requests(reqs, self.data()["updates"])
+        self.pull()
+        self.assertEqual(len(self.events("request_blocked")), 2)
+
+    def test_a_source_that_cannot_be_reached_is_reported_once_after_three_failures_in_a_row(self):
+        self.setup_source([])
+        open(self.db + ".fail", "w").close()
+        for n in range(2):
+            self.assertFalse(self.pull()["ok"])
+            self.assertEqual(self.events("source_unreachable"), [], n)
+        third = self.pull()
+        self.assertEqual((third["ok"], third["events"]), (False, 1))
+        e = self.events("source_unreachable")[0]
+        self.assertEqual(e["project"], "Clockwize")
+        self.assertIn("Can't reach Clockwize (3 tries in a row failed)", e["summary"])
+        self.assertIn("the service is down", e["summary"])
+        for _ in range(3):
+            self.pull()
+        self.assertEqual(len(self.events("source_unreachable")), 1, "once, until the source comes back")
+        os.remove(self.db + ".fail")
+        self.assertTrue(self.pull()["ok"])
+        open(self.db + ".fail", "w").close()
+        for _ in range(3):
+            self.pull()
+        self.assertEqual(len(self.events("source_unreachable")), 2, "back, and gone again: one more")
+        # a success in between starts the count over
+        os.remove(self.db + ".fail")
+        self.pull()
+        open(self.db + ".fail", "w").close()
+        self.pull()
+        self.pull()
+        os.remove(self.db + ".fail")
+        self.pull()
+        open(self.db + ".fail", "w").close()
+        self.pull()
+        self.assertEqual(len(self.events("source_unreachable")), 2)
+
+    def owe(self, request_id, status, summary="x"):
+        """An update the harvest owes the source, as if its delivery had failed earlier."""
+        with open(os.path.join(self.home, "sources.json")) as f:
+            st = json.load(f)
+        st["seq"] = st.get("seq", 0) + 1
+        st["pending"]["clockwize/" + request_id] = {"type": "clockwize", "id": request_id, "seq": st["seq"], "tries": 0,
+                                                    "at": iso(datetime.now(timezone.utc)),
+                                                    "update": {"status": status, "summary": summary}}
+        with open(os.path.join(self.home, "sources.json"), "w") as f:
+            json.dump(st, f)
+
+    def test_an_update_for_a_request_that_has_moved_on_is_dropped_or_taken_a_step_at_a_time(self):
+        self.env["FAKE_CW_STRICT"] = "1"
+        self.setup_source([self.request("r1"), self.request("r2"), self.request("r3")])
+        self.pull()
+        self.assertEqual(self.updates(), [("r1", "picked"), ("r2", "picked"), ("r3", "picked")])
+        reqs = self.data()["requests"]
+        reqs[0]["status"] = "cancelled"                 # the owner cancelled it in the app
+        reqs[2]["status"] = "running"                   # r3 has already moved on past 'picked'
+        self.set_requests(reqs, self.data()["updates"])
+        # r1: a final request — the update is dropped, once
+        self.owe("r1", "waiting_review")
+        # r2: still 'picked', but the owed update is waiting_review: running goes first, then the update
+        self.owe("r2", "waiting_review", "Straightened it")
+        # r3: an update that would send a running request back to 'picked' can never apply
+        self.owe("r3", "picked")
+        out = self.pull()
+        self.assertEqual(out["pending"], 0)
+        self.assertEqual(self.updates()[3:], [("r2", "running"), ("r2", "waiting_review")])
+        self.assertEqual(self.last()["summary"], "Straightened it")
+        self.assertEqual([a for a in self.data()["attempts"] if a[0] == "r1"][-1], ["r1", "waiting_review"])
+        before = len(self.data()["attempts"])
+        self.pull()
+        self.assertEqual(len(self.data()["attempts"]), before, "nothing is retried any more")
+        with open(os.path.join(self.home, "logs", "sources.log")) as f:
+            log = f.read()
+        self.assertIn("request r1 is already cancelled: dropping the owed update waiting_review", log)
+        self.assertIn("request r2 is picked, not where the owed update waiting_review expects: reporting running first", log)
+        self.assertIn("request r3 is running, past the owed update picked: dropping it", log)
+
+    def test_an_update_that_fails_for_another_reason_is_still_retried(self):
+        self.env["FAKE_CW_STRICT"] = "1"
+        self.setup_source([self.request("r1")])
+        self.pull()
+        with open(self.cli) as f:
+            body = f.read()
+        with open(self.cli, "w") as f:
+            f.write(body.replace('if os.path.exists(db + ".fail"):', 'if os.path.exists(db + ".fail") and sys.argv[2] == "update":'))
+        open(self.db + ".fail", "w").close()
+        self.owe("r1", "running")
+        self.assertEqual(self.pull()["pending"], 1)
+        self.assertEqual(self.pull()["pending"], 1)
+        os.remove(self.db + ".fail")
+        self.assertEqual(self.pull()["pending"], 0)
+        self.assertEqual(self.updates(), [("r1", "picked"), ("r1", "running")])
+
+    def test_the_task_prompt_for_folder_mode_is_a_fixed_paragraph_in_both_languages(self):
+        for language, words in (("en", ["no git, so there is no branch to review", "Don't change, move or delete existing files",
+                                        "Put any new output in a new file", "Never publish, deploy, push or send anything",
+                                        "list of every file you created or changed"]),
+                                ("he", ["אין git", "אל תשנה, תעביר או תמחק קבצים קיימים", "קובץ חדש", "אל תפרסם", "כל קובץ שיצרת או שינית"])):
+            self.run_engine("settings", "--set", "language=" + language)
+            os.environ["HARVEST_HOME"] = self.home
+            try:
+                h = self.load_engine()
+                text = h.tr("folder_mode_prompt")
+            finally:
+                os.environ.pop("HARVEST_HOME", None)
+            for w in words:
+                self.assertIn(w, text, language)
+
+    load_engine = Harvest.load_engine
 
     def test_the_switch_and_the_settings(self):
         self.setup_source([])

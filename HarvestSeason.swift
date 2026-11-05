@@ -445,7 +445,14 @@ struct HTask: Decodable, Identifiable, Equatable {
     let dateProblem: String?
     /// A proposal whose date has come: it can't run by itself, so it goes to the owner.
     let dueProposal: Bool?
+    /// Done in a folder with no git (folder mode): there is no branch, and the owner's "Done" takes the place of a
+    /// merge. `files` are what it created or changed.
+    let folder: Bool?
+    let files: [String]?
     var id: String { project + "::" + title }
+    /// Done and waiting for the owner: a branch to merge, or (folder mode) work to mark Done.
+    var awaitsReview: Bool { status == "done" && (branchState == "unmerged" || branchState == "review") }
+    var isFolderReview: Bool { status == "done" && branchState == "review" }
     var hasDates: Bool { !(scheduled ?? "").isEmpty || !(deadline ?? "").isEmpty }
 }
 
@@ -522,7 +529,7 @@ struct HEvents: Decodable {
 func eventShown(_ kind: String, mode: String?) -> Bool {
     switch mode ?? "all" {
     case "run_end": return kind == "run_ended"
-    case "needs_me": return ["task_blocked", "task_failed", "task_waiting_review", "run_ended"].contains(kind)
+    case "needs_me": return ["task_blocked", "task_failed", "task_waiting_review", "run_ended", "request_blocked", "source_unreachable"].contains(kind)
     default: return true
     }
 }
@@ -593,6 +600,8 @@ struct HPullResult: Decodable {
     var busy: Bool?
     var requests: [HPullRequest]?
     var runNow: [RunNow]?
+    /// Notification events this pull wrote (a request blocked, a source that can't be reached).
+    var events: Int?
 }
 
 struct HPullRequest: Decodable { var outcome: String? }
@@ -622,6 +631,8 @@ struct HProject: Decodable, Equatable, Identifiable {
     var name: String
     var exists: Bool?
     var proposalsOff: Bool?
+    /// A folder with no git: its tasks run in the folder itself.
+    var folderMode: Bool?
     var id: String { path }
 }
 
@@ -1196,6 +1207,7 @@ protocol WidgetActions: AnyObject {
     func setQueued(_ task: HTask, _ queued: Bool)
     func setDates(_ task: HTask, date: Date?, strict: Bool, deadline: Date?)
     func openNeed(_ task: HTask)
+    func acceptFolder(_ task: HTask)
     func rejectWaiting(_ task: HTask, reason: String)
     func rejectAllWaiting(reason: String)
     func setConfig(_ config: HarvestConfig)
@@ -1614,9 +1626,9 @@ struct PanelView: View {
         } else {
             ByProject(tasks: m.listing.needsYou) { t in
                 VStack(alignment: .leading, spacing: 0) {
-                    NeedRow(task: t, onOpen: { m.actions?.openNeed(t) }, onReject: {
+                    NeedRow(task: t, onOpen: { t.isFolderReview ? m.actions?.openDone(t) : m.actions?.openNeed(t) }, onReject: {
                         withAnimation(.easeOut(duration: 0.12)) { m.rejecting = m.rejecting == t.id ? nil : t.id }
-                    })
+                    }, onDone: t.isFolderReview ? { m.actions?.acceptFolder(t) } : nil)
                     if m.rejecting == t.id {
                         RejectForm(blocked: t.status == "blocked", count: nil,
                                    onReject: { m.actions?.rejectWaiting(t, reason: $0) },
@@ -2067,7 +2079,8 @@ struct DoneRow: View {
     var icon: String {
         switch task.branchState {
         case "unmerged": return "arrow.triangle.branch"
-        case "merged": return "checkmark.circle.fill"
+        case "review": return "folder"
+        case "merged", "accepted": return "checkmark.circle.fill"
         case "archived": return "archivebox"
         default: return "checkmark.circle"
         }
@@ -2075,8 +2088,8 @@ struct DoneRow: View {
 
     var tint: AnyShapeStyle {
         switch task.branchState {
-        case "unmerged": return AnyShapeStyle(Color.accentColor)
-        case "merged": return AnyShapeStyle(Color.green)
+        case "unmerged", "review": return AnyShapeStyle(Color.accentColor)
+        case "merged", "accepted": return AnyShapeStyle(Color.green)
         default: return AnyShapeStyle(.secondary)
         }
     }
@@ -2087,6 +2100,8 @@ struct DoneRow: View {
         switch task.branchState {
         case "unmerged": lines.append(L("הענף \(task.branch ?? "") מחכה לבדיקה ולמיזוג שלך",
                                         "Branch \(task.branch ?? "") is waiting for your review and merge"))
+        case "review": lines.append(L("בוצע בתיקייה בלי git, ומחכה ל\"בוצע\" שלך", "Done in a folder without git, waiting for your Done"))
+        case "accepted": lines.append(L("סומן כבוצע", "Marked done"))
         case "merged": lines.append(L("מוזג", "Merged"))
         case "archived": lines.append(L("הועבר לארכיון", "Archived"))
         default: break
@@ -2459,13 +2474,15 @@ struct NeedRow: View {
     let task: HTask
     let onOpen: () -> Void
     var onReject: (() -> Void)? = nil
+    /// Work done in a folder with no git: "Done" takes the place of a merge.
+    var onDone: (() -> Void)? = nil
 
     var body: some View {
         // Two buttons side by side — a button inside the row's own label wouldn't get its clicks.
         HStack(spacing: 6) {
             Button(action: onOpen) {
                 HStack(spacing: 6) {
-                    Image(systemName: task.status == "blocked" ? "questionmark.circle" : "arrow.triangle.branch")
+                    Image(systemName: task.status == "blocked" ? "questionmark.circle" : task.isFolderReview ? "folder" : "arrow.triangle.branch")
                         .font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 12)
                     Text(task.title).lineLimit(2).truncationMode(.tail).fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2481,14 +2498,29 @@ struct NeedRow: View {
             .modifier(HoverHighlight())
             .help(task.status == "blocked"
                   ? L("חסום: ", "Blocked: ") + (task.question ?? "")
+                  : task.isFolderReview ? folderTooltip
                   : L("פתח סשן בקלוד שמציג את השינוי וממזג באישורך",
                       "Open a Claude session that shows the change and merges it with your approval"))
+            if let onDone = onDone {
+                Button(action: onDone) {
+                    HStack(spacing: 3) {
+                        Image(systemName: "checkmark").font(.system(size: 9, weight: .semibold))
+                        Text(L("בוצע", "Done")).font(.system(size: 11))
+                    }
+                }
+                .buttonStyle(.plain).foregroundStyle(Color.accentColor)
+                .help(L("סמן כבוצע. אין ענף למזג: העבודה כבר בתיקייה כמו שהיא, ושום דבר לא נמחק או נדחף",
+                        "Mark it done. There is no branch to merge: the work is already in the folder as it is, and nothing is deleted or pushed"))
+            }
             if let onReject = onReject {
                 Button(action: onReject) { Image(systemName: "xmark.circle").font(.system(size: 12)) }
                     .buttonStyle(.plain).foregroundStyle(.secondary)
                     .frame(width: TaskRow.iconColumn)
                     .help(task.status == "blocked"
                           ? L("דחה — המשימה לא תתבצע ועוברת ל\"הוסרו\"", "Reject — the task won't be done and moves to Removed")
+                          : task.isFolderReview
+                          ? L("דחה — המשימה עוברת ל\"הוסרו\". הקבצים נשארים בתיקייה כמו שהם",
+                              "Reject — the task moves to Removed. The files stay in the folder as they are")
                           : L("דחה — לא למזג. הענף עובר לארכיון (לא נמחק), והמשימה ל\"הוסרו\"",
                               "Reject — don't merge. The branch is archived (not deleted), the task moves to Removed"))
             }
@@ -2501,6 +2533,20 @@ struct NeedRow: View {
         case 1: return L("אתמול", "yesterday")
         case let d: return L("\(d) ימים", "\(d) days")
         }
+    }
+
+    /// What a click opens, and what the work touched: the files, as far as a tooltip holds.
+    var folderTooltip: String {
+        let files = task.files ?? []
+        var lines = [L("פתח את הסשן שעשה את זה, באפליקציית Claude", "Open the session that did it, in the Claude app")]
+        if files.isEmpty {
+            lines.append(L("לא נוצר ולא שונה אף קובץ", "No file was created or changed"))
+        } else {
+            lines.append(L("קבצים שנוצרו או שונו (\(files.count)):", "Files created or changed (\(files.count)):"))
+            lines += files.prefix(12).map { "• " + $0 }
+            if files.count > 12 { lines.append(L("ועוד \(files.count - 12)", "and \(files.count - 12) more")) }
+        }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -2529,7 +2575,7 @@ enum TaskFilter: String, CaseIterable, Identifiable {
         case .queue: return t.status == "open" && t.waits != true
         case .scheduled: return t.status == "open" && t.waits == true
         case .proposals: return t.status == "proposed"
-        case .waiting: return t.status == "blocked" || t.dueProposal == true || (t.status == "done" && t.branchState == "unmerged")
+        case .waiting: return t.status == "blocked" || t.dueProposal == true || t.awaitsReview
         case .done: return t.status == "done"
         case .dropped: return t.status == "dropped"
         }
@@ -2542,6 +2588,7 @@ func taskStage(_ t: HTask) -> (order: Int, label: String, color: Color) {
     switch t.status {
     case "blocked": return (0, L("שאלה אליך", "Question for you"), .orange)
     case "done" where t.branchState == "unmerged": return (0, L("מחכה למיזוג", "Awaiting merge"), .orange)
+    case "done" where t.branchState == "review": return (0, L("מחכה ל\"בוצע\"", "Awaiting Done"), .orange)
     case "proposed" where t.dueProposal == true: return (0, L("הגיע המועד", "Date has come"), .orange)
     case "open" where t.waits == true: return (2, L("ממתינה לתאריך", "Awaiting date"), .teal)
     case "open": return (1, L("בתור", "Queued"), .accentColor)
@@ -2653,6 +2700,11 @@ func taskActions(_ t: HTask, _ actions: WidgetActions?, reject: @escaping () -> 
         if t.branchState == "unmerged" {
             out.append(TaskAction(title: L("לבדיקה ולמיזוג", "Review and merge"), icon: "arrow.triangle.branch") { actions?.openNeed(t) })
             out.append(TaskAction(title: L("דחה — לא למזג", "Reject — don't merge"), icon: "xmark.circle", run: reject))
+        }
+        if t.branchState == "review" {
+            out.append(TaskAction(title: L("בוצע", "Done"), icon: "checkmark.circle") { actions?.acceptFolder(t) })
+            out.append(TaskAction(title: L("לבדיקה עם קלוד", "Review with Claude"), icon: "folder") { actions?.openNeed(t) })
+            out.append(TaskAction(title: L("דחה", "Reject"), icon: "xmark.circle", run: reject))
         }
         if t.sessionId != nil {
             out.append(TaskAction(title: L("פתח את הסשן שביצע", "Open the session that did it"), icon: "arrow.up.forward.app") { actions?.openDone(t) })
@@ -2809,6 +2861,13 @@ struct AllTasksView: View {
                             .foregroundStyle(.secondary)
                     }
                     .help(branchNote(r.task.branchState))
+                } else if r.task.folder == true {
+                    HStack(spacing: 4) {
+                        Image(systemName: branchIcon(r.task.branchState)).font(.system(size: 10))
+                            .foregroundStyle(r.task.branchState == "accepted" ? Color.green : Color.accentColor)
+                        Text(L("תיקייה", "folder")).font(.system(size: 11)).lineLimit(1).foregroundStyle(.secondary)
+                    }
+                    .help(branchNote(r.task.branchState))
                 }
             }
             .width(min: 80, ideal: 100)
@@ -2911,6 +2970,11 @@ struct AllTasksView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         if task.hasDates { field(L("תאריכים", "Dates"), datesLine(task)) }
                         if let d = task.details, !d.isEmpty { field(L("מה לעשות", "What to do"), d) }
+                        if task.folder == true {
+                            field(L("קבצים", "Files"), (task.files ?? []).isEmpty
+                                  ? L("לא נוצר ולא שונה אף קובץ", "No file was created or changed")
+                                  : (task.files ?? []).joined(separator: ", "))
+                        }
                         if task.status == "blocked", let q = task.question, !q.isEmpty {
                             field(L("השאלה", "The question"), q)
                         } else if task.status == "done", let s = task.summary, !s.isEmpty {
@@ -2951,7 +3015,8 @@ struct AllTasksView: View {
     func branchIcon(_ state: String?) -> String {
         switch state {
         case "unmerged": return "arrow.triangle.branch"
-        case "merged": return "checkmark.circle.fill"
+        case "review": return "folder"
+        case "merged", "accepted": return "checkmark.circle.fill"
         case "archived": return "archivebox"
         default: return "questionmark.circle"
         }
@@ -2960,6 +3025,8 @@ struct AllTasksView: View {
     func branchNote(_ state: String?) -> String {
         switch state {
         case "unmerged": return L("מחכה לבדיקה ולמיזוג שלך", "Waiting for your review and merge")
+        case "review": return L("בוצע בתיקייה בלי git (אין ענף), ומחכה ל\"בוצע\" שלך", "Done in a folder without git (no branch), waiting for your Done")
+        case "accepted": return L("בוצע בתיקייה בלי git, וסומן כבוצע", "Done in a folder without git, marked done")
         case "merged": return L("מוזג", "Merged")
         case "archived": return L("בארכיון", "Archived")
         default: return L("הענף כבר לא קיים", "The branch is gone")
@@ -3018,8 +3085,9 @@ struct HelpView: View {
         ("מחכה לך", [
             "עבודה שהקציר גמר ומחכה לך: ענף עם שינויים שעוד לא מוזג, או שאלה שהסוכן נתקע עליה. ליד כל שורה — כמה זמן היא מחכה (כתום אחרי 14 יום).",
             "למעלה, כשיש: **הצעות שהגיע המועד שלהן** (או שנשאר להן עד שבוע לדדליין). **⊕** מכניס לתור, **פח** מוחק.",
-            "הסמלים: **ענף** — שינוי גמור שעוד לא מוזג. **סימן שאלה** — שאלה שהסוכן נתקע עליה. **חץ יוצא מריבוע** — נפתח באפליקציית Claude.",
+            "הסמלים: **ענף** — שינוי גמור שעוד לא מוזג. **תיקייה** — עבודה שנעשתה בתיקייה בלי git (אין ענף). **סימן שאלה** — שאלה שהסוכן נתקע עליה. **חץ יוצא מריבוע** — נפתח באפליקציית Claude.",
             "**לחיצה על שורה** פותחת סשן באפליקציית Claude שמראה מה השתנה, וממזג רק אם תאשר. בשאלה — עונים לו שם.",
+            "**עבודה בתיקייה בלי git:** אין ענף למזג, אז במקום מיזוג יש כפתור **\"בוצע\"** בשורה. הוא רק מסמן את המשימה כבוצעה (ומדווח על כך ל-Clockwize); שום קובץ לא נמחק או זז. הריחוף על השורה מראה אילו קבצים נוצרו או שונו, ולחיצה עליה פותחת את הסשן שעשה את העבודה. \"דחה\" עובד כרגיל, והקבצים נשארים בתיקייה כמו שהם.",
             "**✕** בסוף שורה = **דחייה**: השינוי לא ימוזג (או שהמשימה החסומה לא תתבצע). מתחת לשורה נפתח טופס קצר: מסמנים סיבות מוכנות (כמה שרוצים), אפשר להוסיף מילים, ו\"**דחה**\". המשימה עוברת ל\"הוסרו\" עם הסיבה, והענף נשמר בארכיון ולא נמחק.",
             "**\"דחה הכל\"** בתחתית — אותו טופס, לכל מה שמחכה בבת אחת. מה שלא נדחה (למשל ענף שפתוח עכשיו בפרויקט) מופיע מתחת עם הסיבה.",
             "**\"לשיחה עם קלוד על כל אלה\"** בתחתית — שיחה אחת שעוברת על הכול וממליצה על כל פריט.",
@@ -3027,7 +3095,7 @@ struct HelpView: View {
         ]),
         ("בוצעו", [
             "מה שהושלם ב-30 הימים האחרונים: היום, אתמול, השבוע, קודם.",
-            "הסמל: **ענף כחול** — מחכה לבדיקה שלך. **וי ירוק** — מוזג. **קופסה** — עבר לארכיון. **וי רגיל** — בוצע בלי ענף של קציר.",
+            "הסמל: **ענף כחול** — מחכה לבדיקה שלך. **תיקייה כחולה** — עבודה בתיקייה בלי git שמחכה ל\"בוצע\" שלך. **וי ירוק** — מוזג, או סומן כבוצע. **קופסה** — עבר לארכיון. **וי רגיל** — בוצע בלי ענף של קציר.",
             "**לחיצה על שורה** פותחת באפליקציית Claude את הסשן שעשה את העבודה.",
             "**פח** בסוף שורה מנקה אותה מהרשימה, ו\"**נקה הכל**\" בתחתית מנקה את כולן (אחרי אישור). זה רק מסדר את הרשימה: הענף, \"מחכה לך\" והרישום ב-BACKLOG.md נשארים, ומחלון \"כל המשימות\" אפשר להחזיר כל אחת.",
         ]),
@@ -3061,8 +3129,9 @@ struct HelpView: View {
         ]),
         ("התראות", [
             "בזמן שהקציר עובד מגיעות התראות על מה שקורה: **משימה התחילה**, **מחכה לאישור שלך** (יש ענף), **נתקעה בשאלה**, **נכשלה**, **נעצרה במגבלת שימוש** (העבודה נשמרת וממשיכה אחר כך), **מוזגה**, וגם **תחילת ריצה וסיומה**. הכותרת היא הפרויקט והמשימה, והטקסט הוא שורה אחת על מה שקרה.",
+            "עוד שתי התראות, על בקשות מבחוץ: **בקשה שנחסמה** עוד לפני שהפכה למשימה (למשל תיקייה שלא נמצאה) — הטקסט הוא השאלה שנשלחה ל-Clockwize — ו**אין חיבור** ל-Clockwize אחרי שלושה ניסיונות רצופים שנכשלו (פעם אחת, עד שהחיבור חוזר).",
             "**לחיצה על התראה** פותחת את הסשן של אותה משימה באפליקציית Claude (בהתראה על ריצה: את סשן המתאם).",
-            "בהגדרות ← קציר בוחרים כמה לקבל: **על כל שלב** (ברירת המחדל), **רק כשצריכים אותי** — שאלה, כישלון, עבודה שמחכה לאישור וסיום ריצה — או **רק בסוף ריצה**. התראה אחת לסיום ריצה, לא שתיים.",
+            "בהגדרות ← קציר בוחרים כמה לקבל: **על כל שלב** (ברירת המחדל), **רק כשצריכים אותי** — שאלה, כישלון, עבודה שמחכה לאישור, בקשה שנחסמה, חיבור שנפל וסיום ריצה — או **רק בסוף ריצה**. התראה אחת לסיום ריצה, לא שתיים.",
             "**בין 22:00 ל־08:00** ההתראות מגיעות בלי צליל. ההתראות של אותה ריצה מקובצות יחד במרכז ההתראות.",
         ]),
         ("הגדרה והתקנה", [
@@ -3078,10 +3147,11 @@ struct HelpView: View {
         ]),
         ("בקשות מבחוץ", [
             "אם אתה עובד עם Clockwize (אפליקציית המשימות), אפשר ללחוץ שם **\"טפל עם Claude Code\"** על משימה, לכתוב מה לעשות, לבחור תיקייה ו**עכשיו** או **בקציר הבא**. הווידג'ט שולף את הבקשה, והיא נכנסת **לתור** של הפרויקט — הלחיצה שלך היא האישור.",
-            "זה כבוי כברירת מחדל, ומדליקים ב**הגדרות ← כללי ← בקשות מבחוץ**. המתג מופיע רק כשהכלי של Clockwize בשורת הפקודה מותקן במק. הקציר מדבר איתו דרך הכלי הזה, שמחזיק את ההתחברות בעצמו — הקציר לא שומר שם שום מפתח. זה הקשר היחיד של הקציר עם שירות חיצוני, והוא פועל אחת לשתי דקות כשהמק ער.",
+            "זה כבוי כברירת מחדל, ומדליקים ב**הגדרות ← כללי ← בקשות מבחוץ**. המתג מופיע רק כשהכלי של Clockwize בשורת הפקודה מותקן במק. הקציר מדבר איתו דרך הכלי הזה, שמחזיק את ההתחברות בעצמו — הקציר לא שומר שם שום מפתח. זה הקשר היחיד של הקציר עם שירות חיצוני, והוא פועל אחת ל-15 שניות כשהמק ער (עם האטה אוטומטית כשהחיבור נכשל).",
             "ההוראה היא מה שכתבת. מה ש-Clockwize יודע על המשימה (שם, תיאור, לקוח) מצורף כמידע בלבד: הסוכן לא מבצע הוראות שכתובות שם.",
-            "כל שלב חוזר ל-Clockwize: התחיל, מחכה לבדיקה (עם הענף והסשן), שאלה, כישלון, ומוזג. תיקייה שלא נמצאה, או שאינה ריפו git, מחזירה שאלה לשם.",
-            "**עכשיו** מריץ רק את המשימה הזאת מיד. אם קציר רץ באותו רגע היא תרוץ בו או מיד אחריו; אם אין מכסה או שאין חיבור ל-Claude Code, היא נשארת בתור לקציר הבא. כשאין חיבור לשירות, הנקודה למעלה הופכת לצהובה והעדכון נשלח שוב בהמשך.",
+            "כל שלב חוזר ל-Clockwize: התחיל, מחכה לבדיקה (עם הענף והסשן), שאלה, כישלון, ומוזג. תיקייה שלא נמצאה מחזירה שאלה לשם, בשפה שלך.",
+            "**תיקייה בלי git** היא לא סיבה לחסום: היא נרשמת כפרויקט ב**מצב תיקייה**. המשימה רצה בתיקייה עצמה, בלי worktree ובלי ענף, ומקבלת הוראה קבועה: לא לשנות, להעביר או למחוק קבצים קיימים אלא אם ביקשת במפורש, לכתוב כל תוצר חדש לקובץ חדש, ולא לפרסם, לדחוף או לשלוח כלום. בסוף היא מחכה ב\"מחכה לך\" עם רשימת הקבצים שנוצרו או שונו, ו**\"בוצע\"** סוגר אותה. פרויקטים שכבר רשומים עם git ממשיכים לעבוד עם ענף. הקציר לא עובד בתיקייה שמחוץ לתיקיית הבית, בתיקיית מערכת, בתיקיית הבית עצמה, ב-Library (חוץ מ-iCloud Drive) או בתיקייה מוסתרת, ושואל במקום.",
+            "**עכשיו** באמת עכשיו: בלי קציר רץ, היא מתחילה תוך 15 שניות; עם קציר רץ — מיד כשהוא נגמר. ההצעה לרוץ חוזרת בכל שליפה עד שהמשימה מתחילה (אין מגבלת ניסיונות), ורק אם הריצה נכשלת שוב ושוב היא מתרחקת. אם המכסה לא מאפשרת (המקום ששמור לך, חלון 5 השעות או המכסה השבועית), היא ממתינה, ו-Clockwize מקבל פעם אחת הודעה מתי היא תתחיל. כשאין חיבור לשירות, הנקודה למעלה הופכת לצהובה והעדכון נשלח שוב בהמשך.",
         ]),
     ]
 
@@ -3123,7 +3193,8 @@ struct HelpView: View {
         ("Waiting for you", [
             "Work the harvest finished that is waiting for you: a branch with changes not merged yet, or a question the agent got stuck on. Next to each row — how long it has waited (orange after 14 days).",
             "At the top, when there are any: **proposals whose date has come** (or with a week or less to their deadline). **⊕** queues one, **the trash can** deletes it.",
-            "The icons: **a branch** — finished changes not merged yet. **A question mark** — a question the agent got stuck on. **An arrow out of a square** — opens in the Claude app.",
+            "The icons: **a branch** — finished changes not merged yet. **A folder** — work done in a folder without git (no branch). **A question mark** — a question the agent got stuck on. **An arrow out of a square** — opens in the Claude app.",
+            "**Work in a folder without git:** there is no branch to merge, so instead of a merge the row has a **\"Done\"** button. It only marks the task done (and tells Clockwize); no file is deleted or moved. Hovering the row shows which files were created or changed, and clicking it opens the session that did the work. \"Reject\" works as usual, and the files stay in the folder as they are.",
             "**Clicking a row** opens a session in the Claude app that shows what changed, and merges only if you approve. For a question — you answer it there.",
             "**✕** at the end of a row = **rejecting** it: the change won't be merged (or the blocked task won't be done). A short form opens under the row: tick ready reasons (as many as you like), add words if you want, and \"**Reject**\". The task moves to Removed with the reason, and its branch is kept in the archive, not deleted.",
             "**\"Reject all\"** at the bottom — the same form, for everything that waits at once. Whatever wasn't rejected (a branch checked out in the project, say) shows underneath with the reason.",
@@ -3132,7 +3203,7 @@ struct HelpView: View {
         ]),
         ("Done", [
             "What was completed in the last 30 days: today, yesterday, this week, earlier.",
-            "The icon: **blue branch** — waiting for your review. **Green check** — merged. **Box** — archived. **Plain check** — done without a harvest branch.",
+            "The icon: **blue branch** — waiting for your review. **Blue folder** — work in a folder without git, waiting for your Done. **Green check** — merged, or marked done. **Box** — archived. **Plain check** — done without a harvest branch.",
             "**Clicking a row** opens the session that did the work in the Claude app.",
             "**The trash can** at the end of a row clears it from the list, and **\"Clear all\"** at the bottom clears them all (after you confirm). It only tidies the list: the branch, \"Waiting for you\" and the BACKLOG.md entry stay, and the \"All tasks\" window can bring any of them back.",
         ]),
@@ -3166,8 +3237,9 @@ struct HelpView: View {
         ]),
         ("Notifications", [
             "While the harvest works, notifications tell you what happens: a task **started**, is **waiting for your approval** (there is a branch), **stopped on a question**, **failed**, **stopped at a usage limit** (the work is saved and goes on later), was **merged** — and a run's **start and end**. The title is the project and the task; the text is one line about what happened.",
+            "Two more, about requests from outside: a **request that was blocked** before it became a task (a folder that wasn't found, say) — the text is the question sent to Clockwize — and **no connection** to Clockwize after three failed tries in a row (once, until the connection is back).",
             "**A click on a notification** opens that task's session in the Claude app (for a run: the coordinating session).",
-            "In Settings → Harvest you choose how many: **about every step** (the default), **only when I'm needed** — a question, a failure, work waiting for approval and the end of a run — or **only when a run ends**. A run's end is one notification, not two.",
+            "In Settings → Harvest you choose how many: **about every step** (the default), **only when I'm needed** — a question, a failure, work waiting for approval, a blocked request, a lost connection and the end of a run — or **only when a run ends**. A run's end is one notification, not two.",
             "**Between 22:00 and 08:00** notifications come without a sound. The notifications of one run are grouped together in the notification center.",
         ]),
         ("Setup and install", [
@@ -3183,10 +3255,11 @@ struct HelpView: View {
         ]),
         ("Requests from outside", [
             "If you use Clockwize (the task app), you can press **\"Handle with Claude Code\"** on a task there, write what to do, choose a folder and **now** or **next harvest**. The widget picks the request up, and it goes into the project's **Queue** — your press is the approval.",
-            "It is off by default; turn it on in **Settings → General → Requests from outside**. The switch shows only when Clockwize's command-line tool is installed on this Mac. The harvest talks to Clockwize through that tool, which keeps its own sign-in — the harvest stores no key of it. This is the harvest's only link to an outside service, and it runs once every two minutes while the Mac is awake.",
+            "It is off by default; turn it on in **Settings → General → Requests from outside**. The switch shows only when Clockwize's command-line tool is installed on this Mac. The harvest talks to Clockwize through that tool, which keeps its own sign-in — the harvest stores no key of it. This is the harvest's only link to an outside service, and it runs every 15 seconds while the Mac is awake (slowing down by itself while the connection fails).",
             "The instruction is what you wrote. What Clockwize knows about the task (name, description, client) is attached as information only: the agent never follows instructions written there.",
-            "Every step goes back to Clockwize: started, waiting for review (with the branch and the session), a question, a failure, and merged. A folder that wasn't found, or isn't a git repository, sends a question back.",
-            "**Now** runs only that task right away. If a harvest is running at that moment it runs in it or right after it; if there is no quota or Claude Code is signed out, it stays queued for the next harvest. When the service can't be reached, the dot at the top turns yellow and the update is sent again later.",
+            "Every step goes back to Clockwize: started, waiting for review (with the branch and the session), a question, a failure, and merged. A folder that wasn't found sends a question back, in your language.",
+            "**A folder without git** is no reason to block: it is registered as a project in **folder mode**. The task runs in the folder itself, with no worktree and no branch, and gets a fixed instruction: don't change, move or delete existing files unless you explicitly asked, put any new output in a new file, and never publish, push or send anything. At the end it waits in \"Waiting for you\" with the list of files it created or changed, and **\"Done\"** closes it. Projects already registered with git keep working with a branch. The harvest won't work in a folder outside your home folder, a system folder, the home folder itself, Library (except iCloud Drive) or a hidden folder, and asks instead.",
+            "**Now** really means now: with no harvest running it starts within 15 seconds; with one running — right when it ends. The offer to run is repeated on every pull until the task starts (there is no limit on tries), and only spaces out if the run keeps failing. If the quota doesn't allow it (what is kept free for you, the 5-hour window or the weekly quota), it waits, and Clockwize is told once when it will start. When the service can't be reached, the dot at the top turns yellow and the update is sent again later.",
         ]),
     ]
 
@@ -4259,8 +4332,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     var handledLaunchId: String?
     var listingLoaded = false
     var pulling = false
-    var pulledOnce = false
     var pullProblem = false
+    /// The next pull, when one is scheduled: the chain that keeps requests from outside coming (`pullRequests`).
+    var pullWork: DispatchWorkItem?
+    var pullStartedAt: Date?
+    /// How long to wait after the last pull: 15 s while all goes well, backing off after failures.
+    var pullDelay = AppDelegate.pullSteps[0]
+    static let pullSteps: [TimeInterval] = [15, 30, 60, 120]
     /// An `events` question is out (see `pollEvents`).
     var eventsBusy = false
     /// `--pretend-weekly-reset-in <minutes>`: test hook that moves the weekly
@@ -4906,13 +4984,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     /// never starts an engine run for this.
     var sourcesOn: Bool { model.listing.settings?.sourceStatus?.contains { $0.enabled && $0.found } == true }
 
-    /// Every 4th tick (about 2 minutes), and once as soon as the first listing is in.
+    /// The 30 s tick only keeps the chain alive: it starts the first pull as soon as the first listing is in, and
+    /// starts one again if the chain ever broke (a pull whose engine call never came back).
     func pullTick() {
         guard listingLoaded, model.harvestInstalled else { return }
-        if !pulledOnce || tickCount % 4 == 0 {
-            pulledOnce = true
-            pullRequests()
-        }
+        if pulling, let started = pullStartedAt, -started.timeIntervalSinceNow > 150 { pulling = false }
+        if pullWork == nil && !pulling { pullRequests() }
     }
 
     /// When the Mac wakes: a pull a few seconds later, once the network is back.
@@ -4922,11 +4999,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         }
     }
 
-    /// `claude-harvest pull`: quietly. One at a time; a failure changes only the live dot — yellow, and never
-    /// over a red one (which is about Claude Code, and needs the owner).
+    func schedulePull(after delay: TimeInterval) {
+        pullWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.pullWork = nil
+            self?.pullRequests()
+        }
+        pullWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// `claude-harvest pull`: quietly. Every 15 s while a source is on (one local engine call that runs the
+    /// source's own tool), and once at the start and on wake. Never two at once: the next one is scheduled only when
+    /// this one has ended. A failure backs the next one off (15 → 30 → 60 → 120 s) and changes only the live dot —
+    /// yellow, and never over a red one (which is about Claude Code, and needs the owner); a success goes back to 15 s.
     func pullRequests() {
-        guard model.harvestInstalled, sourcesOn, !pulling else { return }
+        guard model.harvestInstalled, !pulling else { return }
+        pullWork?.cancel()
+        pullWork = nil
+        guard sourcesOn else {
+            schedulePull(after: AppDelegate.pullSteps[0])       // nothing to ask: look again soon, no engine run
+            return
+        }
         pulling = true
+        pullStartedAt = Date()
         runEngine(["pull"]) { [weak self] data in
             guard let self else { return }
             self.pulling = false
@@ -4937,6 +5033,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
 
     func pullEnded(_ result: HPullResult?) {
         let fine = result?.ok == true || result?.busy == true
+        let steps = AppDelegate.pullSteps
+        pullDelay = fine ? steps[0] : steps[min((steps.firstIndex(of: pullDelay) ?? 0) + 1, steps.count - 1)]
+        schedulePull(after: pullDelay)
+        // A request blocked, or a source that can't be reached, wrote an event: tell the owner now, not at the next listing.
+        if (result?.events ?? 0) > 0 { pollEvents() }
         if !fine {
             pullProblem = true
             if model.dotColor != .systemRed {
@@ -4954,7 +5055,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     }
 
     /// The requests that asked to run now: one run, limited to those tasks (the same as ▶ on each), started
-    /// only when nothing stands in the way — otherwise the engine offers them again in a while.
+    /// only when nothing stands in the way — otherwise the engine offers them again on the next pull (every 15 s).
     func startRequested(_ wanted: [HPullResult.RunNow]) {
         let tasks = model.listing.queue.filter { t in wanted.contains { $0.project == t.project && $0.title == t.title } }
         guard !tasks.isEmpty, !runner.isRunning, !model.harvestActive, model.signIn == nil, claudeExecutable() != nil else { return }
@@ -5171,7 +5272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
     func openDone(_ task: HTask) {
         if let sid = task.sessionId {
             openSessionInApp(sid)
-        } else if task.branchState == "unmerged" {
+        } else if task.awaitsReview {
             openNeed(task)
             return
         } else {
@@ -5351,6 +5452,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
                 "The backlog task \"\(task.title)\" is blocked and waiting for my decision: \(task.question ?? ""). "
                 + "Help me decide, then update it: claude-harvest set-status \"\(task.project)\" \"\(task.title)\" "
                 + "open --answer \"<my decision>\" (it goes back to the queue with the answer), or dropped.")
+        } else if task.isFolderReview {
+            let files = (task.files ?? []).prefix(30).joined(separator: ", ")
+            prompt = L("משימת הבקלוג \"\(task.title)\" בוצעה בתיקייה בלי git, אז אין ענף למזג: \(task.summary ?? ""). "
+                + (files.isEmpty ? "לא נוצר ולא שונה אף קובץ. " : "הקבצים שנוצרו או שונו: \(files). ")
+                + "הראה לי בקצרה מה נעשה ובדוק שזה נראה תקין. אם אני מאשר: claude-harvest accept \"\(task.project)\" \"\(task.title)\" "
+                + "— זה רק מסמן אותה כבוצעה. בלי למחוק, להעביר או לדחוף שום דבר.",
+                "The backlog task \"\(task.title)\" was done in a folder without git, so there is no branch to merge: \(task.summary ?? ""). "
+                + (files.isEmpty ? "No file was created or changed. " : "Files created or changed: \(files). ")
+                + "Show me briefly what was done and check that it looks right. If I approve: claude-harvest accept \"\(task.project)\" \"\(task.title)\" "
+                + "— it only marks the task done. Don't delete, move or push anything.")
         } else {
             prompt = L("סקור את הענף \(task.branch ?? "") — משימת בקלוג שהקציר השלים: \"\(task.title)\". "
                 + "הראה לי בקצרה מה השתנה ולמה. אם אני מאשר: claude-harvest merge \"\(task.project)\" \"\(task.title)\" "
@@ -5535,7 +5646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         model.rejectProblem = nil
         var l = model.listing
         l.needsYou.removeAll { $0.id == task.id }
-        l.done.removeAll { $0.id == task.id && $0.branchState == "unmerged" }
+        l.done.removeAll { $0.id == task.id && $0.awaitsReview }
         model.listing = l
         var args = ["reject", task.project, task.title]
         if !reason.isEmpty { args += ["--reason", reason] }
@@ -5547,6 +5658,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         }
     }
 
+    /// "בוצע" on work done in a folder with no git: `accept`, at once — the task leaves the lists while the engine
+    /// writes it down, and comes back if the engine refuses.
+    func acceptFolder(_ task: HTask) {
+        model.rejecting = nil
+        model.rejectProblem = nil
+        var l = model.listing
+        l.needsYou.removeAll { $0.id == task.id }
+        model.listing = l
+        runEngine(["accept", task.project, task.title]) { [weak self] data in
+            guard let self else { return }
+            let reply = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            if reply?["ok"] as? Bool != true {
+                self.model.rejectProblem = L("\"\(task.title)\" לא סומנה כבוצעה: ", "\"\(task.title)\" wasn't marked done: ")
+                    + (reply?["error"] as? String ?? L("המנוע לא ענה", "the engine didn't answer"))
+            }
+            self.refreshListing { [weak self] in self?.pollEvents() }
+        }
+    }
+
     /// "דחה הכל": everything that waits, each on its own — what the engine refused is listed with its reason.
     func rejectAllWaiting(reason: String) {
         model.rejecting = nil
@@ -5554,7 +5684,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         model.rejectProblem = nil
         var l = model.listing
         l.needsYou = []
-        l.done.removeAll { $0.branchState == "unmerged" }
+        l.done.removeAll { $0.awaitsReview }
         model.listing = l
         var args = ["reject", "--all"]
         if !reason.isEmpty { args += ["--reason", reason] }
@@ -5803,13 +5933,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         let every: TimeInterval = oldest >= 7 ? 20 * 3600 : 44 * 3600
         guard now >= d.double(forKey: "NudgeSnoozeUntil"), now - d.double(forKey: "NudgeLast") >= every else { return }
         d.set(now, forKey: "NudgeLast")
-        let branches = waiting.filter { $0.status == "done" }.count
-        let questions = waiting.count - branches
-        var what = branches == 0 ? "" : branches == 1 ? L("ענף אחד", "one branch") : L("\(branches) ענפים", "\(branches) branches")
-        if questions > 0 {
-            let q = questions == 1 ? L("שאלה אחת", "one question") : L("\(questions) שאלות", "\(questions) questions")
-            what = what.isEmpty ? q : what + L(questions == 1 ? " ו" : " ו־", " and ") + q
-        }
+        let folders = waiting.filter { $0.isFolderReview }.count
+        let branches = waiting.filter { $0.status == "done" }.count - folders
+        let questions = waiting.count - branches - folders
+        var parts: [String] = []
+        if branches > 0 { parts.append(branches == 1 ? L("ענף אחד", "one branch") : L("\(branches) ענפים", "\(branches) branches")) }
+        if folders > 0 { parts.append(folders == 1 ? L("עבודה אחת בתיקייה", "one piece of work in a folder") : L("\(folders) עבודות בתיקיות", "\(folders) pieces of work in folders")) }
+        if questions > 0 { parts.append(questions == 1 ? L("שאלה אחת", "one question") : L("\(questions) שאלות", "\(questions) questions")) }
+        let what = parts.count < 2 ? (parts.first ?? "")
+            : parts.dropLast().joined(separator: ", ") + L(parts[parts.count - 1].first?.isNumber == true ? " ו־" : " ו", " and ") + parts[parts.count - 1]
         let age = oldest >= 7 ? L("כבר יותר משבוע", "over a week") : L("\(oldest) ימים", "\(oldest) days")
         notify(title: appName,
                body: L("יש עבודה שעשיתי ועוד לא אישרת: \(what). הוותיק מחכה \(age). נדבר על זה?",
@@ -6251,10 +6383,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
          "proposals":[\(task("recipes-app", he ? "להסיר TODO ישן ב-sync" : "Resolve an old TODO in sync", "proposed", 0.6)),
                       \(task("site", he ? "שגיאות lint בטופס יצירת קשר" : "Lint errors in the contact form", "proposed", 0.3)),
                       \(task("site", he ? "תמונות בלי טקסט חלופי" : "Images without alt text", "proposed", 0.5))],
-         "needsYou":[\(task("recipes-app", he ? "בדיקות יחידה למיון" : "Unit tests for sorting", "done", 0.8, extra: #","branch":"backlog/sort-tests","branchState":"unmerged","ageDays":1"#))],
+         "needsYou":[\(task("recipes-app", he ? "בדיקות יחידה למיון" : "Unit tests for sorting", "done", 0.8, extra: #","branch":"backlog/sort-tests","branchState":"unmerged","ageDays":1"#)),
+                     \(task("client-files", he ? "סיכום ההערות מהפגישה" : "Summarise the meeting notes", "done", 0.5, extra: #","branchState":"review","folder":true,"files":["summary.md","notes-checked.txt"],"summary":"summary.md","ageDays":0"#))],
          "done":[\(task("recipes-app", he ? "בדיקות יחידה למיון" : "Unit tests for sorting", "done", 0.8, extra: #","branch":"backlog/sort-tests","branchState":"unmerged","ageDays":1"#)),
+                 \(task("client-files", he ? "סיכום ההערות מהפגישה" : "Summarise the meeting notes", "done", 0.5, extra: #","branchState":"review","folder":true,"files":["summary.md","notes-checked.txt"],"summary":"summary.md","ageDays":0"#)),
                  \(task("site", he ? "תיקון קישורים שבורים" : "Fix broken links", "done", 0.3, extra: #","branch":"backlog/links","branchState":"merged","ageDays":2"#))],
-         "projects":[{"path":"/demo/recipes-app","name":"recipes-app"},{"path":"/demo/site","name":"site"}],
+         "projects":[{"path":"/demo/recipes-app","name":"recipes-app"},{"path":"/demo/site","name":"site"},{"path":"/demo/client-files","name":"client-files","folderMode":true}],
          "settings":{"language":"\(he ? "he" : "en")","configured":true}}
         """
         do { model.listing = try JSONDecoder().decode(HListing.self, from: Data(json.utf8)) }
