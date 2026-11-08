@@ -578,12 +578,12 @@ the owner does between runs); `project` / `title` are the project's name and the
 |---|---|---|
 | `run_started` | `begin` | a run begins |
 | `task_started` | `worktree` / `run-task` | a task's worktree and branch are ready (a task going on from a pause too) |
-| `task_waiting_review` | `finish-task` | done with commits: the branch waits for approval |
+| `task_waiting_review` | `finish-task` | done with commits: the branch waits for approval; done with nothing to commit and a clean worktree (a check, a report): no branch, it waits for the owner's "Done" (`accept`), its result marked "no changes" |
 | `task_blocked` | `finish-task` | stopped on a question (`question`) |
-| `task_failed` | `finish-task` | failed (also: "done" with no commit; also the second failure that blocks the task) |
+| `task_failed` | `finish-task` | failed (also: "done" with no commit but uncommitted work left in the worktree; also the second failure that blocks the task) |
 | `task_paused` | `finish-task` | a usage limit stopped it; its work is saved |
 | `task_merged` | `merge` | the owner's approved merge |
-| `task_accepted` | `accept` | the owner's "Done" on work done in a folder without git |
+| `task_accepted` | `accept` | the owner's "Done" on work done in a folder without git, or on a task that changed nothing |
 | `request_blocked` | `pull` | a request from outside was blocked before it became a task (a folder that wasn't found, outside home, a system folder…); `summary` and `question` are the question sent to the source, in the owner's language; `project` is the source's name, `title` the task's name |
 | `source_unreachable` | `pull` | a source couldn't be listed 3 pulls in a row — once, until it answers again; `summary` says so with the reason |
 | `run_ended` | `end`, a limit ending the coordinator, `maintain` (a run that was cut off) | the run is over: how many tasks finished, why it stopped, how many wait for the owner, and "the summary email wasn't sent" when an automatic final run's digest was due and didn't go |
