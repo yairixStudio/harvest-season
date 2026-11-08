@@ -348,6 +348,9 @@ def is_git(repo):
 # Folder mode: a project folder that exists but has no git. Its tasks run in the folder itself (no worktree, no
 # branch), edit nothing the owner didn't ask for, and end waiting for the owner's "Done" instead of a merge.
 FOLDER_MARK = "no-git folder"                       # a done folder task's result carries this part instead of a branch
+# A task in a git project that finished with nothing to commit — a check, an investigation, a report given in the
+# summary — carries this instead of a branch, and waits for the owner's "Done" like a folder task.
+NO_CHANGES_MARK = "no changes"
 MANIFEST_DIR = os.path.join(HOME, "folder-manifests")
 MANIFEST_SKIP = {".git", "node_modules", "__pycache__", ".DS_Store"}
 MANIFEST_MAX_FILES = 40000
@@ -1000,12 +1003,15 @@ def task_view(repo, t, r):
         parts = [x.strip() for x in result.split("·")]
         rest = [x for x in parts if x and not DATE_RE.fullmatch(x) and not BRANCH_RE.fullmatch(x)
                 and not re.fullmatch(r"\d+k", x) and not x.startswith("archived") and not MERGED_RE.fullmatch(x)
-                and x != FOLDER_MARK and not x.startswith(FILES_PREFIX) and not ACCEPTED_RE.fullmatch(x)]
+                and x not in (FOLDER_MARK, NO_CHANGES_MARK) and not x.startswith(FILES_PREFIX) and not ACCEPTED_RE.fullmatch(x)]
         v["summary"] = " · ".join(rest)
         b = BRANCH_RE.search(result)
-        if FOLDER_MARK in parts:
-            # A task done in a folder without git: no branch, and the owner's "Done" takes the place of a merge.
+        if FOLDER_MARK in parts or NO_CHANGES_MARK in parts:
+            # A task done in a folder without git, or one that changed nothing: no branch, and the owner's "Done"
+            # takes the place of a merge.
             v["folder"] = True
+            if NO_CHANGES_MARK in parts:
+                v["noChanges"] = True
             listed = next((x for x in parts if x.startswith(FILES_PREFIX)), "")
             v["files"] = [x.strip() for x in listed[len(FILES_PREFIX):].split(" | ") if x.strip()]
             v["branchState"] = "accepted" if ACCEPTED_RE.search(result) else "review"
@@ -1997,8 +2003,14 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
         snapshot_worktree(cur["worktree"])
     commits = commits_ahead(repo, base, branch)
     summary = (summary or "").strip().replace("\n", " ")
+    no_changes = False
     if outcome == "done" and commits == 0:
-        outcome, summary = "failed", tr("no_commit")
+        if git(cur["worktree"], "status", "--porcelain").stdout.strip():
+            # Work was left uncommitted: removing the worktree would lose it.
+            outcome, summary = "failed", tr("no_commit")
+        else:
+            # Nothing to commit and nothing left behind: a check or a report. It waits for the owner's "Done".
+            no_changes = True
     remove_worktree(repo, cur["worktree"])
     _, t = find_task(repo, title)
     previous = t["fields"].get("result", "")
@@ -2010,6 +2022,9 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
         else:
             git(repo, "branch", "-D", branch)
             updates = {"status": "open", "result": tr("paused_empty", today(), summary)}
+    elif outcome == "done" and no_changes:
+        git(repo, "branch", "-D", branch)
+        updates = {"status": "done", "result": "%s · %s · %s · %s" % (today(), NO_CHANGES_MARK, summary, k)}
     elif outcome == "done":
         updates = {"status": "done", "result": "%s · %s · %s · %s" % (today(), branch, summary, k)}
     elif outcome == "blocked":
@@ -2031,6 +2046,8 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
     set_fields(repo, title, updates)
     if outcome == "paused":
         report_source(t["fields"], "running", summary=updates["result"], branch=branch if commits else "", session=session_id or "")
+    elif outcome == "done" and no_changes:
+        report_source(t["fields"], "waiting_review", summary=" ".join([summary, tr("src_no_files")]), session=session_id or "")
     elif outcome == "done":
         report_source(t["fields"], "waiting_review", summary=summary, branch=branch, session=session_id or "")
     elif outcome == "blocked":
@@ -2039,8 +2056,8 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
         retry = updates["status"] == "open"
         report_source(t["fields"], "failed", summary=tr("src_retry", summary) if retry else summary, session=session_id or "")
     record = record_finish(repo, title, cur, outcome, summary, tokens, usage_json, session_id, tests, updates,
-                           branch if outcome == "done" or (outcome == "blocked" and commits) else None)
-    kept = branch if outcome == "done" or (outcome in ("blocked", "paused") and commits) else None
+                           branch if (outcome == "done" and not no_changes) or (outcome == "blocked" and commits) else None)
+    kept = branch if (outcome == "done" and not no_changes) or (outcome in ("blocked", "paused") and commits) else None
     kind, text = {"done": ("task_waiting_review", tr("ev_waiting_review", summary)),
                   "blocked": ("task_blocked", tr("ev_blocked", question if outcome == "blocked" else "")),
                   "paused": ("task_paused", tr("ev_paused", summary))}.get(outcome, ("task_failed", tr("ev_failed", summary)))

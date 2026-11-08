@@ -421,16 +421,41 @@ class Harvest(unittest.TestCase):
         with open(os.path.join(other, "BACKLOG.md"), encoding="utf-8") as f:
             self.assertIn("משימות קטנות ולא דחופות", f.read(), "a new backlog starts from the Hebrew template")
 
-    def test_done_without_commits_fails_then_blocks(self):
+    def test_done_with_uncommitted_work_fails_then_blocks(self):
         self.add("Flaky task")
         self.usage()
         self.run_engine("begin")
         for expected in ("open", "blocked"):
-            self.run_engine("worktree", self.repo, "Flaky task")
+            wt = self.run_engine("worktree", self.repo, "Flaky task")
+            with open(os.path.join(wt["path"], "left.txt"), "w") as f:
+                f.write("not committed\n")
             out = self.run_engine("finish-task", self.repo, "Flaky task", "--outcome", "done", "--summary", "x")
             self.assertEqual(out["backlog"]["status"], expected)
         self.assertFalse(subprocess.run(["git", "-C", self.repo, "branch", "--list", "backlog/*"],
                                         capture_output=True, text=True).stdout.strip())
+
+    def test_done_with_nothing_to_commit_waits_for_done(self):
+        # A check or a report changes no file: it is not a failure, it waits for the owner's "Done".
+        self.add("Check the logs")
+        self.usage()
+        self.run_engine("begin")
+        self.run_engine("worktree", self.repo, "Check the logs")
+        out = self.run_engine("finish-task", self.repo, "Check the logs", "--outcome", "done",
+                              "--summary", "Logs are clean since 4.11")
+        self.assertEqual((out["outcome"], out["backlog"]["status"], out["branch"]), ("done", "done", None))
+        self.assertFalse(subprocess.run(["git", "-C", self.repo, "branch", "--list", "backlog/*"],
+                                        capture_output=True, text=True).stdout.strip(), "no branch is kept")
+        review = self.events()["events"][-1]
+        self.assertEqual((review["kind"], review["summary"]),
+                         ("task_waiting_review", "Waiting for your approval · Logs are clean since 4.11"))
+        self.assertNotIn("branch", review)
+        view = next(t for t in self.run_engine("list")["needsYou"] if t["title"] == "Check the logs")
+        self.assertEqual((view["branchState"], view["folder"], view.get("noChanges"), view["summary"]),
+                         ("review", True, True, "Logs are clean since 4.11"))
+        self.run_engine("end", "--reason", "queue-empty")
+        self.run_engine("accept", self.repo, "Check the logs")
+        view = next(t for t in self.run_engine("list")["done"] if t["title"] == "Check the logs")
+        self.assertEqual(view["branchState"], "accepted")
 
     def test_maintain_recovers_interrupted_run(self):
         self.add("Interrupted work")
@@ -1194,8 +1219,10 @@ class Harvest(unittest.TestCase):
         stops = wt["branch"]
         self.commit_in(wt["path"])
         self.run_engine("finish-task", self.repo, "Stops", "--outcome", "paused", "--summary", "the 5-hour limit")
-        # A task that reports done without a commit is a failure, and says so once.
-        self.run_engine("worktree", self.repo, "Empty")
+        # A task that reports done but left its work uncommitted is a failure, and says so once.
+        wt = self.run_engine("worktree", self.repo, "Empty")
+        with open(os.path.join(wt["path"], "left.txt"), "w") as f:
+            f.write("not committed\n")
         self.run_engine("finish-task", self.repo, "Empty", "--outcome", "done", "--summary", "all good")
         self.assertEqual(self.kinds()[2:], [
             "task_waiting_review",
