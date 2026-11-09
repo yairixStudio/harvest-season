@@ -75,6 +75,9 @@ DEFAULT_SETTINGS = {"ownerName": "", "language": "en", "email": "", "emailDigest
                     # How many days before its recommended date a task may run. The harvest comes once a week, so
                     # 3 keeps a task within half a week of its date: this harvest if it is closer, else the next.
                     "earlyDays": 3,
+                    # How many tasks may run at once, each in another project, when the quota is plentiful
+                    # (PARALLEL_MIN_FIVE_ROOM, PARALLEL_HEADROOM). 1 = one at a time.
+                    "maxParallel": 2,
                     # Which steps the widget notifies about: all · needs_me (a question, a failure, work to approve,
                     # the end of a run) · run_end (only the end of a run).
                     "notify": "all"}
@@ -87,6 +90,11 @@ WEEKLY_PER_FIVE = 3.8
 MIN_CALIBRATION_POINTS = 3
 
 FIT_FACTOR = 1.5     # a task starts only if 1.5x its estimate fits the budget
+# Tasks in parallel (settings `maxParallel`): a second slot opens only when the quota is plentiful — the
+# 5-hour window has at least this many points of room, and the budget covers every running task's reserve
+# plus the new one this many times over. usage.json can be minutes old and parallel sessions burn faster.
+PARALLEL_MIN_FIVE_ROOM = 40
+PARALLEL_HEADROOM = 2.0
 CUTOFF_GUARD_MIN = 20
 TOKENS_PER_MINUTE = 8000
 USAGE_MAX_AGE_S = 15 * 60
@@ -681,6 +689,41 @@ def status():
 
 def save_status(st):
     write_json(STATUS, st)
+
+
+class StatusLock:
+    """An exclusive lock around a read-modify-write of status.json. With tasks in parallel, two task sessions'
+    `run-task` processes write it at the same time (a start, a session's ids, a finish); without the lock one
+    would silently undo the other. Not re-entrant: never nest it."""
+    def __enter__(self):
+        os.makedirs(HOME, exist_ok=True)
+        self.f = open(STATUS + ".lock", "a")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def running_tasks(st):
+    """The tasks running now. `running` is the list; a status written before tasks could run in parallel has only
+    `current`. `current` stays the first running task, so readers that know one task (the widget) still work."""
+    if "running" in st:
+        return list(st.get("running") or [])
+    return [st["current"]] if st.get("current") else []
+
+
+def set_running(st, running):
+    st["running"] = running
+    st["current"] = running[0] if running else None
+
+
+def max_parallel():
+    try:
+        return max(1, min(4, int(settings().get("maxParallel", 1))))
+    except (TypeError, ValueError):
+        return 1
 
 
 def read_lock():
@@ -1431,6 +1474,10 @@ def cmd_settings(a):
                 if not v.strip().isdigit() or not 0 <= int(v) <= 7:
                     fail("earlyDays takes a whole number of days, 0–7")
                 v = int(v)
+            elif k == "maxParallel":
+                if not v.strip().isdigit() or not 1 <= int(v) <= 4:
+                    fail("maxParallel takes a whole number of tasks, 1–4")
+                v = int(v)
             elif k == "notify" and v not in NOTIFY_MODES:
                 fail("notify is one of " + ", ".join(NOTIFY_MODES))
             elif k in ("emailDigest", "switchMidTask"):
@@ -1764,6 +1811,15 @@ def plan_result(mode, only_keys, usage_json):
     budget = min(weekly_budget, five_budget)
     res.update({"weeklyRoom": round(weekly_room, 1), "fiveRoom": round(five_room, 1),
                 "budgetTokens": int(budget), "limitedBy": "5h" if five_budget < weekly_budget else "weekly"})
+    # Tasks already running keep their reserve (estimate × FIT_FACTOR: their progress can't be read) and their
+    # project; another task starts beside them only while the quota is plentiful.
+    running = running_tasks(st)
+    reserve = sum(int(x.get("tokens") or 0) * FIT_FACTOR for x in running)
+    busy = {os.path.realpath(x.get("project", "")) for x in running}
+    fable_busy = any("fable" in str(x.get("model", "")).lower() for x in running)
+    slots = max_parallel() - len(running)
+    res["parallel"] = {"max": max_parallel(), "running": len(running), "reserveTokens": int(reserve),
+                       "tasks": [{"project": x.get("project"), "title": x.get("title")} for x in running]}
 
     tasks, infos = all_tasks(r)
     only = set(only_keys or [])
@@ -1781,7 +1837,7 @@ def plan_result(mode, only_keys, usage_json):
         if minutes_left - duration < CUTOFF_GUARD_MIN:
             res["deferred"].append({"project": c["project"], "title": c["title"], "why": "cutoff"})
             continue
-        if need > budget:
+        if need > budget - reserve:
             res["deferred"].append({"project": c["project"], "title": c["title"], "why": "budget"})
             deferred_budget = True
             continue
@@ -1789,12 +1845,22 @@ def plan_result(mode, only_keys, usage_json):
         if not model:
             res["deferred"].append({"project": c["project"], "title": c["title"], "why": "model-full"})
             continue
+        if running and res["next"] is None:
+            # Beside a running task: another project only, a free slot, plenty of quota, and never two Fable
+            # sessions at once (Fable has its own, smaller quota). Otherwise it simply waits its turn.
+            if os.path.realpath(c["project"]) in busy or slots <= 0:
+                continue
+            if five_room < PARALLEL_MIN_FIVE_ROOM or budget < PARALLEL_HEADROOM * (reserve + need):
+                res["parallel"]["gate"] = "not-plentiful"
+                continue
+            if fable_busy and "fable" in model.lower():
+                continue
         if res["next"] is None:
             res["next"] = {"kind": "task", "project": c["project"], "projectName": c["projectName"],
                            "title": c["title"], "details": c["details"], "priority": c["priority"],
                            "complexity": c["complexity"], "tokens": c["tokens"], "model": model,
                            "scheduled": c["scheduled"], "deadline": c["deadline"], "overdue": c["overdue"]}
-    if res["next"] is None and mode == "auto" and not only and st.get("scansThisRun", 0) < MAX_SCANS_PER_RUN:
+    if res["next"] is None and not running and mode == "auto" and not only and st.get("scansThisRun", 0) < MAX_SCANS_PER_RUN:
         open_or_proposed = {x["project"] for x in tasks if x["status"] in ("open", "proposed")}
         scanned = set(st.get("scannedThisRun", []))
         for info in infos:
@@ -1807,6 +1873,10 @@ def plan_result(mode, only_keys, usage_json):
                 break
     if res["next"]:
         res["harvest"] = True
+        return res
+    if running:
+        # Nothing more to start now, but tasks are still at work: wait for one to finish, then plan again.
+        res.update({"harvest": True, "reason": "wait-running", "final": False})
         return res
     if not candidates:
         res["reason"] = "queue-empty"
@@ -1836,7 +1906,7 @@ def cmd_begin(a):
         st["cycle"] = {"id": cycle, "done": [], "blocked": [], "failed": [], "runs": 0}
     if st.get("cycle"):
         st["cycle"]["runs"] = st["cycle"].get("runs", 0) + 1
-    st.update({"state": "running", "mode": a.mode, "runStartedAt": iso(now()), "current": None,
+    st.update({"state": "running", "mode": a.mode, "runStartedAt": iso(now()), "current": None, "running": [],
                "doneThisRun": [], "scansThisRun": 0, "scannedThisRun": [], "usageAtStart": u,
                "runId": "run-" + datetime.now().strftime("%Y%m%d-%H%M%S")})
     save_status(st)
@@ -1867,6 +1937,12 @@ def start_task(repo, title, model, usage_json, session_id=None):
     _, t = find_task(repo, title)
     if (t["fields"].get("status") or "open") != "open":
         fail("only open tasks can be started")
+    # The same checks task_current makes under the lock, made here first so a refused start leaves no worktree.
+    running = running_tasks(status())
+    if any(os.path.realpath(r.get("project", "")) == os.path.realpath(repo) for r in running):
+        fail("a task is already running in this project: one task per project at a time")
+    if len(running) >= max_parallel():
+        fail("as many tasks are running as maxParallel allows (%d)" % max_parallel())
     if is_folder_project(repo):
         return start_folder_task(repo, t, title, model, usage_json, session_id)
     if not is_git(repo):
@@ -1912,9 +1988,20 @@ def task_current(repo, t, title, model, usage_json, extra):
                "scheduled": f.get("scheduled", ""), "deadline": f.get("deadline", ""),
                "source": f.get("source", ""), "startedAt": iso(now()), "usageBefore": u}
     current.update(extra)
-    st = status()
-    st["current"] = current
-    save_status(st)
+    with StatusLock():
+        st = status()
+        running = running_tasks(st)
+        if any(os.path.realpath(r.get("project", "")) == os.path.realpath(repo) for r in running):
+            fail("a task is already running in this project: one task per project at a time")
+        if len(running) >= max_parallel():
+            fail("as many tasks are running as maxParallel allows (%d)" % max_parallel())
+        # Tasks that ran side by side share the usage percentages: none of them can calibrate from them.
+        if running:
+            current["overlapped"] = True
+            for r in running:
+                r["overlapped"] = True
+        set_running(st, running + [current])
+        save_status(st)
     return current
 
 
@@ -1975,27 +2062,34 @@ def record_finish(repo, title, cur, outcome, summary, tokens, usage_json, sessio
     """The part of ending a task that is the same with a branch and in a folder: calibration, history, the run's
     tally in status.json. Returns the history record."""
     after, _ = load_usage(usage_json)
-    append_calibration(repo, cur["slug"], cur.get("model") or "", cur.get("tokens") or "",
-                       tokens or 0, cur.get("usageBefore"), after)
-    record = {"project": repo, "projectName": display_name(repo), "title": title,
-              "outcome": outcome if outcome in ("done", "paused") else updates["status"],
-              "branch": branch, "summary": summary, "tokens": tokens or 0}
-    append_history(dict(record, sessionId=session_id, tests=tests))
-    st = status()
-    st["doneThisRun"] = st.get("doneThisRun", []) + [record]
-    if st.get("cycle"):
-        key = {"done": "done", "blocked": "blocked", "paused": "paused"}.get(record["outcome"], "failed")
-        st["cycle"].setdefault(key, []).append(record)
-    st["current"] = None
-    save_status(st)
+    with StatusLock():
+        st = status()
+        running = running_tasks(st)
+        mine = next((r for r in running if r.get("project") == repo and r.get("title") == title), cur)
+        overlapped = bool(mine.get("overlapped") or cur.get("overlapped"))
+        # A task that ran beside another: its usage percentages moved for both, so the row keeps its tokens but
+        # no percentages, and ratio() leaves it out.
+        append_calibration(repo, cur["slug"], cur.get("model") or "", cur.get("tokens") or "",
+                           tokens or 0, None if overlapped else cur.get("usageBefore"), None if overlapped else after)
+        record = {"project": repo, "projectName": display_name(repo), "title": title,
+                  "outcome": outcome if outcome in ("done", "paused") else updates["status"],
+                  "branch": branch, "summary": summary, "tokens": tokens or 0}
+        append_history(dict(record, sessionId=session_id, tests=tests))
+        st["doneThisRun"] = st.get("doneThisRun", []) + [record]
+        if st.get("cycle"):
+            key = {"done": "done", "blocked": "blocked", "paused": "paused"}.get(record["outcome"], "failed")
+            st["cycle"].setdefault(key, []).append(record)
+        set_running(st, [r for r in running if not (r.get("project") == repo and r.get("title") == title)])
+        save_status(st)
     return record
 
 
 def finish_task(repo, title, outcome, summary, question, tokens, usage_json, session_id, tests=None, files=None):
     st = status()
-    cur = st.get("current") or {}
-    if cur.get("project") != repo or cur.get("title") != title:
-        fail("finish-task does not match the task that was started", current=cur)
+    running = running_tasks(st)
+    cur = next((r for r in running if r.get("project") == repo and r.get("title") == title), None)
+    if cur is None:
+        fail("finish-task does not match a task that was started", running=running)
     if cur.get("folder"):
         return finish_folder_task(repo, title, cur, outcome, summary, question, tokens, usage_json, session_id, tests, files)
     branch, base = cur["branch"], cur["base"]
@@ -2194,7 +2288,7 @@ def end_run(reason, final, emailed, report=None):
         "scans": st.get("scansThisRun", 0), "stopReason": reason, "final": final,
         "emailed": emailed, "report": report,
     }
-    st.update({"state": "idle", "current": None})
+    st.update({"state": "idle", "current": None, "running": []})
     save_status(st)
     lk = read_lock()
     if lk and (not lk.get("pid") or lk.get("pid") == runner_pid() or not alive(lk.get("pid"))):
@@ -2247,7 +2341,7 @@ def cmd_maintain(a):
         st["lastRun"] = {"startedAt": st.get("runStartedAt"), "finishedAt": iso(now()), "mode": st.get("mode"),
                          "done": sum(1 for d in st.get("doneThisRun", []) if d["outcome"] == "done"),
                          "stopReason": "interrupted", "final": False, "emailed": False}
-        st.update({"state": "idle", "current": None})
+        st.update({"state": "idle", "current": None, "running": []})
         save_status(st)
         run_ended_event(st["lastRun"])
         report["interrupted"] = True
@@ -3672,8 +3766,7 @@ def cmd_launch(a):
     def task_running():
         """A task session the coordinator started is still at work (or being recorded): closing the coordinator
         now would take it down too, so a limit waits for it — the task stops at the same limit by itself."""
-        cur = status().get("current") or {}
-        return bool(cur) and (alive(cur.get("claudePid")) or alive(cur.get("launcherPid")))
+        return any(alive(c.get("claudePid")) or alive(c.get("launcherPid")) for c in running_tasks(status()))
 
     info = run_session(a.workdir, name, prompt, a.model, a.effort, a.remote_control, a.max_minutes, a.linger,
                        is_done=run_ended if a.auto_exit else None, on_update=record,
@@ -3836,11 +3929,19 @@ def cmd_prompts(a):
     emit({"ok": True, "prompts": out, "folder": PROMPTS_DIR})
 
 
-def update_current(extra):
-    st = status()
-    if st.get("current") is not None:
-        st["current"].update(extra)
-        save_status(st)
+def update_running(repo, title, extra):
+    """Adds what the launcher learns about a task session (its ids, pids, model) to that task's running record."""
+    with StatusLock():
+        st = status()
+        running = running_tasks(st)
+        hit = False
+        for r in running:
+            if r.get("project") == repo and r.get("title") == title:
+                r.update(extra)
+                hit = True
+        if hit:
+            set_running(st, running)
+            save_status(st)
 
 
 def cmd_run_task(a):
@@ -3878,7 +3979,7 @@ def cmd_run_task(a):
     effort = "high" if cur["complexity"] == "high" else "medium"
 
     def track(info):
-        update_current({"sessionId": info["sessionId"], "sessionName": info["name"],
+        update_running(repo, a.title, {"sessionId": info["sessionId"], "sessionName": info["name"],
                         "bridgeSessionId": info["bridgeSessionId"], "claudePid": info["claudePid"],
                         "launcherPid": info["launcherPid"],
                         "model": "→".join([info["switches"][0]["from"]] + [x["to"] for x in info["switches"]])

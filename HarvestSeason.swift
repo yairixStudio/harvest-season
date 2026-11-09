@@ -494,6 +494,9 @@ struct HLimit: Decodable, Equatable {
 struct HStatus: Decodable, Equatable {
     let state: String?
     let current: HCurrent?
+    /// Every task running now: more than one when the quota is plentiful (`maxParallel`), each in another
+    /// project. `current` is the first of them.
+    let running: [HCurrent]?
     let lastRun: HRun?
     let doneThisRun: [HRecord]?
     /// "five", "weekly", "model:<name>".
@@ -5235,9 +5238,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         // The run this stops ends as "interrupted"; this keeps it from being resumed as if the Mac had slept.
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "HarvestStoppedAt")
         let claudePid = model.listing.launch?.claudePid
-        // The task session is a terminal session of its own: stop it directly too.
-        if let taskPid = model.listing.status?.current?.claudePid, taskPid > 1 {
-            killpg(pid_t(taskPid), SIGTERM)
+        // Each task session is a terminal session of its own: stop every running one directly too.
+        let status = model.listing.status
+        let tasks = status?.running ?? (status?.current).map { [$0] } ?? []
+        for pid in Set(tasks.compactMap { $0.claudePid }) where pid > 1 {
+            killpg(pid_t(pid), SIGTERM)
         }
         if runner.isRunning {
             runner.stop(claudePid: claudePid)

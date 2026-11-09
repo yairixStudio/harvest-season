@@ -263,6 +263,21 @@ added to the repo's `.git/info/exclude`) and starts "קציר · <task title>" t
 the same way, with the project's CLAUDE.md, memory, settings and hooks. The
 task session reports with `harvest.py task-report`; the launcher then closes it
 and the engine records the result (history keeps the task session's id).
+Tasks in parallel (settings `maxParallel`, 1–4, default 2): `status.running` lists every running task (`current`
+is its first, for readers that know one). `plan` keeps each running task's reserve (estimate × FIT_FACTOR) and
+its project, and offers another task beside them only in another project, never a second Fable session, only
+while the 5-hour window has at least `PARALLEL_MIN_FIVE_ROOM` points of room and the budget covers all the
+reserves plus the new one `PARALLEL_HEADROOM` times over; otherwise it answers `wait-running`. `worktree` /
+`run-task` refuse a second task in a project or past `maxParallel`. Tasks that overlapped write their
+calibration row without usage percentages (both moved them), so `ratio()` leaves them out. status.json writes
+go through a file lock (`StatusLock`). The widget's Stop stops every running task's session.
+A task session starts by doubting its task (the task prompt, `task-agent-prompt.md`):
+before changing anything it checks that what the task names still exists and
+behaves as described, that the git history and later reports don't show it done
+or overtaken, and that its premise (a date, a build, a "before X") still holds.
+A task that no longer applies changes nothing and ends `blocked`, with the
+evidence and "close it?" as the question, so the owner closes it; a task partly
+done already does only what is left.
 Proposal scans run likewise ("קציר · סריקת הצעות", a throwaway detached
 worktree). New folders open on Claude Code's "trust this folder?" screen with
 "No, exit" preselected; the launcher moves the pointer to "Yes" before Enter.

@@ -11,6 +11,12 @@ Task: <title>
 Priority <priority> · complexity <complexity> · estimated tokens <tokens>
 Details / done when: <details>
 
+First, doubt the task. It was written days or weeks ago, and the code, the site or the decision behind it may have moved on since. Before changing anything, check that it still applies:
+- Does what it names still exist and still behave as described (the file, function, line, bug, page, setting)? Read it now; don't trust the details.
+- Was it already done, or overtaken? Look at the git history since the task was added (`git log --since`, `-S`, `--grep`), later reports or docs in the project, and newer code that replaced the thing it talks about.
+- Does its premise still hold (a date, a build or version, a "before X" that may already have happened)?
+If it no longer applies, change nothing and report blocked with the evidence as the question, in <owner language>: what you found (commit, file, line), and "close it?" — the owner decides, never drop it yourself. If part of it was already done, do only what is left and say what you skipped and why. Only then start the work.
+
 Rules:
 - Work only inside this worktree. Never push, never merge, never change remotes, never run deploy/publish/migration commands, never modify secrets or .env files.
 - Do exactly this task. Don't edit BACKLOG.md or record new backlog tasks — other issues you notice go into your summary as suggestions.

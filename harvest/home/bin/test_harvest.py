@@ -176,6 +176,78 @@ class Harvest(unittest.TestCase):
         plan = self.run_engine("plan", "--only", self.repo + "::Second thing to do")
         self.assertEqual(plan["next"]["title"], "Second thing to do")
 
+    def calibration_rows(self):
+        with open(os.path.join(self.home, "calibration.md")) as f:
+            return [[c.strip() for c in line.strip().strip("|").split("|")]
+                    for line in f if line.startswith("| 20")]
+
+    def test_parallel_tasks_in_other_projects(self):
+        beta = self.make_repo("beta")
+        self.add("Alpha one", tokens=60000)
+        self.add("Alpha two", tokens=60000)
+        self.run_engine("add", beta, "--title", "Beta one", "--details", "x", "--complexity", "low", "--tokens", "60000")
+        self.usage(five=10, weekly=20)
+        self.run_engine("begin", "--mode", "manual")
+        first = self.run_engine("plan", "--mode", "manual")["next"]
+        wt1 = self.run_engine("worktree", first["project"], first["title"], "--model", "sonnet")
+        # Plenty of quota: the next task comes from the other project, beside the running one.
+        plan = self.run_engine("plan", "--mode", "manual")
+        self.assertTrue(plan["harvest"])
+        self.assertEqual(plan["parallel"]["running"], 1)
+        second = plan["next"]
+        self.assertNotEqual(os.path.realpath(second["project"]), os.path.realpath(first["project"]))
+        # Never two tasks in one project, even when asked directly.
+        same = "Alpha two" if first["title"] == "Alpha one" else "Alpha one"
+        if os.path.realpath(first["project"]) == os.path.realpath(self.repo):
+            self.run_engine("worktree", self.repo, same, code=2)
+        wt2 = self.run_engine("worktree", second["project"], second["title"], "--model", "sonnet")
+        # Both slots taken (maxParallel 2): nothing more to start, wait for one to finish.
+        plan = self.run_engine("plan", "--mode", "manual")
+        self.assertEqual((plan["harvest"], plan["reason"], plan["next"]), (True, "wait-running", None))
+        self.assertEqual(len(self.run_engine("list")["status"]["running"]), 2)
+        # They finish in the other order; each finds its own record.
+        self.commit_in(wt2["path"])
+        self.assertEqual(self.run_engine("finish-task", second["project"], second["title"], "--outcome", "done",
+                                         "--summary", "ok", "--tokens", "50000")["outcome"], "done")
+        st = self.run_engine("list")["status"]
+        self.assertEqual([r["title"] for r in st["running"]], [first["title"]])
+        self.assertEqual(st["current"]["title"], first["title"])
+        self.commit_in(wt1["path"])
+        self.run_engine("finish-task", first["project"], first["title"], "--outcome", "done",
+                        "--summary", "ok", "--tokens", "50000")
+        st = self.run_engine("list")["status"]
+        self.assertEqual((st["running"], st["current"]), ([], None))
+        # Side by side, the usage percentages moved for both: no percentages in their calibration rows.
+        rows = self.calibration_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r[6] == "" and r[8] == "" for r in rows), rows)
+        self.run_engine("end", "--reason", "queue-empty")
+
+    def test_parallel_only_when_quota_is_plentiful(self):
+        beta = self.make_repo("beta")
+        self.add("Alpha one", tokens=60000)
+        self.run_engine("add", beta, "--title", "Beta one", "--details", "x", "--complexity", "low", "--tokens", "60000")
+        # 5-hour window 50 % used: room 35 points (after the 15-point reserve), under the parallel floor of 40,
+        # though the budget itself would fit both. One at a time.
+        self.usage(five=50, weekly=20)
+        self.run_engine("begin", "--mode", "manual")
+        first = self.run_engine("plan", "--mode", "manual")["next"]
+        wt = self.run_engine("worktree", first["project"], first["title"], "--model", "sonnet")
+        plan = self.run_engine("plan", "--mode", "manual")
+        self.assertEqual((plan["reason"], plan["next"], plan["parallel"].get("gate")), ("wait-running", None, "not-plentiful"))
+        # A single task alone calibrates as before.
+        self.commit_in(wt["path"])
+        self.run_engine("finish-task", first["project"], first["title"], "--outcome", "done", "--tokens", "50000")
+        self.assertNotEqual(self.calibration_rows()[0][6], "")
+        # maxParallel 1: one at a time whatever the quota.
+        self.usage(five=10, weekly=20)
+        self.run_engine("settings", "--set", "maxParallel=1")
+        self.run_engine("settings", "--set", "maxParallel=9", code=2)
+        nxt = self.run_engine("plan", "--mode", "manual")["next"]
+        self.run_engine("worktree", nxt["project"], nxt["title"], "--model", "sonnet")
+        plan = self.run_engine("plan", "--mode", "manual")
+        self.assertEqual((plan["reason"], plan["next"]), ("wait-running", None))
+
     def test_full_task_cycle(self):
         self.add("Write docs for alpha")
         self.usage()
