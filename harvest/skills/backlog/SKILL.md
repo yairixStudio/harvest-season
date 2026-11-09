@@ -13,12 +13,13 @@ One `BACKLOG.md` per project root, fixed format, edited only through the harvest
 The Harvest Season widget in the menu bar shows every project's queue and launches the harvest a set number of hours before the weekly reset (or on demand). Each task runs in a fresh agent on its own `backlog/<slug>` branch, never pushed; the owner reviews and merges.
 
 ## Adding a task
-    claude-harvest add "<project root>" --status <open|proposed> --priority <1|2|3> --complexity <low|medium|high> --tokens <estimate> [--not-before "<date>" | --when "<date>"] [--deadline "<date>"] --title "<short title>" --details "<what to do, which files, and what counts as done>"
+    claude-harvest add "<project root>" --status <open|proposed> --priority <1|2|3> --complexity <low|medium|high> [--kind <code|check|report>] --tokens <estimate> [--not-before "<date>" | --when "<date>"] [--deadline "<date>"] --title "<short title>" --details "<what to do, which files, and what counts as done>"
 
 It creates BACKLOG.md from the template if needed, registers the project in `~/.claude/harvest/projects.md`, and refuses duplicates. Tell the user in one line what you recorded.
 
 - **Status**: `open` (queued, will run) only when the user is present in this session and agreed. Running unattended — a scheduled task, a headless `claude -p`, a harvest agent — use `proposed`: an agent never queues work for another agent (the engine enforces this in widget-launched runs).
 - **Complexity** picks the model: low → Sonnet, medium → Opus, high → Fable. Unsure means medium.
+- **Kind** says what the task delivers. `code` (the default) changes the project: it runs on a branch the owner merges. `check` verifies something and changes nothing (did the fix hold, are the logs clean, is the page indexed); `report` investigates and writes findings (an audit, a weekly report, a comparison, a plan the owner reads). A check or report writes its findings to a file outside the repository and closes by itself, with no branch to merge; each decision it finds becomes an item of its own. A document that belongs in the repository itself (README, docs the code links to) is `code`. Most tasks with a date are checks.
 - **Tokens** is an optional size hint. The engine prices every task from what it measures: turns × (the project's starting context — CLAUDE.md, connectors, system prompt — + the conversation's growth). Your hint only counts when it is larger, so give one for tasks you know are big.
 - **Details** must let a fresh agent tell when it's done ("done when X passes / Y exists"). "A check in a month" with nothing else: what to check comes from this conversation; if it doesn't say, ask in one line.
 
@@ -46,7 +47,7 @@ A task with a `source:` line (`<type>:request/<id>`) came from an outside task a
 Done-checkable work that is safe unattended: tests, refactors inside a module, docs, lint/type fixes, dependency bumps covered by tests, small UI polish with a clear spec, TODO/FIXME cleanups. Not here: product decisions, deploys, data migrations, payments/auth/secrets, work the user wants to watch.
 
 ## Statuses
-`open` queued (with a future date: waiting for it) · `proposed` not approved to run (an agent's idea, or paused by the owner) · `blocked` needs the decision written in `result` · `done` finished; `result` holds date · branch · plain-words summary · tokens · `dropped`.
+`open` queued (with a future date: waiting for it) · `proposed` not approved to run (an agent's idea, or paused by the owner) · `blocked` needs the decision written in `result` · `done` finished; `result` holds date · branch (or "no changes", and for a check or report `report: <file>`) · plain-words summary · tokens · `dropped`.
 
 The owner queues and pauses tasks with the switch in the widget (open ⇄ proposed). Agents never promote a proposal.
 

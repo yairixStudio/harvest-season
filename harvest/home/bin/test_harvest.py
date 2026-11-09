@@ -33,6 +33,11 @@ class Harvest(unittest.TestCase):
         self.env.pop("HARVEST_UNATTENDED", None)
         self.env.pop("HARVEST_RUNNER_PID", None)
         self.env.pop("CLAUDE_CODE_SESSION_ID", None)
+        # Run inside a harvest task session, the tests must never reach that session's real result or report file:
+        # task-report would write a test's {"done", "x"} there and the harvest would close the task with it.
+        for k in ("HARVEST_TASK_RESULT", "HARVEST_TASK_REPORT"):
+            self.env.pop(k, None)
+            os.environ.pop(k, None)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -67,6 +72,8 @@ class Harvest(unittest.TestCase):
                 "--complexity", kw.get("complexity", "low"), "--status", kw.get("status", "open")]
         if "tokens" in kw:
             args += ["--tokens", str(kw["tokens"])]
+        if "kind" in kw:
+            args += ["--kind", kw["kind"]]
         return self.run_engine(*args, env=kw.get("env"))
 
     def commit_in(self, path, name="x.txt"):
@@ -528,6 +535,88 @@ class Harvest(unittest.TestCase):
         self.run_engine("accept", self.repo, "Check the logs")
         view = next(t for t in self.run_engine("list")["done"] if t["title"] == "Check the logs")
         self.assertEqual(view["branchState"], "accepted")
+
+    def test_a_check_closes_by_itself_with_its_report_and_no_branch(self):
+        # kind check / report: nothing to merge and nothing to mark Done; the report file is the result.
+        self.add("Check SAP stock sync", kind="check")
+        with open(os.path.join(self.repo, "BACKLOG.md"), encoding="utf-8") as f:
+            self.assertIn("- kind: check", f.read())
+        self.usage()
+        self.run_engine("begin")
+        self.run_engine("worktree", self.repo, "Check SAP stock sync")
+        report = os.path.join(self.tmp, "sap-report.md")
+        with open(report, "w") as f:
+            f.write("# fine\n")
+        out = self.run_engine("finish-task", self.repo, "Check SAP stock sync", "--outcome", "done",
+                              "--summary", "SAP pushed stock every two hours, all calls fine", "--report", report)
+        self.assertEqual((out["outcome"], out["branch"], out["closed"], out["report"]), ("done", None, True, report))
+        self.assertEqual(self.events()["events"][-1]["kind"], "task_closed")
+        listing = self.run_engine("list")
+        self.assertFalse([t for t in listing["needsYou"] if t["title"] == "Check SAP stock sync"], "nothing waits for the owner")
+        view = next(t for t in listing["done"] if t["title"] == "Check SAP stock sync")
+        self.assertEqual((view["kind"], view["branchState"], view["report"], view["summary"]),
+                         ("check", "accepted", report, "SAP pushed stock every two hours, all calls fine"))
+        # A code task that changed nothing still waits for the owner's Done, as before kinds.
+        self.add("Fix the footer")
+        self.run_engine("worktree", self.repo, "Fix the footer")
+        out = self.run_engine("finish-task", self.repo, "Fix the footer", "--outcome", "done", "--summary", "It was fine already")
+        self.assertFalse(out["closed"])
+        view = next(t for t in self.run_engine("list")["needsYou"] if t["title"] == "Fix the footer")
+        self.assertEqual((view["kind"], view["branchState"]), ("code", "review"))
+        self.run_engine("add", self.repo, "--title", "Bad kind", "--details", "d", "--kind", "audit", code=2)
+
+    def test_a_placeholder_summary_is_refused(self):
+        result = os.path.join(self.tmp, "r.json")
+        env = dict(self.env, HARVEST_TASK_RESULT=result)
+        for bad in ("x", "done", "ok.", "בוצע", "abc def"):
+            out = self.run_engine("task-report", "--status", "done", "--summary", bad, env=env, code=2)
+            self.assertIn("summary", out["error"])
+        self.assertFalse(os.path.exists(result), "nothing is recorded")
+        out = self.run_engine("task-report", "--status", "done", "--summary", "The stock check is clean since 4.11",
+                              "--decision", "Remove the old stock app?", "--decision", "  ", env=env)
+        self.assertEqual(out["decisions"], 1)
+        with open(result) as f:
+            self.assertEqual(json.load(f)["decisions"], ["Remove the old stock app?"])
+        self.run_engine("task-report", "--status", "done", "--summary", "The stock check is clean since 4.11",
+                        "--report", os.path.join(self.tmp, "missing.md"), env=env, code=2)
+
+    def test_decisions_become_items_of_their_own(self):
+        # No source knows the folder: each decision waits as a proposal in the project's backlog.
+        h = self.load_engine()
+        os.environ["HARVEST_HOME"] = self.home
+        try:
+            h = self.load_engine()
+            self.add("Weekly checkout report", kind="report")
+            out = h.route_decisions(self.repo, "Weekly checkout report", ["Fix the payment record of order 33996?", ""],
+                                    "/tmp/r.md")
+        finally:
+            os.environ.pop("HARVEST_HOME")
+        self.assertEqual(out, [{"decision": "Fix the payment record of order 33996?", "where": "backlog"}])
+        prop = next(t for t in self.run_engine("list")["proposals"] if "33996" in t["title"])
+        self.assertEqual(prop["status"], "proposed")
+        self.assertIn("Weekly checkout report", prop["details"])
+        self.assertIn("/tmp/r.md", prop["details"])
+
+    def test_docs_only_branches_merge_in_one_go(self):
+        self.add("Write the SAP report")
+        self.add("Fix the grid")
+        self.usage()
+        self.run_engine("begin")
+        wt = self.run_engine("worktree", self.repo, "Write the SAP report")
+        os.makedirs(os.path.join(wt["path"], "docs"))
+        self.commit_in(wt["path"], "docs/sap.md")
+        self.run_engine("finish-task", self.repo, "Write the SAP report", "--outcome", "done", "--summary", "The SAP report is written")
+        wt = self.run_engine("worktree", self.repo, "Fix the grid")
+        self.commit_in(wt["path"], "grid.js")
+        self.run_engine("finish-task", self.repo, "Fix the grid", "--outcome", "done", "--summary", "The grid is fixed now")
+        self.run_engine("end", "--reason", "queue-empty")
+        needs = {t["title"]: t for t in self.run_engine("list")["needsYou"]}
+        self.assertEqual((needs["Write the SAP report"]["docsOnly"], needs["Fix the grid"]["docsOnly"]), (True, False))
+        self.run_engine("merge-docs", env=dict(self.env, HARVEST_UNATTENDED="1"), code=2)
+        out = self.run_engine("merge-docs")
+        self.assertEqual([m["title"] for m in out["merged"]], ["Write the SAP report"])
+        needs = [t["title"] for t in self.run_engine("list")["needsYou"]]
+        self.assertEqual(needs, ["Fix the grid"], "the code branch still waits for its own merge")
 
     def test_maintain_recovers_interrupted_run(self):
         self.add("Interrupted work")

@@ -45,6 +45,19 @@ QUEUE_ORDER = os.path.join(HOME, "queue-order.json")
 MERGED_RE = re.compile(r"merged (\d{4}-\d{2}-\d{2})")
 ACCEPTED_RE = re.compile(r"accepted (\d{4}-\d{2}-\d{2})")     # the owner's "Done" on a folder task (no branch to merge)
 FILES_PREFIX = "files: "
+# What a task is meant to deliver (`kind` in BACKLOG.md; none = code). A check or a report changes no code: the
+# session writes its findings to a file under TASK_REPORTS (outside every repo, so no branch to merge) and the task
+# closes by itself; each decision it found becomes an item of its own (`--decision`), not a line inside the report.
+TASK_KINDS = ("code", "check", "report")
+TASK_REPORTS = os.path.join(HOME, "reports", "tasks")
+REPORT_PREFIX = "report: "
+# A branch that only touches these is documents, not code: the widget offers to merge all of them at once.
+DOCS_ONLY_RE = re.compile(r"(^|/)docs?/|\.(md|markdown|txt|rst)$", re.I)
+# A task-report summary must say something: "x", "done", "ok" or a few characters are refused, and the session
+# writes a real one (a test once wrote "x" into a live result and closed two tasks with it).
+SUMMARY_MIN_LETTERS = 8
+SUMMARY_PLACEHOLDERS = {"x", "xx", "xxx", "done", "ok", "okay", "-", "n/a", "na", "todo", "tbd", "summary",
+                        "בוצע", "סיימתי", "הושלם", "תקין"}
 DONE_LIST_DAYS = 30
 DONE_LIST_MAX = 40
 
@@ -1022,6 +1035,18 @@ def deadline_run(queue, usage):
     return [t for t in queue if 0 <= t.get("deadlineIn", -1) <= DEADLINE_RUN_DAYS and parse_date(t["deadline"]) < harvest]
 
 
+def task_kind(fields):
+    """code, check or report: what the task is meant to deliver. A missing or unknown kind is code, as before kinds."""
+    k = (fields.get("kind") or "").strip().lower()
+    return k if k in TASK_KINDS else "code"
+
+
+def docs_only(repo, base, branch):
+    """Whether a branch changes documents only (docs/, .md, .txt): such a merge can't change how anything runs."""
+    files = [x for x in git(repo, "diff", "--name-only", "%s...%s" % (base, branch)).stdout.splitlines() if x]
+    return bool(files) and all(DOCS_ONLY_RE.search(x) for x in files)
+
+
 def task_view(repo, t, r):
     f = t["fields"]
     complexity = f.get("complexity") or "medium"
@@ -1034,7 +1059,7 @@ def task_view(repo, t, r):
         "complexity": complexity, "tokens": tokens, "pct": round(tokens / float(r["weekly"]), 2),
         "estimate": parts,
         "details": f.get("details", ""), "added": f.get("added", ""), "result": result,
-        "line": t["line"], "cleared": bool(f.get("cleared")),
+        "line": t["line"], "cleared": bool(f.get("cleared")), "kind": task_kind(f),
     }
     day = parse_date(today())
     v.update(task_timing(f, day, settings()["earlyDays"]))
@@ -1046,8 +1071,12 @@ def task_view(repo, t, r):
         parts = [x.strip() for x in result.split("·")]
         rest = [x for x in parts if x and not DATE_RE.fullmatch(x) and not BRANCH_RE.fullmatch(x)
                 and not re.fullmatch(r"\d+k", x) and not x.startswith("archived") and not MERGED_RE.fullmatch(x)
-                and x not in (FOLDER_MARK, NO_CHANGES_MARK) and not x.startswith(FILES_PREFIX) and not ACCEPTED_RE.fullmatch(x)]
+                and x not in (FOLDER_MARK, NO_CHANGES_MARK) and not x.startswith(FILES_PREFIX) and not ACCEPTED_RE.fullmatch(x)
+                and not x.startswith(REPORT_PREFIX)]
         v["summary"] = " · ".join(rest)
+        rep = next((x for x in parts if x.startswith(REPORT_PREFIX)), "")
+        if rep:
+            v["report"] = rep[len(REPORT_PREFIX):].strip()
         b = BRANCH_RE.search(result)
         if FOLDER_MARK in parts or NO_CHANGES_MARK in parts:
             # A task done in a folder without git, or one that changed nothing: no branch, and the owner's "Done"
@@ -1066,6 +1095,8 @@ def task_view(repo, t, r):
                 v["branchState"] = "merged"
             else:
                 v["branchState"] = branch_state(repo, v["branch"])
+                if v["branchState"] == "unmerged":
+                    v["docsOnly"] = docs_only(repo, base_branch(repo), v["branch"])
     if v["status"] == "blocked":
         v["question"] = DATE_RE.sub("", result, count=1).strip(" ·-")
     return v
@@ -1194,7 +1225,8 @@ def history():
 # ---------- events (the widget's notifications) ----------
 
 EVENT_KINDS = ("run_started", "run_ended", "task_started", "task_waiting_review", "task_blocked", "task_failed",
-               "task_paused", "task_merged", "task_accepted", "request_blocked", "source_unreachable")
+               "task_paused", "task_merged", "task_accepted", "task_closed", "decision_recorded", "request_blocked",
+               "source_unreachable")
 
 
 def event_lines():
@@ -1672,7 +1704,7 @@ def cmd_schedule(a):
           "deadline": timing["deadline"], "waits": timing["waits"]})
 
 
-def add_task(repo, title, details, priority, complexity, tokens, status_value, dates, source=""):
+def add_task(repo, title, details, priority, complexity, tokens, status_value, dates, source="", kind=""):
     """Writes one new task into the project's BACKLOG.md (created from the template when missing) and registers the
     project. `source` (`<type>:request/<id>`) says which external request it came from; only the engine sets it.
     Raises `Refused` on a title that is already in play. Returns what `add` reports."""
@@ -1693,8 +1725,10 @@ def add_task(repo, title, details, priority, complexity, tokens, status_value, d
              field_line("scheduled", dates.get("scheduled", "")), field_line("deadline", dates.get("deadline", ""))]
     if source:
         block.append("- source: " + source)
-    block += ["- priority: %d" % priority, "- complexity: " + complexity, "- tokens: %d" % tokens,
-              "- details: " + details.strip().replace("\n", " "), "- result:"]
+    block += ["- priority: %d" % priority, "- complexity: " + complexity, "- tokens: %d" % tokens]
+    if kind and kind != "code":
+        block.append("- kind: " + kind)
+    block += ["- details: " + details.strip().replace("\n", " "), "- result:"]
     text = "\n".join(lines).rstrip("\n") + "\n" + "\n".join(block) + "\n"
     write_text(path, text)
     registered = register(repo)
@@ -1718,9 +1752,11 @@ def cmd_add(a):
         fail("the owner turned proposals off for this project — don't record proposals here", proposalsOff=True)
     if a.complexity not in MODEL_BY_COMPLEXITY:
         fail("complexity must be low, medium or high")
+    if a.kind not in TASK_KINDS:
+        fail("kind must be code, check or report")
     dates = resolve_dates(a, parse_date(today()), past_ok=False)
     try:
-        out = add_task(repo, a.title, a.details, a.priority, a.complexity, a.tokens, status_value, dates)
+        out = add_task(repo, a.title, a.details, a.priority, a.complexity, a.tokens, status_value, dates, kind=a.kind)
     except Refused as e:
         fail(str(e), **e.extra)
     emit(dict(out, downgradedToProposed=downgraded))
@@ -1986,7 +2022,7 @@ def task_current(repo, t, title, model, usage_json, extra):
                "details": f.get("details", ""), "priority": int_or(f.get("priority"), 2),
                "complexity": f.get("complexity") or "medium", "added": f.get("added", ""),
                "scheduled": f.get("scheduled", ""), "deadline": f.get("deadline", ""),
-               "source": f.get("source", ""), "startedAt": iso(now()), "usageBefore": u}
+               "source": f.get("source", ""), "kind": task_kind(f), "startedAt": iso(now()), "usageBefore": u}
     current.update(extra)
     with StatusLock():
         st = status()
@@ -2084,7 +2120,8 @@ def record_finish(repo, title, cur, outcome, summary, tokens, usage_json, sessio
     return record
 
 
-def finish_task(repo, title, outcome, summary, question, tokens, usage_json, session_id, tests=None, files=None):
+def finish_task(repo, title, outcome, summary, question, tokens, usage_json, session_id, tests=None, files=None,
+                report=None):
     st = status()
     running = running_tasks(st)
     cur = next((r for r in running if r.get("project") == repo and r.get("title") == title), None)
@@ -2098,13 +2135,16 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
     commits = commits_ahead(repo, base, branch)
     summary = (summary or "").strip().replace("\n", " ")
     no_changes = False
+    closes_itself = False
     if outcome == "done" and commits == 0:
         if git(cur["worktree"], "status", "--porcelain").stdout.strip():
             # Work was left uncommitted: removing the worktree would lose it.
             outcome, summary = "failed", tr("no_commit")
         else:
-            # Nothing to commit and nothing left behind: a check or a report. It waits for the owner's "Done".
+            # Nothing to commit and nothing left behind: a check or a report. A task of kind check / report closes by
+            # itself; any other kind waits for the owner's "Done".
             no_changes = True
+            closes_itself = cur.get("kind") in ("check", "report")
     remove_worktree(repo, cur["worktree"])
     _, t = find_task(repo, title)
     previous = t["fields"].get("result", "")
@@ -2118,7 +2158,15 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
             updates = {"status": "open", "result": tr("paused_empty", today(), summary)}
     elif outcome == "done" and no_changes:
         git(repo, "branch", "-D", branch)
-        updates = {"status": "done", "result": "%s · %s · %s · %s" % (today(), NO_CHANGES_MARK, summary, k)}
+        parts = [today(), NO_CHANGES_MARK, summary]
+        if report and os.path.isfile(report):
+            parts.append(REPORT_PREFIX + report)
+        parts.append(k)
+        if closes_itself:
+            # A check or a report that changed nothing is delivered: the report is the result, and any decision it
+            # found is an item of its own. Nothing waits for a "Done".
+            parts.append("accepted " + today())
+        updates = {"status": "done", "result": " · ".join(parts)}
     elif outcome == "done":
         updates = {"status": "done", "result": "%s · %s · %s · %s" % (today(), branch, summary, k)}
     elif outcome == "blocked":
@@ -2140,6 +2188,8 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
     set_fields(repo, title, updates)
     if outcome == "paused":
         report_source(t["fields"], "running", summary=updates["result"], branch=branch if commits else "", session=session_id or "")
+    elif outcome == "done" and closes_itself:
+        report_source(t["fields"], "done", summary=summary, session=session_id or "")
     elif outcome == "done" and no_changes:
         report_source(t["fields"], "waiting_review", summary=" ".join([summary, tr("src_no_files")]), session=session_id or "")
     elif outcome == "done":
@@ -2152,14 +2202,16 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
     record = record_finish(repo, title, cur, outcome, summary, tokens, usage_json, session_id, tests, updates,
                            branch if (outcome == "done" and not no_changes) or (outcome == "blocked" and commits) else None)
     kept = branch if (outcome == "done" and not no_changes) or (outcome in ("blocked", "paused") and commits) else None
-    kind, text = {"done": ("task_waiting_review", tr("ev_waiting_review", summary)),
+    kind, text = {"done": ("task_closed", tr("ev_closed", summary)) if closes_itself
+                  else ("task_waiting_review", tr("ev_waiting_review", summary)),
                   "blocked": ("task_blocked", tr("ev_blocked", question if outcome == "blocked" else "")),
                   "paused": ("task_paused", tr("ev_paused", summary))}.get(outcome, ("task_failed", tr("ev_failed", summary)))
     append_event(kind, run_id=current_run_id(), project=display_name(repo), title=title, summary=text,
                  question=question if outcome == "blocked" else None, session_id=session_id, branch=kept,
                  source=t["fields"].get("source"))
     return {"ok": True, "outcome": record["outcome"], "commits": commits, "backlog": updates,
-            "branch": record["branch"], "summary": summary}
+            "branch": record["branch"], "summary": summary, "closed": closes_itself,
+            "report": report if report and os.path.isfile(report) else None}
 
 
 def listed_files(files, limit=FILES_LISTED):
@@ -2260,7 +2312,8 @@ def cmd_accept(a):
 
 def cmd_finish_task(a):
     emit(finish_task(os.path.abspath(a.project), a.title, a.outcome, a.summary, a.question,
-                     a.tokens, a.usage_json, live_launch_session(), files=a.files))
+                     a.tokens, a.usage_json, live_launch_session(), files=a.files,
+                     report=os.path.abspath(os.path.expanduser(a.report)) if a.report else None))
 
 
 def cmd_finish_scan(a):
@@ -2555,6 +2608,14 @@ TEXT.update({
     "ev_source_unreachable": {"he": "אין חיבור ל-%s (%d ניסיונות נכשלו ברצף): %s. בקשות חדשות לא יגיעו עד שהחיבור יחזור.",
                               "en": "Can't reach %s (%d tries in a row failed): %s. New requests won't arrive until it is back."},
     "ev_accepted": {"he": "סומנה כבוצעה", "en": "Marked done"},
+    "ev_closed": {"he": "הסתיימה ונסגרה (בדיקה או דוח, בלי ענף) · %s", "en": "Finished and closed (a check or a report, no branch) · %s"},
+    "ev_decision": {"he": "החלטה מחכה לך · %s", "en": "A decision waits for you · %s"},
+    "decision_category": {"he": "בירור / החלטה", "en": "Decision"},
+    "decision_prompt": {"he": "עזור לי להחליט: %s", "en": "Help me decide: %s"},
+    "decision_title": {"he": "החלטה: %s", "en": "Decision: %s"},
+    "decision_details": {"he": "עלתה בקציר, במשימה \"%s\" (%s, %s). הדוח: %s. כשתחליט: לבצע, או לסגור.",
+                         "en": "Came up in the harvest, in the task \"%s\" (%s, %s). Report: %s. Once you decide: do it, or drop it."},
+    "decision_no_report": {"he": "אין קובץ דוח, הפרטים בסיכום המשימה", "en": "no report file, the details are in the task's summary"},
     "folder_mode_prompt": {
         "he": ("מצב תיקייה: בתיקייה הזו אין git, ולכן אין ענף לבדיקה. ההוראות למעלה על worktree, על התיקייה של הבעלים, על ענף, על staging ועל commit "
                "לא חלות: הסשן עובד בתיקייה עצמה, וזו התיקייה היחידה שלו.\n"
@@ -2795,6 +2856,73 @@ def report_source(fields, status_value, summary="", question="", branch="", sess
         flush_updates(only=pending_key(m.group(1), m.group(2)))
     except Exception as e:  # noqa: BLE001 — a source must never stop a harvest
         source_log("report failed: %r" % (e,))
+
+
+DECISIONS_MAX = 5
+
+
+def route_decisions(repo, title, decisions, report=""):
+    """Each decision a task session found becomes an item of its own, so the owner sees it without opening a report:
+    a task in the outside task app when a source is on and knows this project's folder, else a proposal in the
+    project's backlog (which only the owner can approve or reject). Never raises. Returns where each one went."""
+    out = []
+    for text in [" ".join(str(d).split()) for d in (decisions or []) if str(d).strip()][:DECISIONS_MAX]:
+        text = text[:300]
+        where = None
+        try:
+            where = decision_to_source(repo, title, text, report)
+        except Exception as e:  # noqa: BLE001 — a source must never stop a harvest
+            source_log("decision to source failed: %r" % (e,))
+        if not where and not proposals_off(repo):
+            details = tr("decision_details", title, display_name(repo), today(), report or tr("decision_no_report"))
+            try:
+                add_task(repo, tr("decision_title", text)[:200], details, 2, "low", None, "proposed", {})
+                where = "backlog"
+            except Refused:
+                where = "backlog"                  # the same decision is already waiting there
+            except Exception as e:  # noqa: BLE001
+                source_log("decision to backlog failed: %r" % (e,))
+        out.append({"decision": text, "where": where or "summary"})
+        append_event("decision_recorded", run_id=current_run_id(), project=display_name(repo), title=title,
+                     summary=tr("ev_decision", text))
+    return out
+
+
+def decision_to_source(repo, title, text, report):
+    """A decision as a task in the first enabled source whose records name this project's folder; its id, or None."""
+    for src in enabled_sources():
+        if src["type"] != "clockwize":
+            continue
+        ok, found = run_source_cli(src, ["find", repo])
+        if not ok:
+            continue
+        try:
+            hits = json.loads(found).get("results") or []
+        except ValueError:
+            continue
+        client = next((h.get("client") for h in hits if h.get("match") == "folder" and (h.get("score") or 0) >= 100
+                       and isinstance(h.get("client"), dict) and h["client"].get("id")), None)
+        if not client:
+            continue
+        details = tr("decision_details", title, display_name(repo), today(), report or tr("decision_no_report"))
+        ok, made = run_source_cli(src, ["add-task", "--client", client["id"], "--name", tr("decision_title", text)[:280],
+                                        "--description", details[:1900], "--category", tr("decision_category"),
+                                        "--claude-prompt", tr("decision_prompt", text)[:290]])
+        if not ok:
+            source_log("decision add-task failed: " + made)
+            continue
+        try:
+            task = json.loads(made).get("task") or {}
+        except ValueError:
+            task = {}
+        return "%s:task/%s" % (src["type"], task.get("id") or "?")
+    return None
+
+
+def task_report_path(repo, title):
+    """Where a check or report task writes its findings: outside every repository, so there is no branch to merge."""
+    name = re.sub(r"[^\w.-]+", "-", display_name(repo)).strip("-") or "project"
+    return os.path.join(TASK_REPORTS, name, "%s-%s.md" % (today(), slugify(title, repo)))
 
 
 def forget_run_now(fields):
@@ -3544,42 +3672,68 @@ def cmd_brief(a):
     emit({"count": len(items), "items": items})
 
 
-def cmd_merge(a):
+def merge_task(repo, title):
     """Merges a finished task's branch into the project's main branch and deletes it — on the owner's word
     only, and only when nothing of theirs is in the way: the checkout is on the main branch with no
     uncommitted changes, and the branch merges without conflicts. Refuses otherwise, touching nothing."""
-    repo = os.path.abspath(a.project)
-    _, t = find_task(repo, a.title)
+    _, t = find_task(repo, title)
     v = task_view(repo, t, ratio())
     branch = v.get("branch")
     if v.get("branchState") == "review":
-        fail("this task was done in a folder without git: there is no branch to merge — `claude-harvest accept` marks it done",
+        raise Refused("this task was done in a folder without git: there is no branch to merge — `claude-harvest accept` marks it done",
              project=repo, title=v["title"])
     if v["status"] != "done" or not branch:
-        fail("only a done task with a harvest branch can be merged", project=repo, title=v["title"])
+        raise Refused("only a done task with a harvest branch can be merged", project=repo, title=v["title"])
     if v.get("branchState") != "unmerged":
-        fail("the branch is not waiting to be merged (%s)" % v.get("branchState"), branch=branch)
+        raise Refused("the branch is not waiting to be merged (%s)" % v.get("branchState"), branch=branch)
     base = base_branch(repo)
     current, dirty = checkout_state(repo)
     if current != base:
-        fail("the project's checkout is on %s, not %s" % (current or "a detached commit", base), branch=branch,
+        raise Refused("the project's checkout is on %s, not %s" % (current or "a detached commit", base), branch=branch,
              inTheWay="checkout-branch")
     if dirty:
-        fail("the project's checkout has uncommitted changes", branch=branch, inTheWay="uncommitted-changes")
+        raise Refused("the project's checkout has uncommitted changes", branch=branch, inTheWay="uncommitted-changes")
     if git(repo, "merge-tree", "--write-tree", base, branch).returncode != 0:
-        fail("the branch conflicts with %s and needs updating first" % base, branch=branch, inTheWay="conflicts")
+        raise Refused("the branch conflicts with %s and needs updating first" % base, branch=branch, inTheWay="conflicts")
     m = git(repo, "merge", "--no-edit", branch)
     if m.returncode != 0:
         git(repo, "merge", "--abort")
-        fail("the merge failed and was undone: " + (m.stderr or m.stdout).strip()[:300], branch=branch)
+        raise Refused("the merge failed and was undone: " + (m.stderr or m.stdout).strip()[:300], branch=branch)
     head = git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
-    git(repo, "branch", "-d", branch)
+    kept = git(repo, "branch", "-d", branch).returncode != 0      # e.g. still checked out in another worktree
     set_fields(repo, v["title"], {"result": v["result"] + " · merged " + today()})
     report_source(t["fields"], "done", summary=tr("src_merged", base), branch=branch)
     append_event("task_merged", run_id=current_run_id(), project=display_name(repo), title=v["title"],
                  summary=tr("ev_merged", base), session_id=task_session(repo, v["title"]), branch=branch,
                  source=t["fields"].get("source"))
-    emit({"ok": True, "project": repo, "title": v["title"], "branch": branch, "base": base, "head": head})
+    return {"ok": True, "project": repo, "title": v["title"], "branch": branch, "base": base, "head": head,
+            "branchKept": kept}
+
+
+def cmd_merge(a):
+    try:
+        emit(merge_task(os.path.abspath(a.project), a.title))
+    except Refused as e:
+        fail(str(e), **e.extra)
+
+
+def cmd_merge_docs(a):
+    """The owner's one click for every finished branch that changes documents only (docs/, .md, .txt): each is
+    merged as `merge` would, one by one; one that can't be merged now is left as it is and said why."""
+    if os.environ.get("HARVEST_UNATTENDED"):
+        fail("only the owner merges")
+    tasks, _ = all_tasks(ratio())
+    merged, skipped = [], []
+    for t in tasks:
+        if not (awaits_owner(t) and t.get("docsOnly") and t.get("branchState") == "unmerged"):
+            continue
+        if a.project and os.path.realpath(t["project"]) != os.path.realpath(a.project):
+            continue
+        try:
+            merged.append(merge_task(t["project"], t["title"]))
+        except Refused as e:
+            skipped.append(dict({"project": t["project"], "title": t["title"], "why": str(e)}, **e.extra))
+    emit({"ok": True, "merged": merged, "skipped": skipped})
 
 
 class Refused(Exception):
@@ -3963,6 +4117,16 @@ def cmd_run_task(a):
         "tokens": cur["tokens"], "details": cur["details"]})
     if folder:
         prompt += "\n\n" + tr("folder_mode_prompt")
+    report_path = task_report_path(repo, a.title)
+    if cur.get("kind") in ("check", "report") and not folder:
+        os.makedirs(os.path.dirname(report_path), exist_ok=True)
+        prompt += ("\n\nThis task is a %s: it changes no code. Change nothing in the worktree and commit nothing — a "
+                   "report committed into the repository would turn into a branch the owner has to merge. Write your "
+                   "findings, in %s, to this file, outside the repository: %s (also in $HARVEST_TASK_REPORT), and pass "
+                   "it as `--report`. Lead with the conclusion, then a short table of what was checked (item, number, "
+                   "fine / problem), then checked / not checked. Quote a problem's evidence as it is, and suggest a "
+                   "fix without making it. If the task asks for a document that belongs in the repository itself, it "
+                   "is not a %s: report blocked and ask." % (cur["kind"], LANGUAGE_NAMES[settings()["language"]], report_path, cur["kind"]))
     if cur.get("resumed"):
         prompt += ("\n\nAn earlier attempt at this task stopped at a usage limit. Its work is already on this branch"
                    " (`git log %s..HEAD`; the last commit may be a WIP snapshot the harvest made of uncommitted"
@@ -3987,8 +4151,8 @@ def cmd_run_task(a):
 
     info = run_session(cur["worktree"], tr("task_name", a.title), prompt, a.model, effort, True, a.max_minutes, 10,
                        is_done=lambda started: os.path.exists(result_path), on_update=track,
-                       extra_env={"HARVEST_TASK_RESULT": result_path}, session_id=session_id,
-                       on_limit=limit_fallback)
+                       extra_env={"HARVEST_TASK_RESULT": result_path, "HARVEST_TASK_REPORT": report_path},
+                       session_id=session_id, on_limit=limit_fallback)
     res = read_json(result_path, None)
     if not res and info.get("limitHit"):
         res = {"status": "paused", "summary": limit_label(info["limitHit"])}
@@ -3996,11 +4160,15 @@ def cmd_run_task(a):
     stats = session_stats(info["transcript"])
     record_session(repo, cur["complexity"], stats)
     tokens = stats["total"]
+    report = res.get("report") or (report_path if os.path.isfile(report_path) else "")
     out = finish_task(repo, a.title, res.get("status", "failed"), res.get("summary"), res.get("question"),
-                      tokens, a.usage_json, info["sessionId"], tests=res.get("tests"), files=res.get("files"))
+                      tokens, a.usage_json, info["sessionId"], tests=res.get("tests"), files=res.get("files"),
+                      report=report)
+    decisions = route_decisions(repo, a.title, res.get("decisions"), report) \
+        if out.get("outcome") in ("done", "blocked") else []
     emit(dict(out, sessionId=info["sessionId"], sessionName=info["name"], tokens=tokens, tests=res.get("tests"),
               question=res.get("question"), closedIdle=info.get("closedIdle", False),
-              switches=info["switches"], limitHit=info.get("limitHit")))
+              switches=info["switches"], limitHit=info.get("limitHit"), decisions=decisions))
 
 
 def cmd_run_scan(a):
@@ -4045,9 +4213,27 @@ def cmd_task_report(a):
     path = os.environ.get("HARVEST_TASK_RESULT")
     if not path:
         fail("task-report runs only inside a harvest task session")
+    problem = summary_problem(a.summary)
+    if problem:
+        fail("the summary %s: write 1–3 real sentences for the owner (what was found or changed, and what it means "
+             "for them), then run task-report again" % problem)
+    decisions = [" ".join(d.split()) for d in (a.decision or []) if d and d.strip()]
+    report = os.path.abspath(os.path.expanduser(a.report)) if a.report else ""
+    if report and not os.path.isfile(report):
+        fail("--report names a file that does not exist: " + report)
     write_json(path, {"status": a.status, "summary": a.summary, "question": a.question,
-                      "tests": a.tests, "files": a.files, "at": iso(now())})
-    emit({"ok": True, "status": a.status})
+                      "tests": a.tests, "files": a.files, "decisions": decisions, "report": report, "at": iso(now())})
+    emit({"ok": True, "status": a.status, "decisions": len(decisions)})
+
+
+def summary_problem(text):
+    """Why a task-report summary can't be recorded, or None: it must be words a person can read."""
+    s = " ".join((text or "").split())
+    if s.strip(" .!·-").lower() in SUMMARY_PLACEHOLDERS:
+        return "is a placeholder (%r)" % s
+    if sum(1 for c in s if c.isalpha()) < SUMMARY_MIN_LETTERS:
+        return "is too short (%r)" % s
+    return None
 
 
 def cmd_watch(a):
@@ -4175,6 +4361,10 @@ def main():
     p.add_argument("project"); p.add_argument("title")
     p.set_defaults(fn=cmd_merge)
 
+    p = sub.add_parser("merge-docs", help="the owner's merge of every finished branch that changes documents only")
+    p.add_argument("--project", help="only this project")
+    p.set_defaults(fn=cmd_merge_docs)
+
     p = sub.add_parser("accept", help="the owner's Done on a task finished in a folder without git")
     p.add_argument("project"); p.add_argument("title")
     p.set_defaults(fn=cmd_accept)
@@ -4205,6 +4395,8 @@ def main():
     p.add_argument("--title", required=True); p.add_argument("--details", required=True)
     p.add_argument("--priority", type=int, default=2, choices=(1, 2, 3))
     p.add_argument("--complexity", default="low"); p.add_argument("--tokens", type=int)
+    p.add_argument("--kind", default="code", help="code (default) · check (verify something, change nothing) · "
+                   "report (investigate and write findings): a check or report needs no branch")
     p.add_argument("--status", default="open")
     add_date_flags(p)
     p.set_defaults(fn=cmd_add)
@@ -4242,6 +4434,7 @@ def main():
     p.add_argument("--summary", default=""); p.add_argument("--question")
     p.add_argument("--tokens", type=int, default=0); p.add_argument("--usage-json")
     p.add_argument("--files", help="folder mode: the files the session reported (used when the folder is too big to compare)")
+    p.add_argument("--report", help="a check or report task: the file with its findings")
     p.set_defaults(fn=cmd_finish_task)
 
     p = sub.add_parser("finish-scan")
@@ -4284,6 +4477,9 @@ def main():
     p.add_argument("--status", choices=("done", "blocked", "failed"), required=True)
     p.add_argument("--summary", required=True); p.add_argument("--question"); p.add_argument("--tests")
     p.add_argument("--files", help="folder mode: every file you created or changed, comma- or line-separated")
+    p.add_argument("--decision", action="append", help="one decision the owner must take (repeat for each); "
+                   "each becomes an item of its own")
+    p.add_argument("--report", help="a check or report task: the file with your findings ($HARVEST_TASK_REPORT)")
     p.set_defaults(fn=cmd_task_report)
 
     p = sub.add_parser("watch")

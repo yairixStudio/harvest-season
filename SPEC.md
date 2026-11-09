@@ -278,6 +278,26 @@ or overtaken, and that its premise (a date, a build, a "before X") still holds.
 A task that no longer applies changes nothing and ends `blocked`, with the
 evidence and "close it?" as the question, so the owner closes it; a task partly
 done already does only what is left.
+A task has a kind (`kind:` in BACKLOG.md, `add --kind`; none = `code`). `code` works as
+above. A `check` (verify something) or `report` (investigate, write findings) changes and
+commits nothing: the engine appends a paragraph telling the session so, and gives it a
+findings file outside every repository (`~/.claude/harvest/reports/tasks/<project>/<date>-<slug>.md`,
+also `$HARVEST_TASK_REPORT`), which it passes as `task-report --report`. Such a task that
+ends done with no commits closes by itself: result `no changes · <summary> · report: <file>
+· accepted <date>`, event `task_closed`, the source told `done`; nothing waits for a Done.
+A code task with no commits still waits for the owner's Done. Any task may pass
+`task-report --decision "<one sentence>"` (repeatable, up to 5): each decision becomes an
+item of its own (`route_decisions`) — a task in an enabled source whose records name the
+project's folder (Clockwize: `find <folder>`, then `add-task --client … --category …`),
+else a `proposed` task in the project's backlog — and an event `decision_recorded`.
+`task-report` refuses a summary that is a placeholder ("x", "done", "ok"…) or has fewer
+than 8 letters, so the session writes a real one; the tests drop `HARVEST_TASK_RESULT`
+and `HARVEST_TASK_REPORT` from their environment, so a test run inside a task session can
+never write that session's result. A branch waiting for its merge that changes documents
+only (`docs/`, `.md`, `.txt`) is `docsOnly` in the listing; `merge-docs` (owner only,
+`--project` to narrow it) merges every such branch the way `merge` does, one by one, and
+lists the ones it had to skip with the reason. `merge` reports `branchKept` when the
+merged branch couldn't be deleted (checked out in another worktree).
 Proposal scans run likewise ("קציר · סריקת הצעות", a throwaway detached
 worktree). New folders open on Claude Code's "trust this folder?" screen with
 "No, exit" preselected; the launcher moves the pointer to "Yes" before Enter.
