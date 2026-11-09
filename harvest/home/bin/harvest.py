@@ -1762,6 +1762,20 @@ def cmd_add(a):
     emit(dict(out, downgradedToProposed=downgraded))
 
 
+def cmd_set_kind(a):
+    """What a task delivers — code, check or report — on the owner's word (a check or report closes by itself)."""
+    if os.environ.get("HARVEST_UNATTENDED"):
+        fail("only the owner sets a task's kind")
+    if a.kind not in TASK_KINDS:
+        fail("kind must be code, check or report")
+    repo = os.path.abspath(a.project)
+    _, t = find_task(repo, a.title)
+    if (t["fields"].get("status") or "open") in ("done", "dropped"):
+        fail("the task is already %s" % t["fields"].get("status"), project=repo, title=t["title"])
+    set_fields(repo, t["title"], {"kind": a.kind})
+    emit({"ok": True, "project": repo, "title": t["title"], "kind": a.kind})
+
+
 def model_full(model, usage, st, s):
     """Whether `model` should give way: its own weekly quota (usage `scoped`, e.g. Fable) reached the owner's
     point for it, or a session hit that model's limit this week (usage.json can be minutes behind)."""
@@ -3459,6 +3473,10 @@ def run_session(cwd, name, prompt, model, effort, remote_control, max_minutes, l
     def spawn(text, resume):
         args = [claude] + (["--resume", info["sessionId"]] if resume else ["--session-id", info["sessionId"]])
         args += ["--name", name, "--permission-mode", "auto", "--model", info["model"], "--effort", effort]
+        report = (extra_env or {}).get("HARVEST_TASK_REPORT")
+        if report:
+            # A check or report writes its findings outside the worktree: that one folder is added to the session.
+            args += ["--add-dir", os.path.dirname(report)]
         if remote_control:
             args += ["--remote-control", name]
         args.append(text)
@@ -4118,7 +4136,8 @@ def cmd_run_task(a):
     if folder:
         prompt += "\n\n" + tr("folder_mode_prompt")
     report_path = task_report_path(repo, a.title)
-    if cur.get("kind") in ("check", "report") and not folder:
+    reporting = cur.get("kind") in ("check", "report") and not folder
+    if reporting:
         os.makedirs(os.path.dirname(report_path), exist_ok=True)
         prompt += ("\n\nThis task is a %s: it changes no code. Change nothing in the worktree and commit nothing — a "
                    "report committed into the repository would turn into a branch the owner has to merge. Write your "
@@ -4151,7 +4170,8 @@ def cmd_run_task(a):
 
     info = run_session(cur["worktree"], tr("task_name", a.title), prompt, a.model, effort, True, a.max_minutes, 10,
                        is_done=lambda started: os.path.exists(result_path), on_update=track,
-                       extra_env={"HARVEST_TASK_RESULT": result_path, "HARVEST_TASK_REPORT": report_path},
+                       extra_env=dict({"HARVEST_TASK_RESULT": result_path},
+                                      **({"HARVEST_TASK_REPORT": report_path} if reporting else {})),
                        session_id=session_id, on_limit=limit_fallback)
     res = read_json(result_path, None)
     if not res and info.get("limitHit"):
@@ -4400,6 +4420,10 @@ def main():
     p.add_argument("--status", default="open")
     add_date_flags(p)
     p.set_defaults(fn=cmd_add)
+
+    p = sub.add_parser("set-kind", help="the owner's word on what a task delivers: code, check or report")
+    p.add_argument("project"); p.add_argument("title"); p.add_argument("kind")
+    p.set_defaults(fn=cmd_set_kind)
 
     p = sub.add_parser("schedule")
     p.add_argument("project"); p.add_argument("title")

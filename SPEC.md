@@ -296,7 +296,9 @@ and `HARVEST_TASK_REPORT` from their environment, so a test run inside a task se
 never write that session's result. A branch waiting for its merge that changes documents
 only (`docs/`, `.md`, `.txt`) is `docsOnly` in the listing; `merge-docs` (owner only,
 `--project` to narrow it) merges every such branch the way `merge` does, one by one, and
-lists the ones it had to skip with the reason. `merge` reports `branchKept` when the
+lists the ones it had to skip with the reason. `set-kind <project> <title> code|check|report` (owner only)
+sets the kind of a task that isn't done. A check or report session gets `--add-dir` for its
+findings folder, since it works outside its worktree there. `merge` reports `branchKept` when the
 merged branch couldn't be deleted (checked out in another worktree).
 Proposal scans run likewise ("קציר · סריקת הצעות", a throwaway detached
 worktree). New folders open on Claude Code's "trust this folder?" screen with

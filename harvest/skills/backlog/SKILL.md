@@ -54,5 +54,6 @@ The owner queues and pauses tasks with the switch in the widget (open ⇄ propos
 ## Reviewing
 "What's in the backlog" → `claude-harvest list`, then summarize in the user's language: queued (`queue`), waiting for a date (`waiting`, with the date), proposals, and what needs them (`needsYou`: branches to review, blocked questions; `dueProposals`: proposals whose date came). On the user's explicit instruction only:
 - queue / pause: `claude-harvest set-status "<project>" "<title>" open|proposed`
+- what it delivers: `claude-harvest set-kind "<project>" "<title>" code|check|report`
 - merge a finished branch: `claude-harvest merge "<project>" "<title>"` — it merges into the main branch and deletes the branch, and refuses (touching nothing) when the checkout is on another branch, has uncommitted changes, or the branch conflicts. `claude-harvest brief` shows what waits and whether each branch is ready.
 - drop: `claude-harvest set-status "<project>" "<title>" dropped`, and `git branch -D backlog/<slug>` if a branch exists

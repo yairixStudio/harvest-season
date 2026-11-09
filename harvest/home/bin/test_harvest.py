@@ -565,6 +565,15 @@ class Harvest(unittest.TestCase):
         self.assertEqual((view["kind"], view["branchState"]), ("code", "review"))
         self.run_engine("add", self.repo, "--title", "Bad kind", "--details", "d", "--kind", "audit", code=2)
 
+    def test_the_owner_sets_a_kind(self):
+        self.add("Recheck the 404 page")
+        self.run_engine("set-kind", self.repo, "Recheck the 404 page", "check", env=dict(self.env, HARVEST_UNATTENDED="1"), code=2)
+        self.run_engine("set-kind", self.repo, "Recheck the 404 page", "audit", code=2)
+        self.run_engine("set-kind", self.repo, "Recheck the 404 page", "check")
+        self.assertEqual(self.run_engine("list")["queue"][0]["kind"], "check")
+        self.run_engine("set-kind", self.repo, "Recheck the 404 page", "code")
+        self.assertEqual(self.run_engine("list")["queue"][0]["kind"], "code")
+
     def test_a_placeholder_summary_is_refused(self):
         result = os.path.join(self.tmp, "r.json")
         env = dict(self.env, HARVEST_TASK_RESULT=result)
