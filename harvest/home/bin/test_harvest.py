@@ -11,6 +11,8 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 
 ENGINE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harvest.py")
+# The tests never open anything in the Claude app
+os.environ["HARVEST_NO_APP_OPEN"] = "1"
 # In the repository the prompts sit beside the engine's source (harvest/skills/…): test those, not whatever
 # copy happens to be installed. An installed engine has no such folder and falls back to its default.
 REPO_REFS = os.path.normpath(os.path.join(os.path.dirname(ENGINE), "..", "..", "skills", "harvest-season", "references"))
@@ -34,6 +36,15 @@ class SessionName(unittest.TestCase):
         self.assertEqual(engine.session_name("Clockwize: Fix the footer (r1abcdef)"), "clockwiseAI: Fix the footer (r1abcdef)")
         self.assertEqual(engine.session_name("Fix the footer", "clockwize:request/r1"), "clockwiseAI: Fix the footer")
         self.assertNotIn("clockwiseAI", engine.session_name("Tidy the README", "owner"))
+
+    def test_only_clockwize_tasks_are_shown_in_the_app_and_tests_never_open_it(self):
+        spec = importlib.util.spec_from_file_location("harvest_engine_open", ENGINE)
+        engine = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(engine)
+        self.assertTrue(engine.is_clockwize_task("Clockwize: Fix", None))
+        self.assertTrue(engine.is_clockwize_task("Fix", "clockwize:request/r1"))
+        self.assertFalse(engine.is_clockwize_task("Fix", "owner"))
+        self.assertFalse(engine.open_in_claude_app("claude://resume?session=x"))
 
 
 class Harvest(unittest.TestCase):

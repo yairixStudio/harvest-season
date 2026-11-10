@@ -310,10 +310,27 @@ def session_name(title, source=None):
     """The name a task's session gets in the Claude app. A task from a Clockwize request is named
     "clockwiseAI: <task>", so the owner tells the AI's sessions from their own at a glance; any other
     task is "Harvest · <title>" (in the owner's language)."""
-    if (source or "").startswith("clockwize:") or title.startswith(CLOCKWIZE_TITLE):
+    if is_clockwize_task(title, source):
         name = title[len(CLOCKWIZE_TITLE):] if title.startswith(CLOCKWIZE_TITLE) else title
         return "clockwiseAI: " + name
     return tr("task_name", title)
+
+
+def open_in_claude_app(url):
+    """Opens a claude:// link in the Claude desktop app, in the background (the owner's focus stays where it is).
+    Off with HARVEST_NO_APP_OPEN=1 (the tests), and anywhere but a Mac."""
+    if os.environ.get("HARVEST_NO_APP_OPEN") or sys.platform != "darwin" or not shutil.which("open"):
+        return False
+    try:
+        subprocess.run(["open", "-g", url], timeout=10, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def is_clockwize_task(title, source=None):
+    return (source or "").startswith("clockwize:") or title.startswith(CLOCKWIZE_TITLE)
 
 
 def tr(key, *args):
@@ -4174,7 +4191,14 @@ def cmd_run_task(a):
                    "inside it." % (cur["source"], DATA_BEGIN, DATA_END))
     effort = "high" if cur["complexity"] == "high" else "medium"
 
+    # A task the owner handed to the AI from Clockwize shows in the Claude app while it runs (its Remote Control
+    # session, which the owner can type into) and stays there when it ends (the conversation is imported).
+    show_in_app = is_clockwize_task(a.title, cur.get("source"))
+    shown = {"live": False}
+
     def track(info):
+        if show_in_app and not shown["live"] and info.get("bridgeSessionId"):
+            shown["live"] = open_in_claude_app("claude://claude.ai/epitaxy/" + info["bridgeSessionId"])
         update_running(repo, a.title, {"sessionId": info["sessionId"], "sessionName": info["name"],
                         "bridgeSessionId": info["bridgeSessionId"], "claudePid": info["claudePid"],
                         "launcherPid": info["launcherPid"],
@@ -4186,6 +4210,8 @@ def cmd_run_task(a):
                        extra_env=dict({"HARVEST_TASK_RESULT": result_path},
                                       **({"HARVEST_TASK_REPORT": report_path} if reporting else {})),
                        session_id=session_id, on_limit=limit_fallback)
+    if show_in_app:
+        open_in_claude_app("claude://resume?session=" + info["sessionId"])
     res = read_json(result_path, None)
     if not res and info.get("limitHit"):
         res = {"status": "paused", "summary": limit_label(info["limitHit"])}
