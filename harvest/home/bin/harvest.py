@@ -303,6 +303,19 @@ def proposals_off(repo):
     return any(os.path.realpath(os.path.expanduser(p)) == real for p in settings()["noProposals"])
 
 
+CLOCKWIZE_TITLE = "Clockwize: "
+
+
+def session_name(title, source=None):
+    """The name a task's session gets in the Claude app. A task from a Clockwize request is named
+    "clockwiseAI: <task>", so the owner tells the AI's sessions from their own at a glance; any other
+    task is "Harvest · <title>" (in the owner's language)."""
+    if (source or "").startswith("clockwize:") or title.startswith(CLOCKWIZE_TITLE):
+        name = title[len(CLOCKWIZE_TITLE):] if title.startswith(CLOCKWIZE_TITLE) else title
+        return "clockwiseAI: " + name
+    return tr("task_name", title)
+
+
 def tr(key, *args):
     text = TEXT[key].get(settings()["language"]) or TEXT[key]["en"]
     return text % args if args else text
@@ -4168,7 +4181,7 @@ def cmd_run_task(a):
                         "model": "→".join([info["switches"][0]["from"]] + [x["to"] for x in info["switches"]])
                         if info["switches"] else info["model"]})
 
-    info = run_session(cur["worktree"], tr("task_name", a.title), prompt, a.model, effort, True, a.max_minutes, 10,
+    info = run_session(cur["worktree"], session_name(a.title, cur.get("source")), prompt, a.model, effort, True, a.max_minutes, 10,
                        is_done=lambda started: os.path.exists(result_path), on_update=track,
                        extra_env=dict({"HARVEST_TASK_RESULT": result_path},
                                       **({"HARVEST_TASK_REPORT": report_path} if reporting else {})),

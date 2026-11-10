@@ -23,6 +23,19 @@ def iso(d):
     return d.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+class SessionName(unittest.TestCase):
+    """A Clockwize request's task session is named "clockwiseAI: <task>"; every other one keeps "Harvest · <title>"."""
+
+    def test_clockwize_tasks_get_the_clockwiseai_name(self):
+        spec = importlib.util.spec_from_file_location("harvest_engine_names", ENGINE)
+        engine = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(engine)
+        self.assertEqual(engine.session_name("Clockwize: Fix the footer", "clockwize:request/r1"), "clockwiseAI: Fix the footer")
+        self.assertEqual(engine.session_name("Clockwize: Fix the footer (r1abcdef)"), "clockwiseAI: Fix the footer (r1abcdef)")
+        self.assertEqual(engine.session_name("Fix the footer", "clockwize:request/r1"), "clockwiseAI: Fix the footer")
+        self.assertNotIn("clockwiseAI", engine.session_name("Tidy the README", "owner"))
+
+
 class Harvest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="harvest-test-")
