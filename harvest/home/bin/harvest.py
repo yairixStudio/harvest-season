@@ -3219,6 +3219,66 @@ def run_now_gap(attempts):
     return min(RUN_NOW_BRAKE_S * 2 ** (attempts - RUN_NOW_BRAKE_AFTER), RUN_NOW_BRAKE_MAX_S)
 
 
+LOGIN_RENEW_GAP_S = 10 * 60
+LOGIN_RENEW_STAMP = os.path.join(HOME, "login-renew.json")
+LOGIN_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def stored_login_expiry():
+    """When the stored Claude Code login lapses (epoch seconds), or None when it can't be read. Only the expiry is
+    read; the token itself is never kept. The Keychain first (as the widget reads it), else ~/.claude/.credentials.json;
+    HARVEST_LOGIN_FILE points at a file instead (tests)."""
+    raw = None
+    path = os.environ.get("HARVEST_LOGIN_FILE")
+    if not path and sys.platform == "darwin":
+        try:
+            raw = subprocess.run(["security", "find-generic-password", "-s", LOGIN_KEYCHAIN_SERVICE, "-w"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            raw = None
+    if not raw:
+        try:
+            with open(path or os.path.expanduser("~/.claude/.credentials.json"), encoding="utf-8") as f:
+                raw = f.read()
+        except OSError:
+            return None
+    try:
+        expires = (json.loads(raw).get("claudeAiOauth") or {}).get("expiresAt")
+    except (ValueError, AttributeError):
+        return None
+    return expires / 1000.0 if isinstance(expires, (int, float)) else None
+
+
+def renew_lapsed_login():
+    """A "now" request waits on usage.json, and the widget only reads the Claude Code login: it never renews it, so a
+    login that lapsed while no `claude` ran (overnight) holds every "now" request until the owner next uses Claude
+    Code. When the stored login has lapsed, this starts one tiny `claude -p` (Haiku, one turn) in the background,
+    which renews it the way any use of Claude Code does; the widget's next poll then writes a fresh usage.json and
+    the next pull starts the run. At most once per LOGIN_RENEW_GAP_S. True when it started one."""
+    if os.environ.get("HARVEST_NO_LOGIN_RENEW"):
+        return False
+    expiry = stored_login_expiry()
+    if expiry is None or expiry > time.time() + 60:
+        return False
+    last = parse_iso((read_json(LOGIN_RENEW_STAMP, {}) or {}).get("at"))
+    if last and (now() - last).total_seconds() < LOGIN_RENEW_GAP_S:
+        return False
+    exe = claude_bin()
+    if not exe:
+        source_log("login lapsed, and no claude command to renew it")
+        return False
+    write_json(LOGIN_RENEW_STAMP, {"at": iso(now())})
+    try:
+        subprocess.Popen([exe, "-p", "--model", "haiku", "--max-turns", "1", "Reply with the single word: ok"],
+                         cwd=HOME, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as e:
+        source_log("login renewal failed to start: %s" % e)
+        return False
+    source_log("login lapsed at %s: started claude -p to renew it" % iso(datetime.fromtimestamp(expiry, timezone.utc)))
+    return True
+
+
 def run_now_step(wanted, report):
     """The tasks whose request says "now". Each one is offered to the widget on every pull until it starts (the
     task starting, or its request being cancelled or finished, ends the offer) — but only when nothing stands in
@@ -3258,6 +3318,8 @@ def run_now_step(wanted, report):
             offered.append(key)
             continue
         wait = quota_wait(res)
+        if (res.get("reason") or "").startswith("usage-unreadable") and "loginRenewal" not in report:
+            report["loginRenewal"] = renew_lapsed_login()
         report.setdefault("runNowWaiting", []).append({"project": e["project"], "title": e["title"],
                                                        "reason": res.get("reason")})
         if wait:
@@ -3355,6 +3417,8 @@ ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[=>()][
 
 
 def claude_bin():
+    if os.environ.get("HARVEST_CLAUDE_BIN"):
+        return os.environ["HARVEST_CLAUDE_BIN"]
     for p in (os.path.expanduser("~/.local/bin/claude"), "/opt/homebrew/bin/claude", "/usr/local/bin/claude"):
         if os.access(p, os.X_OK):
             return p

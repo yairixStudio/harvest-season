@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 ENGINE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harvest.py")
 # The tests never open anything in the Claude app
 os.environ["HARVEST_NO_APP_OPEN"] = "1"
+os.environ["HARVEST_NO_LOGIN_RENEW"] = "1"
 # In the repository the prompts sit beside the engine's source (harvest/skills/…): test those, not whatever
 # copy happens to be installed. An installed engine has no such folder and falls back to its default.
 REPO_REFS = os.path.normpath(os.path.join(os.path.dirname(ENGINE), "..", "..", "skills", "harvest-season", "references"))
@@ -1835,6 +1836,36 @@ class Sources(unittest.TestCase):
         self.usage(five=10, weekly=10, reset_in_h=30)
         self.assertEqual(len(self.pull()["runNow"]), 1)
         self.assertEqual(len(self.updates()), 2)
+
+    def test_a_lapsed_login_holding_a_run_now_is_renewed_once(self):
+        import sys, time as _t
+        self.usage(age_min=400)                      # the widget stopped writing usage.json: the login lapsed
+        self.setup_source([self.request(run="now")])
+        login = os.path.join(self.tmp, "login.json")
+        marker = os.path.join(self.tmp, "renewed")
+        fake = os.path.join(self.tmp, "fake-claude")
+        with open(fake, "w") as f:
+            f.write("#!%s\nimport sys\nopen(%r, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n" % (sys.executable, marker))
+        os.chmod(fake, 0o755)
+        env = dict(self.env, HARVEST_LOGIN_FILE=login, HARVEST_CLAUDE_BIN=fake)
+        env.pop("HARVEST_NO_LOGIN_RENEW", None)
+        with open(login, "w") as f:                  # valid for another hour: nothing to renew
+            json.dump({"claudeAiOauth": {"expiresAt": int((_t.time() + 3600) * 1000)}}, f)
+        out = self.pull(env=env)
+        self.assertEqual(out["runNow"], [])
+        self.assertFalse(out["loginRenewal"])
+        with open(login, "w") as f:                  # lapsed seven hours ago
+            json.dump({"claudeAiOauth": {"expiresAt": int((_t.time() - 7 * 3600) * 1000)}}, f)
+        self.assertTrue(self.pull(env=env)["loginRenewal"])
+        self.assertFalse(self.pull(env=env)["loginRenewal"], "renewed at most once per gap")
+        for _ in range(50):
+            if os.path.exists(marker):
+                break
+            _t.sleep(0.1)
+        with open(marker) as f:
+            self.assertEqual(f.read().count("--model haiku"), 1)
+        self.usage()                                 # the widget wrote usage again: the run is offered
+        self.assertEqual(len(self.pull(env=env)["runNow"]), 1)
 
     def test_the_quota_wait_is_told_in_the_owners_language(self):
         self.run_engine("settings", "--set", "language=he")
