@@ -37,14 +37,30 @@ find "$app/Contents/Resources/harvest" -name __pycache__ -prune -exec rm -rf {} 
 
 # 3. The icon, drawn by the app itself, then the signature. Ad hoc by default; with
 #    HARVEST_SIGN_IDENTITY (a code-signing identity from `security find-identity -v -p codesigning`)
-#    the app is signed with it instead. macOS ties a privacy grant (Full Disk Access, the Keychain's
-#    "Always Allow") to the signature: an ad hoc one changes with every build, so the grant is lost
-#    on the next ./install; one made with a real identity stays the same and the grant holds.
+#    the app is signed with it instead, with the hardened runtime and a secure timestamp. With
+#    HARVEST_NOTARY_PROFILE too (a profile made once by `xcrun notarytool store-credentials`), the
+#    app is sent to Apple for notarization and the ticket is stapled to it (a few minutes).
+#    macOS ties a privacy grant (Full Disk Access) to the app: for an ad hoc or an unnotarized app it
+#    pins the grant to this very build, so the next ./install loses it; for a notarized Developer ID
+#    app it is tied to the team, and the grant holds across builds.
 icons="$(mktemp -d)"
 "$exe" --write-iconset "$icons/AppIcon.iconset"
 iconutil -c icns -o "$app/Contents/Resources/AppIcon.icns" "$icons/AppIcon.iconset"
 rm -rf "$icons"
-codesign --force --sign "${HARVEST_SIGN_IDENTITY:--}" "$app"
+if [ -n "${HARVEST_SIGN_IDENTITY:-}" ]; then
+  codesign --force --options runtime --timestamp --sign "$HARVEST_SIGN_IDENTITY" "$app"
+  if [ -n "${HARVEST_NOTARY_PROFILE:-}" ]; then
+    zip="$(mktemp -d)/$name.zip"
+    ditto -c -k --keepParent "$app" "$zip"
+    echo "notarizing (Apple usually answers within a few minutes)…"
+    xcrun notarytool submit "$zip" --keychain-profile "$HARVEST_NOTARY_PROFILE" --wait | tail -3
+    rm -rf "$(dirname "$zip")"
+    xcrun stapler staple -q "$app"
+    spctl -a -t exec "$app" && echo "notarized and stapled"
+  fi
+else
+  codesign --force --sign - "$app"
+fi
 
 # 4. A harvest this installer put in place follows the code in this folder. One set up by hand
 #    is left to the setup window, which asks first; files edited by hand make it stop and say so.
