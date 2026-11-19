@@ -41,6 +41,14 @@ cd harvest-season
 
 `./install` builds the app, signs it for this Mac and starts it at login. The first time, macOS asks whether it may read the Claude Code credentials in your Keychain — choose **Always Allow**. The usage bars work from here on.
 
+**Tasks that read another app's data (optional).** A harvest session is started by the widget, so macOS treats it as the widget: it can't read what macOS protects (another app's data, such as a messaging app's chat history) unless `HarvestSeason.app` has **Full Disk Access** (System Settings → Privacy & Security → Full Disk Access → **+**, pick `HarvestSeason.app` in this folder). Mail read over the network (Gmail's API, a mail CLI) needs no such grant. Full Disk Access is broad — it lets every harvest session read and write any protected file — so keep "read only" in the tools the sessions use. macOS ties the grant to the app's signature, and the default ad hoc signature changes with every build: install with a real code-signing identity first, so the grant survives the next `./install`:
+
+```sh
+HARVEST_SIGN_IDENTITY="Developer ID Application: <name> (<team>)" ./install   # security find-identity -v -p codesigning lists yours
+```
+
+After the first install with a new signature, macOS asks again about the Keychain — **Always Allow** again. To take the grant back, remove the app from that list.
+
 Then click **Set up the harvest…** in the panel. Setup asks for your name, the language, the folder the harvest's sessions run in, and — optionally — an email for a weekly summary. It shows exactly what it will write before writing anything:
 
 - the harvest engine and three Claude Code skills, in `~/.claude`

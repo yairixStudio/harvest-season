@@ -35,12 +35,16 @@ mkdir -p "$app/Contents/Resources/harvest"
 cp -R harvest/install.py harvest/home harvest/skills harvest/instructions "$app/Contents/Resources/harvest/"
 find "$app/Contents/Resources/harvest" -name __pycache__ -prune -exec rm -rf {} +
 
-# 3. The icon, drawn by the app itself, then an ad hoc signature for this Mac.
+# 3. The icon, drawn by the app itself, then the signature. Ad hoc by default; with
+#    HARVEST_SIGN_IDENTITY (a code-signing identity from `security find-identity -v -p codesigning`)
+#    the app is signed with it instead. macOS ties a privacy grant (Full Disk Access, the Keychain's
+#    "Always Allow") to the signature: an ad hoc one changes with every build, so the grant is lost
+#    on the next ./install; one made with a real identity stays the same and the grant holds.
 icons="$(mktemp -d)"
 "$exe" --write-iconset "$icons/AppIcon.iconset"
 iconutil -c icns -o "$app/Contents/Resources/AppIcon.icns" "$icons/AppIcon.iconset"
 rm -rf "$icons"
-codesign --force --sign - "$app"
+codesign --force --sign "${HARVEST_SIGN_IDENTITY:--}" "$app"
 
 # 4. A harvest this installer put in place follows the code in this folder. One set up by hand
 #    is left to the setup window, which asks first; files edited by hand make it stop and say so.
