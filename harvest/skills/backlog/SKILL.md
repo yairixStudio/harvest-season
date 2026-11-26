@@ -12,6 +12,17 @@ One `BACKLOG.md` per project root, fixed format, edited only through the harvest
 
 The Harvest Season widget in the menu bar shows every project's queue and launches the harvest a set number of hours before the weekly reset (or on demand). Each task runs in a fresh agent on its own `backlog/<slug>` branch, never pushed; the owner reviews and merges.
 
+## Where it goes: the `intake` setting
+`claude-harvest settings` shows `intake`. With **`backlog`** (the default) everything below applies as written: small tasks go to the project's `BACKLOG.md`.
+
+With **`source`** the outside task app (Clockwize) is where things are recorded, and `BACKLOG.md` is only for folders that have no home there:
+- First ask which client and project the folder belongs to: `where_am_i` (MCP) or `clockwize whereami "<folder>"`.
+- Something you notice outside your task → an idea in Clockwize (`add_idea`, or `clockwize add-idea --client <id> [--project <id>] --title ... --content ... --kind idea|proposal --status awaiting_decision --source agent`), never a task and never a BACKLOG entry.
+- "Add to backlog" / "later" / "not now" from the user → a Clockwize task assigned to AI (`add_task`, then `hand_to_ai`): the widget pulls it and the harvest runs it. A date the user gives becomes the task's day.
+- `claude-harvest add` in a folder that belongs to a client **refuses** (it says which client and project); don't work around it. In a folder with no home (`whereami` says none or unknown, or Clockwize can't be reached) it works as below.
+- Unattended: ideas only; never a task assigned to AI.
+Reviewing (`claude-harvest list`) and merging work the same in both.
+
 ## Adding a task
     claude-harvest add "<project root>" --status <open|proposed> --priority <1|2|3> --complexity <low|medium|high> [--kind <code|check|report>] --tokens <estimate> [--not-before "<date>" | --when "<date>"] [--deadline "<date>"] --title "<short title>" --details "<what to do, which files, and what counts as done>"
 

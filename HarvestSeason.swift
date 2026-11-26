@@ -593,6 +593,10 @@ struct HSettings: Decodable, Equatable {
     var sourceStatus: [HSource]?
     /// Which steps notify: all · needs_me · run_end.
     var notify: String?
+    /// When the harvest runs besides the reset-anchored one: "reset" (default) · "weekly" (a run a night, at
+    /// `nightHour`, when the week's usage is behind its pace — `claude-harvest settings --set pace=weekly`).
+    var pace: String?
+    var nightHour: Int?
 }
 
 /// A source of requests from outside (`claude-harvest pull`): its tool is `cli`; `found` = the tool exists.
@@ -1042,6 +1046,7 @@ func stopReasonText(_ reason: String?) -> String? {
     case "signed-out": return L("Claude Code לא היה מחובר", "Claude Code was signed out")
     case "weekly-full": return L("המכסה השבועית נוצלה", "the weekly quota is used up")
     case "cutoff-near": return L("קרוב מדי לאיפוס", "too close to the reset")
+    case "review-backlog": return L("יש יותר מדי עבודה שמחכה לבדיקה שלך", "too much finished work is waiting for your review")
     case "too-early": return L("מוקדם מדי לפני האיפוס", "too early before the reset")
     case "interrupted": return L("נעצר באמצע", "stopped midway")
     case "stopped-by-owner": return L("נעצר על ידך", "stopped by you")
@@ -3137,6 +3142,7 @@ struct HelpView: View {
             "**סוללה:** כברירת מחדל ההתחלה האוטומטית מחכה עד שהמק מחובר לחשמל או שהסוללה מעל 10% (משנים או מכבים בהגדרות ← קציר), ומגיעה התראה אחת. \"הרץ עכשיו\" תמיד מתחיל. ריצה שנקטעה באמצע — למשל כי המחשב נכנס לשינה — ממשיכה מעצמה אם יש עוד זמן לפני האיפוס, עם התראה; אבל לא אחרי ש\"עצור\" שלך.",
             "**הרץ עכשיו** מריץ את כל התור מיד.",
             "**דדליין לפני הקציר השבועי:** משימה בתור שהדדליין שלה מגיע לפני הקציר הבא רצה לבד, יומיים לפניו, בריצה אחת ביום ובתוך שמירת המקום שלך. מגיעה התראה. עם המתג \"אוטומטי\" כבוי זה לא קורה.",
+            "**ריצת לילה (אופציונלי):** ברירת המחדל היא ריצה לפני האיפוס השבועי בלבד. מי שהדליק ריצת לילה בהגדרות המתקדמות: פעם בלילה, בשעה שבחר, הקציר בודק שהתור לא ריק, שחלון 5 השעות פנוי ושהשימוש השבועי מפגר בלפחות 10 נקודות אחרי חלק השבוע שעבר. אם כן, יוצאת ריצה אחת, עד הקצב השווה של השבוע. כל החלטה, גם דילוג, נרשמת עם המספרים בקובץ יומן בתיקיית הקציר. הסוללה והמתג \"אוטומטי\" חלים גם עליה.",
             "בזמן ריצה: נקודה מהבהבת, המשימה הנוכחית, **צפה** (הסשן החי באפליקציית Claude) ו**עצור**. אפשר גם לכתוב לו מהאפליקציה או מהטלפון.",
             "כל משימה רצה בסשן משלה ובענף נפרד משלה בתוך הפרויקט. שום דבר לא נדחף לשרת ולא ממוזג — את זה רק אתה מאשר. משימה שלא תספיק להסתיים לפני האיפוס לא מתחילה.",
             "**כשמכסה נגמרת באמצע:** אם נגמרה המכסה של המודל עצמו (למשל Fable), הסשן ממשיך מאותה נקודה על המודל החלופי. אם נגמר חלון 5 השעות או השבועי — המשימה נעצרת מיד, העבודה נשמרת בענף שלה, והיא ממשיכה משם בפעימה הבאה. זה לא נחשב כישלון.",
@@ -3247,6 +3253,7 @@ struct HelpView: View {
             "**Battery:** by default the automatic start waits until the Mac is plugged in or the battery is above 10% (change it or turn it off in Settings → Harvest), and one notification comes. \"Run now\" always starts. A run cut off midway — the Mac went to sleep, say — goes on by itself if there is time before the reset, with a notification; never after your own \"Stop\".",
             "**Run now** runs the whole queue right away.",
             "**A deadline before the weekly harvest:** a queued task whose deadline comes before the next harvest runs by itself, two days before it, in one run a day and within what's kept free for you. A notification comes. With the \"automatic\" switch off, this doesn't happen.",
+            "**The nightly run (optional):** by default the harvest runs before the weekly reset only. Set `pace=weekly` on the command line and, once a night at `nightHour`, the engine checks that the queue isn't empty, the 5-hour window is free and the week's usage is at least 10 points behind the share of the week gone; then one run goes, up to the pace line. Every decision, skips too, is written with its numbers to nightly.log in the harvest folder. The battery guard and the \"automatic\" switch apply to it as well.",
             "During a run: a blinking dot, the current task, **Watch** (the live session in the Claude app) and **Stop**. You can also write to it from the app or from your phone.",
             "Each task runs in its own session and on its own branch inside the project. Nothing is pushed to the server or merged — only you approve that. A task that wouldn't finish before the reset doesn't start.",
             "**When a quota runs out midway:** if it's the model's own quota (Fable, say), the session goes on from the same point with the fallback model. If it's the 5-hour window or the weekly quota, the task stops at once, its work is kept on its branch, and it goes on from there in the next pulse. That doesn't count as a failure.",
@@ -4536,6 +4543,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         }
         updateAutoPlan()
         autoHarvestTick()
+        nightlyTick()
         refreshNotificationPermission()
         nudgeTick()
         dateNudgeTick()
@@ -5346,11 +5354,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         if !inCycle { return (now, true, false) }
         // A run cut off midway (the Mac slept, the session stalled) goes on as soon as possible — at most
         // twice a cycle, and not counted as a pulse.
-        if lastRunCutOff(), !model.listing.queue.isEmpty, d.integer(forKey: "HarvestCycleRetries") < 2, now < cutoff {
+        let lastMode = model.listing.status?.lastRun?.mode
+        if lastRunCutOff(), lastMode != "nightly", !model.listing.queue.isEmpty, d.integer(forKey: "HarvestCycleRetries") < 2, now < cutoff {
             return (now, true, true)
         }
         if d.integer(forKey: "HarvestCycleRuns") < pulses,
-           model.listing.status?.lastRun?.stopReason == "5h-full",
+           model.listing.status?.lastRun?.stopReason == "5h-full", lastMode != "nightly",
            !model.listing.queue.isEmpty {
             var after = Date(timeIntervalSince1970: d.double(forKey: "HarvestLastSessionReset") + 60)
             // A limit a session ran into holds until the engine says it lifts.
@@ -5394,6 +5403,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
         launchHarvest(mode: "auto", only: [])
     }
 
+    /// The nightly run (`claude-harvest settings --set pace=weekly`): once a night, within three hours after
+    /// `nightHour`, the engine is asked whether to run — queue not empty, the 5-hour window under 20 %, the week's
+    /// usage at least 10 points behind the share of the week gone — and it logs the answer with its numbers
+    /// (nightly.log in the harvest folder) whether it says run or skip. The battery guard applies. The night is
+    /// used up by the question, so a skipped night is not retried. Reset-anchored runs are unchanged.
+    func nightlyTick() {
+        let s = model.listing.settings
+        guard s?.pace == "weekly", model.config.auto, model.harvestInstalled, model.signIn == nil,
+              !runner.isRunning, !model.harvestActive, let fresh = lastSuccess, -fresh.timeIntervalSinceNow < 15 * 60 else { return }
+        let start = min(max(s?.nightHour ?? 1, 0), 23)
+        let since = (Calendar.current.component(.hour, from: Date()) - start + 24) % 24
+        guard since < 3 else { return }
+        let d = UserDefaults.standard
+        let night = formatTime(Date().addingTimeInterval(-Double(since) * 3600), "yyyy-MM-dd")
+        guard d.string(forKey: "HarvestLastNightly") != night else { return }
+        d.set(night, forKey: "HarvestLastNightly")
+        runEngine(["nightly", "--battery-ok", batteryHold() == nil ? "yes" : "no"]) { [weak self] data in
+            guard let self, let data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  obj["run"] as? Bool == true else { return }
+            self.launchHarvest(mode: "nightly", only: [])
+        }
+    }
+
     /// A deadline the weekly harvest would come too late for: those tasks get a run of their own, in the owner's
     /// quota and within the reserves, like any other run. At most one a day, so a task that doesn't fit isn't
     /// tried again every 30 seconds; the automatic switch and the battery guard apply.
@@ -5413,7 +5445,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WidgetActions, UNUserN
 
     /// The last run ended "interrupted" without the owner stopping it — the Mac slept, the session stalled.
     func lastRunCutOff() -> Bool {
-        guard let run = model.listing.status?.lastRun, run.stopReason == "interrupted" else { return false }
+        guard let run = model.listing.status?.lastRun, run.stopReason == "interrupted", run.mode != "nightly" else { return false }
         let started = parseDate(run.startedAt)?.timeIntervalSince1970 ?? .infinity
         return UserDefaults.standard.double(forKey: "HarvestStoppedAt") < started
     }

@@ -15,6 +15,8 @@ Start with two sentences on what the harvest does: weekly quota that isn't used 
 
    claude-harvest add "<project path>" --status proposed --priority <1|2|3> --complexity <low|medium|high> --title "<short title in <owner language>>" --details "<in <owner language>: what to do, which files, and 'Done when:' (in that language) what counts as done>"
 
+   With the setting `intake` = `source` (see `claude-harvest settings`), a project that belongs to a client in Clockwize refuses `add`, and says so: record the proposal there as an idea instead (`clockwize add-idea --client <id> --title ... --content ... --kind proposal --status awaiting_decision --source agent`), and tell them in one line.
+
    Good tasks: a missing test for core logic, a TODO/FIXME with a clear fix, docs that no longer match the code, lint or type errors. Not: product decisions, payments, auth, secrets, data migrations, anything big. Always `proposed` — they approve each one themselves. After each project, one line: what you recorded there.
 
 4. Explain, in 3–4 short lines, how to use it from here:

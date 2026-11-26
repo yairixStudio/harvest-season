@@ -93,8 +93,29 @@ DEFAULT_SETTINGS = {"ownerName": "", "language": "en", "email": "", "emailDigest
                     "maxParallel": 2,
                     # Which steps the widget notifies about: all · needs_me (a question, a failure, work to approve,
                     # the end of a run) · run_end (only the end of a run).
-                    "notify": "all"}
+                    "notify": "all",
+                    # What an agent's own scan is for. "on" (default): the harvest scans projects with no work for
+                    # proposals. "off": no scan is planned or run (`run-scan` refuses).
+                    "proposalScans": "on",
+                    # Where small tasks and ideas are recorded. "backlog" (default): the project's BACKLOG.md.
+                    # "source": a folder that belongs to a client in the outside task app (`whereami` says so)
+                    # records there instead — `add` refuses, decisions become ideas, a finished branch gets a step.
+                    "intake": "backlog",
+                    # Merging a finished branch by itself. "off" (default): only the owner merges. "low-risk": a
+                    # project in autoMergeProjects (absolute paths) whose branch changes only tests, .md files and
+                    # lint configs, with passing tests and a clean merge, merges without waiting.
+                    "autoMerge": "off", "autoMergeProjects": [],
+                    # A project with this many finished code tasks waiting for the owner gets no new code task
+                    # (a check or a report still runs; so does a task named with --only). 0 = no limit.
+                    "reviewBacklogMax": 0,
+                    # When the harvest runs. "reset" (default): before the weekly reset, as always. "weekly": also
+                    # one run a night, at nightHour, when the week's usage is behind the pace of the week.
+                    "pace": "reset", "nightHour": 1}
 NOTIFY_MODES = ("all", "needs_me", "run_end")
+PROPOSAL_SCANS = ("on", "off")
+INTAKES = ("backlog", "source")
+AUTO_MERGES = ("off", "low-risk")
+PACES = ("reset", "weekly")
 
 SEED_TOKENS_PER_WEEKLY_PCT = 120000
 SEED_TOKENS_PER_FIVE_PCT = 30000
@@ -194,7 +215,7 @@ def read_json(path, default=None):
 
 
 def settings():
-    s = dict(DEFAULT_SETTINGS, models=dict(MODEL_BY_COMPLEXITY), noProposals=[], sources=[],
+    s = dict(DEFAULT_SETTINGS, models=dict(MODEL_BY_COMPLEXITY), noProposals=[], sources=[], autoMergeProjects=[],
              fallback={k: dict(v) for k, v in DEFAULT_FALLBACK.items()})
     saved = read_json(SETTINGS, {}) or {}
     for k in DEFAULT_SETTINGS:
@@ -202,6 +223,15 @@ def settings():
             s[k] = dict(s[k], **saved[k]) if k in ("models", "fallback") and isinstance(saved[k], dict) else saved[k]
     if s["language"] not in LANGUAGES:
         s["language"] = "en"
+    # A value that is not one of the known choices means the default, never a surprise.
+    for key, choices in (("proposalScans", PROPOSAL_SCANS), ("intake", INTAKES), ("autoMerge", AUTO_MERGES), ("pace", PACES)):
+        if s[key] not in choices:
+            s[key] = DEFAULT_SETTINGS[key]
+    if not isinstance(s["autoMergeProjects"], list):
+        s["autoMergeProjects"] = []
+    for key, low, high in (("reviewBacklogMax", 0, 50), ("nightHour", 0, 23)):
+        if isinstance(s[key], bool) or not isinstance(s[key], int) or not low <= s[key] <= high:
+            s[key] = DEFAULT_SETTINGS[key]
     return s
 
 
@@ -224,6 +254,7 @@ TEXT = {
     "mode_auto": {"he": "אוטומטי", "en": "automatic"},
     "mode_manual": {"he": "ידני", "en": "manual"},
     "mode_deadline": {"he": "דדליין", "en": "deadline"},
+    "mode_nightly": {"he": "לילי", "en": "nightly"},
     "run_name": {"he": "עונת הקציר · %s · %s", "en": "Harvest Season · %s · %s"},
     "task_name": {"he": "קציר · %s", "en": "Harvest · %s"},
     "no_report": {"he": "הסשן נסגר בלי לדווח תוצאה", "en": "the session closed without reporting a result"},
@@ -243,6 +274,7 @@ TEXT = {
     "ev_failed": {"he": "נכשלה · %s", "en": "Failed · %s"},
     "ev_paused": {"he": "נעצרה: %s · העבודה נשמרה", "en": "Stopped: %s · the work is saved"},
     "ev_merged": {"he": "מוזגה ל-%s", "en": "Merged into %s"},
+    "ev_merged_auto": {"he": "מוזגה אוטומטית ל-%s (בדיקות עברו, שינוי בסיכון נמוך)", "en": "Merged into %s automatically (tests passed, low-risk change)"},
     "ev_done_none": {"he": "אף משימה לא הסתיימה", "en": "No task finished"},
     "ev_done_one": {"he": "משימה אחת הסתיימה", "en": "1 task done"},
     "ev_done_many": {"he": "%d משימות הסתיימו", "en": "%d tasks done"},
@@ -255,6 +287,7 @@ TEXT = {
     "stop_signed-out": {"he": "Claude Code לא היה מחובר", "en": "Claude Code was signed out"},
     "stop_weekly-full": {"he": "המכסה השבועית נוצלה", "en": "the weekly quota is used up"},
     "stop_cutoff-near": {"he": "קרוב מדי לאיפוס", "en": "too close to the reset"},
+    "stop_review-backlog": {"he": "יש יותר מדי עבודה שמחכה לבדיקה שלך", "en": "too much finished work is waiting for your review"},
     "stop_too-early": {"he": "מוקדם מדי לפני האיפוס", "en": "too early before the reset"},
     "stop_interrupted": {"he": "נעצר באמצע", "en": "stopped midway"},
     "stop_stopped-by-owner": {"he": "נעצר על ידך", "en": "stopped by you"},
@@ -1542,6 +1575,26 @@ def cmd_settings(a):
                 v = int(v)
             elif k == "notify" and v not in NOTIFY_MODES:
                 fail("notify is one of " + ", ".join(NOTIFY_MODES))
+            elif k in ("proposalScans", "intake", "autoMerge", "pace"):
+                choices = {"proposalScans": PROPOSAL_SCANS, "intake": INTAKES, "autoMerge": AUTO_MERGES, "pace": PACES}[k]
+                if v not in choices:
+                    fail("%s is one of %s" % (k, ", ".join(choices)))
+            elif k == "autoMergeProjects":
+                try:
+                    v = json.loads(v)
+                except ValueError:
+                    fail('autoMergeProjects takes JSON, e.g. ["/Users/me/Programs/site"]')
+                if not isinstance(v, list) or not all(isinstance(p, str) and os.path.isabs(os.path.expanduser(p)) for p in v):
+                    fail("autoMergeProjects is a list of absolute project paths")
+                v = [os.path.realpath(os.path.expanduser(p)) for p in v]
+            elif k == "reviewBacklogMax":
+                if not v.strip().isdigit() or not 0 <= int(v) <= 50:
+                    fail("reviewBacklogMax takes a whole number, 0 (no limit) to 50")
+                v = int(v)
+            elif k == "nightHour":
+                if not v.strip().isdigit() or not 0 <= int(v) <= 23:
+                    fail("nightHour takes an hour, 0–23")
+                v = int(v)
             elif k in ("emailDigest", "switchMidTask"):
                 v = v.strip().lower() in ("1", "true", "yes", "on")
             elif k == "language" and v not in LANGUAGES:
@@ -1734,7 +1787,7 @@ def cmd_schedule(a):
           "deadline": timing["deadline"], "waits": timing["waits"]})
 
 
-def add_task(repo, title, details, priority, complexity, tokens, status_value, dates, source="", kind=""):
+def add_task(repo, title, details, priority, complexity, tokens, status_value, dates, source="", kind="", extra=None):
     """Writes one new task into the project's BACKLOG.md (created from the template when missing) and registers the
     project. `source` (`<type>:request/<id>`) says which external request it came from; only the engine sets it.
     Raises `Refused` on a title that is already in play. Returns what `add` reports."""
@@ -1755,6 +1808,10 @@ def add_task(repo, title, details, priority, complexity, tokens, status_value, d
              field_line("scheduled", dates.get("scheduled", "")), field_line("deadline", dates.get("deadline", ""))]
     if source:
         block.append("- source: " + source)
+    # Fields only the engine writes (never copied from request text): the source's own task id and the
+    # permissions the source granted the AI for it (auto-merge reads them from here, not from the details).
+    for key, value in (extra or {}).items():
+        block.append("- %s: %s" % (key, value))
     block += ["- priority: %d" % priority, "- complexity: " + complexity, "- tokens: %d" % tokens]
     if kind and kind != "code":
         block.append("- kind: " + kind)
@@ -1772,6 +1829,10 @@ def cmd_add(a):
     repo = os.path.abspath(a.project)
     if not os.path.isdir(repo):
         fail("project folder does not exist: " + repo)
+    home = folder_home(repo)
+    if home:
+        fail(tr("intake_source_refused", home_label(home)), intakeSource=True, client=home["client"],
+             project=home.get("project"))
     status_value = a.status
     downgraded = False
     if os.environ.get("HARVEST_UNATTENDED") and status_value == "open":
@@ -1850,6 +1911,82 @@ def limit_fallback(hit, model):
     return fallback_model(hit.get("model") or model, u or {}, status(), s)
 
 
+WEEK_HOURS = 168.0
+NIGHTLY_LOG = os.path.join(HOME, "nightly.log")
+NIGHTLY_LOG_CAP = 300
+NIGHTLY_FIVE_MAX = 20           # the 5-hour window must be under this many percent
+NIGHTLY_MIN_GAP = 10            # the week's usage must be at least this many points under the pace line
+
+
+def pace_line(hours_left):
+    """Where the week's usage would stand if it were spent evenly: the share of the week that has passed, in percent."""
+    return max(0.0, min(100.0, (1 - hours_left / WEEK_HOURS) * 100))
+
+
+def nightly_decision(usage_json=None, battery_ok=True):
+    """Whether tonight's nightly run (settings pace=weekly) should start, and why or why not — with the numbers.
+    The widget asks at nightHour, once a night, and launches `launch --mode nightly` only when this says run."""
+    s = settings()
+    d = {"run": False, "reason": None, "numbers": {}}
+    if s["pace"] != "weekly":
+        d["reason"] = "pace-reset"
+        return d
+    u, err = load_usage(usage_json)
+    reset = parse_iso(((u or {}).get("weekly") or {}).get("resetsAt"))
+    if not u or not reset:
+        d["reason"] = "usage-unreadable: " + (err or "weekly reset time unknown")
+        return d
+    hours_left = (reset - now()).total_seconds() / 3600
+    weekly, five = float(u["weekly"]["pct"]), float(u["session"]["pct"])
+    line = pace_line(hours_left)
+    tasks, _ = all_tasks(ratio())
+    queued = sum(1 for x in tasks if x["status"] == "open" and not x["waits"])
+    d["numbers"] = {"weeklyPct": round(weekly, 1), "paceLine": round(line, 1), "gap": round(line - weekly, 1),
+                    "fivePct": round(five, 1), "queue": queued, "hoursToReset": round(hours_left, 1)}
+    if lock_is_live(read_lock()):
+        d["reason"] = "run-active"
+    elif hours_left <= config()["leadHours"] + AUTO_SLACK_H:
+        d["reason"] = "reset-window"          # the run before the reset takes it from here
+    elif not queued:
+        d["reason"] = "queue-empty"
+    elif not battery_ok:
+        d["reason"] = "battery"
+    elif five >= NIGHTLY_FIVE_MAX:
+        d["reason"] = "5h-busy"
+    elif line - weekly < NIGHTLY_MIN_GAP:
+        d["reason"] = "on-pace"
+    else:
+        d["run"], d["reason"] = True, "behind-pace"
+    return d
+
+
+def log_nightly(d):
+    """One readable line per nightly decision, in nightly.log (kept to the last NIGHTLY_LOG_CAP lines)."""
+    line = "%s %s %s %s" % (datetime.now().strftime("%Y-%m-%d %H:%M"), "RUN " if d["run"] else "SKIP", d["reason"],
+                            " ".join("%s=%s" % kv for kv in d["numbers"].items()))
+    try:
+        os.makedirs(HOME, exist_ok=True)
+        try:
+            with open(NIGHTLY_LOG, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+        write_text(NIGHTLY_LOG, "\n".join((lines + [line])[-NIGHTLY_LOG_CAP:]) + "\n")
+    except OSError:
+        pass
+    return line
+
+
+def cmd_nightly(a):
+    """The widget's once-a-night question (`pace: weekly`): run tonight or not, with the numbers; the decision is
+    logged either way. Only the widget's own launcher asks: an unattended run can't."""
+    if os.environ.get("HARVEST_UNATTENDED"):
+        fail("unattended runs cannot start a nightly run")
+    d = nightly_decision(a.usage_json, a.battery_ok == "yes")
+    d["log"] = log_nightly(d)
+    emit(dict(d, ok=True))
+
+
 def cmd_plan(a):
     emit(plan_result(a.mode, a.only, a.usage_json))
 
@@ -1871,6 +2008,8 @@ def plan_result(mode, only_keys, usage_json):
         return res
     hours_left = (reset - t).total_seconds() / 3600
     res["weeklyResetsInHours"] = round(hours_left, 2)
+    # The nightly run (settings pace=weekly) is not anchored to the reset: it skips this check, and its budget is
+    # capped below to the pace line.
     if mode == "auto" and hours_left > cfg["leadHours"] + AUTO_SLACK_H:
         res["reason"] = "too-early"
         return res
@@ -1886,9 +2025,24 @@ def plan_result(mode, only_keys, usage_json):
         weekly_room = min(weekly_room, 0)
     if limit_active(st, "five"):
         five_room = min(five_room, 0)
+    # The nightly run spends one 5-hour window: once the window it began in has reset, it is over.
+    window_moved = False
+    if mode == "nightly":
+        began = parse_iso(((st.get("usageAtStart") or {}).get("session") or {}).get("resetsAt"))
+        now_reset = parse_iso(u["session"].get("resetsAt"))
+        window_moved = bool(began and now_reset and now_reset - began > timedelta(minutes=30))
+        if window_moved:
+            five_room = min(five_room, 0)
     weekly_budget = max(0, weekly_room) * r["weekly"]
     five_budget = max(0, five_room) * r["five"]
     budget = min(weekly_budget, five_budget)
+    if mode == "nightly":
+        # Up to the pace line (the share of the week that has passed) and no further, inside one 5-hour window.
+        line = pace_line(hours_left)
+        pace_room = max(0.0, line - float(u["weekly"]["pct"]))
+        res["pace"] = {"line": round(line, 1), "weekly": float(u["weekly"]["pct"]), "room": round(pace_room, 1)}
+        weekly_budget = min(weekly_budget, pace_room * r["weekly"])
+        budget = min(weekly_budget, five_budget)
     res.update({"weeklyRoom": round(weekly_room, 1), "fiveRoom": round(five_room, 1),
                 "budgetTokens": int(budget), "limitedBy": "5h" if five_budget < weekly_budget else "weekly"})
     # Tasks already running keep their reserve (estimate × FIT_FACTOR: their progress can't be read) and their
@@ -1911,7 +2065,18 @@ def plan_result(mode, only_keys, usage_json):
     res["dueProposals"] = [brief(x) for x in tasks if due_proposal(x)]
     minutes_left = (reset - t).total_seconds() / 60
     deferred_budget = False
+    # Pressure back (settings reviewBacklogMax): a project with that many finished code tasks waiting for the owner
+    # gets no new code task. A check or a report is exempt, and so is a task the owner named (--only).
+    backlog_max = s["reviewBacklogMax"]
+    waiting_review = review_backlog(tasks) if backlog_max else {}
+    if waiting_review:
+        res["reviewBacklog"] = {os.path.basename(k) or k: n for k, n in waiting_review.items() if n >= backlog_max}
     for c in candidates:
+        if backlog_max and not only and c.get("kind", "code") == "code" \
+                and waiting_review.get(os.path.realpath(c["project"]), 0) >= backlog_max:
+            res["deferred"].append({"project": c["project"], "title": c["title"], "why": "review-backlog",
+                                    "waiting": waiting_review[os.path.realpath(c["project"])]})
+            continue
         need = c["tokens"] * FIT_FACTOR
         duration = max(10, c["tokens"] / TOKENS_PER_MINUTE)
         if minutes_left - duration < CUTOFF_GUARD_MIN:
@@ -1940,7 +2105,8 @@ def plan_result(mode, only_keys, usage_json):
                            "title": c["title"], "details": c["details"], "priority": c["priority"],
                            "complexity": c["complexity"], "tokens": c["tokens"], "model": model,
                            "scheduled": c["scheduled"], "deadline": c["deadline"], "overdue": c["overdue"]}
-    if res["next"] is None and not running and mode == "auto" and not only and st.get("scansThisRun", 0) < MAX_SCANS_PER_RUN:
+    if res["next"] is None and not running and mode == "auto" and not only and s["proposalScans"] == "on" \
+            and st.get("scansThisRun", 0) < MAX_SCANS_PER_RUN:
         open_or_proposed = {x["project"] for x in tasks if x["status"] in ("open", "proposed")}
         scanned = set(st.get("scannedThisRun", []))
         for info in infos:
@@ -1964,14 +2130,29 @@ def plan_result(mode, only_keys, usage_json):
         res["reason"] = "5h-full" if five_budget < weekly_budget else "weekly-full"
     elif any(d["why"] == "model-full" for d in res["deferred"]):
         res["reason"] = "model-full"
+    elif res["deferred"] and all(d["why"] == "review-backlog" for d in res["deferred"]):
+        res["reason"] = "review-backlog"
     else:
         res["reason"] = "cutoff-near"
+    if window_moved and res["reason"] in ("weekly-full", "5h-full", "cutoff-near"):
+        res["reason"] = "5h-full"
     session_reset = parse_iso(u["session"].get("resetsAt"))
     if limit_active(st, "five"):
         session_reset = parse_iso(st["limits"]["five"].get("until"))
-    if res["reason"] == "5h-full" and session_reset and session_reset + timedelta(minutes=30) < reset:
+    if res["reason"] == "5h-full" and session_reset and session_reset + timedelta(minutes=30) < reset and mode != "nightly":
         res["final"] = False
     return res
+
+
+def review_backlog(tasks):
+    """How many finished code tasks wait for the owner in each project (by real path): the pressure that
+    settings reviewBacklogMax pushes back on."""
+    counts = {}
+    for x in tasks:
+        if awaits_owner(x) and x.get("kind", "code") == "code":
+            key = os.path.realpath(x["project"])
+            counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def cmd_begin(a):
@@ -2164,8 +2345,152 @@ def record_finish(repo, title, cur, outcome, summary, tokens, usage_json, sessio
     return record
 
 
+def next_workday(from_day=None):
+    """The next working day after `from_day` (default today), Sunday to Thursday — never a Friday or a Saturday."""
+    d = parse_date(from_day or today()) or datetime.now().date()
+    d += timedelta(days=1)
+    while d.weekday() in (4, 5):
+        d += timedelta(days=1)
+    return d.isoformat()
+
+
+def add_review_step(fields, branch):
+    """With `intake: source`: a finished branch of a Clockwize request becomes a step on its task in Clockwize —
+    "review and merge: <branch>", on the next working day — so it comes back to the owner's board instead of waiting
+    only in the widget. Once per request and branch (remembered in sources.json); never raises."""
+    try:
+        m = REQUEST_SOURCE.match((fields.get("source") or "").strip())
+        task_id = (fields.get("source_task") or "").strip()
+        if settings()["intake"] != "source" or not m or m.group(1) != "clockwize" or not task_id or not branch:
+            return False
+        src = next((x for x in enabled_sources() if x["type"] == "clockwize"), None)
+        if not src:
+            return False
+        key = "%s/%s/%s" % (m.group(1), m.group(2), branch)
+        with StateLock():
+            if key in source_state().setdefault("reviewSteps", {}):
+                return False
+        ok, why = run_source_cli(src, ["add-step", task_id, "--title", tr("review_step", branch),
+                                       "--day", next_workday()])
+        if not ok:
+            source_log("review step failed: " + why)
+            return False
+        with StateLock():
+            st = source_state()
+            steps = st.setdefault("reviewSteps", {})
+            steps[key] = iso(now())
+            for old in sorted(steps, key=steps.get)[:-SEEN_CAP]:
+                del steps[old]
+            write_json(SOURCE_STATE, st)
+        return True
+    except Exception as e:  # noqa: BLE001 — a source must never stop a harvest
+        source_log("review step failed: %r" % (e,))
+        return False
+
+
+# What an automatic merge may carry: tests, documents (.md) and lint settings — nothing that changes how the
+# project runs or builds (not package.json, a lockfile, pyproject.toml, a CI workflow, a script).
+TEST_DIRS = ("test", "tests", "__tests__", "spec", "specs", "__mocks__")
+TEST_FILE_RE = re.compile(r"(^test_.+\.py$|_test\.(py|go|rb|exs?)$|\.(test|spec)\.(js|jsx|ts|tsx|mjs|cjs)$|"
+                          r"(Test|Tests|Spec)\.(java|kt|swift|cs)$|_spec\.rb$|^conftest\.py$)")
+LINT_FILE_RE = re.compile(r"^(\.eslintrc(\..+)?|eslint\.config\.(js|mjs|cjs|ts)|\.eslintignore|\.prettierrc(\..+)?|"
+                          r"prettier\.config\.(js|mjs|cjs|ts)|\.prettierignore|\.editorconfig|\.flake8|\.pylintrc|"
+                          r"\.?ruff\.toml|\.stylelintrc(\..+)?|\.markdownlint(\..+)?|\.swiftlint\.yml|"
+                          r"\.golangci\.ya?ml|rustfmt\.toml|\.rustfmt\.toml|\.rubocop\.yml)$")
+# Never low-risk, wherever they sit (not even inside a test folder): what a build installs, and what steers the
+# agents of every later run (the project's instructions, its backlog, the agent settings folders).
+NEVER_LOW_RISK_NAMES = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "go.sum",
+                        "claude.md", "claude.local.md", "agents.md", "backlog.md"}
+NEVER_LOW_RISK = (".github/", ".gitlab", ".circleci/", ".husky/", ".claude/", ".codex/")
+
+
+def low_risk_file(path):
+    """Whether a changed file is a test, a document (.md) or a lint setting: what settings autoMerge may merge alone."""
+    p = path.strip().strip('"')
+    if not p or p.startswith("/") or ".." in p.split("/") or any(p.startswith(x) for x in NEVER_LOW_RISK):
+        return False
+    parts = p.split("/")
+    name = parts[-1]
+    if name.lower() in NEVER_LOW_RISK_NAMES or name.lower().endswith(".lock"):
+        return False
+    return (name.lower().endswith(".md") or any(x in TEST_DIRS for x in parts[:-1]) or bool(TEST_FILE_RE.search(name))
+            or bool(LINT_FILE_RE.match(name)))
+
+
+def low_risk_branch(repo, base, branch):
+    """(True, files) when the branch changes only low-risk files (renames count both names), else (False, files)."""
+    files = [x for x in git(repo, "diff", "--name-only", "--no-renames", "%s...%s" % (base, branch)).stdout.splitlines() if x]
+    return bool(files) and all(low_risk_file(x) for x in files), files
+
+
+def tests_signal_file(session_id, reporting, folder):
+    """Where a code task writes its tests line — only when the owner turned autoMerge on, else "" (and the task's
+    prompt stays exactly as it was)."""
+    if reporting or folder or settings()["autoMerge"] == "off":
+        return ""
+    return os.path.join(TASK_RESULTS, session_id + ".tests")
+
+
+def tests_signal_prompt(path):
+    return ("Tests signal: before you report, write one line to this file, outside the repository: %s (also in "
+            "$HARVEST_TASK_TESTS) — `TESTS: passed <the command you ran>` when the project's tests ran and "
+            "passed, `TESTS: failed <command>` when any failed, `TESTS: none` when there are none or you could not "
+            "run them. Only a real run counts: never write `passed` for tests you did not run." % path)
+
+
+def read_tests_signal(path):
+    """The last `TESTS: passed|failed|none …` line a task session wrote into its tests file — "passed", "failed",
+    "none" — or None when there is no such line."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            found = re.findall(r"^\s*TESTS:\s*(passed|failed|none)\b", f.read(), re.I | re.M)
+    except OSError:
+        return None
+    return found[-1].lower() if found else None
+
+
+def auto_merge_why_not(repo, fields, branch, tests_signal):
+    """None when this finished branch may be merged by itself, else why not (a short phrase for the log)."""
+    s = settings()
+    if s["autoMerge"] != "low-risk":
+        return "autoMerge is off"
+    real = os.path.realpath(repo)
+    if not any(os.path.realpath(os.path.expanduser(p)) == real for p in s["autoMergeProjects"] if isinstance(p, str)):
+        return "the project is not in autoMergeProjects"
+    if task_kind(fields) != "code" or not branch:
+        return "not a code task with a branch"
+    if tests_signal != "passed":
+        return "no passing-tests signal (%s)" % (tests_signal or "none given")
+    if REQUEST_SOURCE.match((fields.get("source") or "").strip()):
+        # Only what the engine wrote at pull time counts — never the request's own text.
+        if "merge" not in [x.strip() for x in (fields.get("ai_permissions") or "").split(",")]:
+            return "the request does not grant the AI the merge permission"
+    ok, files = low_risk_branch(repo, base_branch(repo), branch)
+    if not ok:
+        return "the branch changes more than tests, docs and lint settings"
+    return None
+
+
+def auto_merge(repo, title, fields, branch, tests_signal, session_id=None):
+    """Merges a just-finished branch through `merge_task` when every condition of settings autoMerge holds; the
+    result of merge_task, or None (nothing changes: the branch waits for the owner as before). Never raises."""
+    try:
+        why = auto_merge_why_not(repo, fields, branch, tests_signal)
+        if why:
+            if settings()["autoMerge"] == "low-risk":
+                source_log("auto-merge of %s skipped: %s" % (title, why))
+            return None
+        return merge_task(repo, title, auto=True)
+    except Refused as e:
+        source_log("auto-merge of %s refused: %s" % (title, e))
+        return None
+    except (Exception, SystemExit) as e:  # noqa: BLE001 — includes the SystemExit of fail(): the branch just waits
+        source_log("auto-merge of %s failed: %r" % (title, e))
+        return None
+
+
 def finish_task(repo, title, outcome, summary, question, tokens, usage_json, session_id, tests=None, files=None,
-                report=None):
+                report=None, tests_signal=None):
     st = status()
     running = running_tasks(st)
     cur = next((r for r in running if r.get("project") == repo and r.get("title") == title), None)
@@ -2246,15 +2571,23 @@ def finish_task(repo, title, outcome, summary, question, tokens, usage_json, ses
     record = record_finish(repo, title, cur, outcome, summary, tokens, usage_json, session_id, tests, updates,
                            branch if (outcome == "done" and not no_changes) or (outcome == "blocked" and commits) else None)
     kept = branch if (outcome == "done" and not no_changes) or (outcome in ("blocked", "paused") and commits) else None
+    # A finished branch waits for the owner — unless settings autoMerge says this one is safe to merge by itself
+    # (`auto_merge`: every condition, never an exception), and the source gets its "review and merge" step.
+    merged = None
+    if outcome == "done" and not no_changes:
+        merged = auto_merge(repo, title, t["fields"], branch, tests_signal, session_id)
+        if not merged:
+            add_review_step(t["fields"], branch)
     kind, text = {"done": ("task_closed", tr("ev_closed", summary)) if closes_itself
                   else ("task_waiting_review", tr("ev_waiting_review", summary)),
                   "blocked": ("task_blocked", tr("ev_blocked", question if outcome == "blocked" else "")),
                   "paused": ("task_paused", tr("ev_paused", summary))}.get(outcome, ("task_failed", tr("ev_failed", summary)))
-    append_event(kind, run_id=current_run_id(), project=display_name(repo), title=title, summary=text,
-                 question=question if outcome == "blocked" else None, session_id=session_id, branch=kept,
-                 source=t["fields"].get("source"))
+    if not merged:
+        append_event(kind, run_id=current_run_id(), project=display_name(repo), title=title, summary=text,
+                     question=question if outcome == "blocked" else None, session_id=session_id, branch=kept,
+                     source=t["fields"].get("source"))
     return {"ok": True, "outcome": record["outcome"], "commits": commits, "backlog": updates,
-            "branch": record["branch"], "summary": summary, "closed": closes_itself,
+            "branch": record["branch"], "summary": summary, "closed": closes_itself, "autoMerged": bool(merged),
             "report": report if report and os.path.isfile(report) else None}
 
 
@@ -2622,6 +2955,8 @@ TEXT.update({
     "src_started_folder": {"he": "המשימה התחילה לעבוד בתיקייה עצמה (אין בה git, ולכן אין ענף).",
                            "en": "Started working in the folder itself (it has no git, so there is no branch)."},
     "src_merged": {"he": "מוזג ל-%s.", "en": "Merged into %s."},
+    "src_merged_auto": {"he": "מוזג אוטומטית ל-%s: הבדיקות עברו והשינוי בסיכון נמוך.", "en": "Merged into %s automatically: the tests passed and the change is low-risk."},
+    "review_step": {"he": "לבדוק ולמזג: %s", "en": "Review and merge: %s"},
     "src_accepted": {"he": "סומנה כבוצעה על ידי הבעלים.", "en": "Marked done by the owner."},
     "src_retry": {"he": "%s (ינסה שוב בקציר הבא)", "en": "%s (it will try again in the next harvest)"},
     "src_no_folder": {"he": "התיקייה %s לא נמצאה. לאיזו תיקייה לשייך את הבקשה?",
@@ -2654,6 +2989,9 @@ TEXT.update({
     "ev_accepted": {"he": "סומנה כבוצעה", "en": "Marked done"},
     "ev_closed": {"he": "הסתיימה ונסגרה (בדיקה או דוח, בלי ענף) · %s", "en": "Finished and closed (a check or a report, no branch) · %s"},
     "ev_decision": {"he": "החלטה מחכה לך · %s", "en": "A decision waits for you · %s"},
+    "intake_source_refused": {
+        "he": "התיקייה הזו שייכת ל-%s בקלוקוויז: רושמים שם, כמשימה שמשויכת ל-AI או כהצעה.",
+        "en": "This folder belongs to %s in Clockwize: record it there, as a task assigned to AI or as an idea."},
     "decision_category": {"he": "בירור / החלטה", "en": "Decision"},
     "decision_prompt": {"he": "עזור לי להחליט: %s", "en": "Help me decide: %s"},
     "decision_title": {"he": "החלטה: %s", "en": "Decision: %s"},
@@ -2721,21 +3059,113 @@ def source_log(message):
         pass
 
 
-def run_source_cli(src, args):
+def run_source_cli(src, args, timeout=None):
     """Runs the source's tool. Returns (True, stdout) or (False, why); never raises."""
     cli = source_cli(src)
     if not cli:
         return False, "command not found: " + (src.get("cli") or src.get("type") or "?")
     try:
-        r = subprocess.run([cli] + list(args), capture_output=True, text=True, timeout=SOURCE_CLI_TIMEOUT,
+        r = subprocess.run([cli] + list(args), capture_output=True, text=True, timeout=timeout or SOURCE_CLI_TIMEOUT,
                            stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        return False, "timed out after %d s" % SOURCE_CLI_TIMEOUT
+        return False, "timed out after %d s" % (timeout or SOURCE_CLI_TIMEOUT)
     except OSError as e:
         return False, str(e)
     if r.returncode != 0:
         return False, ("exit %d: %s" % (r.returncode, (r.stderr or r.stdout).strip()))[:1000]
     return True, r.stdout
+
+
+# ---------- the outside task app as the home of what the harvest records (settings intake=source) ----------
+
+WHEREAMI_CACHE = os.path.join(HOME, "whereami.json")
+WHEREAMI_TTL_H = 6
+WHEREAMI_TIMEOUT = 10
+_WHEREAMI_RUN = {}
+
+
+def intake_source():
+    """The enabled Clockwize source `intake: source` asks where a folder belongs — only a source the owner switched
+    on (`source clockwize on`), never a tool that merely happens to be on PATH. None when intake isn't `source`,
+    or there is no such source or its tool is missing."""
+    if settings()["intake"] != "source":
+        return None
+    src = next((x for x in enabled_sources() if x["type"] == "clockwize"), None)
+    return src if src and source_cli(src) else None
+
+
+def folder_home(repo):
+    """Where this folder lives in Clockwize, as {"client": {id, name}, "project": {id, name} | None}, or None for a
+    folder with no home there (`none`, `unknown`) and for anything that goes wrong — the tool missing, slow or
+    answering nonsense never stops the harvest, the folder just keeps its BACKLOG.md. Asked once per run and kept
+    in a small file for a few hours (only a real answer is kept, never a failure)."""
+    try:
+        src = intake_source()
+        if not src:
+            return None
+        key = os.path.realpath(repo)
+        if key in _WHEREAMI_RUN:
+            return _WHEREAMI_RUN[key]
+        cache = read_json(WHEREAMI_CACHE, {}) or {}
+        hit = cache.get(key) if isinstance(cache, dict) else None
+        if isinstance(hit, dict) and (now() - (parse_iso(hit.get("at")) or now() - timedelta(days=1))).total_seconds() < WHEREAMI_TTL_H * 3600:
+            _WHEREAMI_RUN[key] = hit.get("home")
+            return hit.get("home")
+        ok, out = run_source_cli(src, ["whereami", key], timeout=WHEREAMI_TIMEOUT)
+        if not ok:
+            source_log("whereami failed: " + out[:200])
+            return None
+        found = json.loads(out)
+        client = found.get("client") if isinstance(found, dict) else None
+        home = None
+        if isinstance(client, dict) and client.get("id"):
+            project = found.get("project")
+            home = {"client": {"id": str(client["id"]), "name": str(client.get("name") or client["id"])},
+                    "project": {"id": str(project["id"]), "name": str(project.get("name") or project["id"])}
+                    if isinstance(project, dict) and project.get("id") else None}
+        elif not isinstance(found, dict) or not (found.get("none") or found.get("unknown")):
+            return None                                  # not an answer we know: don't remember it
+        _WHEREAMI_RUN[key] = home
+        cache = cache if isinstance(cache, dict) else {}
+        cache[key] = {"at": iso(now()), "home": home}
+        for old in sorted(cache, key=lambda k: str(cache[k].get("at")))[:-200]:
+            del cache[old]
+        write_json(WHEREAMI_CACHE, cache)
+        return home
+    except Exception as e:  # noqa: BLE001 — a lookup must never stop an add or a harvest
+        source_log("whereami failed: %r" % (e,))
+        return None
+
+
+def home_label(home):
+    return home["client"]["name"] + ("/" + home["project"]["name"] if home.get("project") else "")
+
+
+def idea_for_decision(repo, title, text, report, home):
+    """A decision (or anything an agent found that waits for the owner) as an idea in the folder's client's drawer:
+    kind proposal, awaiting a decision, from an agent. The external id is stable, so asking twice is one idea.
+    Returns the idea's id, or None."""
+    src = intake_source()
+    if not src or not home:
+        return None
+    key = "harvest:%s" % hashlib.sha1(("%s|%s|%s" % (os.path.realpath(repo), title, text)).encode("utf-8")).hexdigest()[:16]
+    details = tr("decision_details", title, display_name(repo), today(), report or tr("decision_no_report"))
+    args = ["add-idea", "--client", home["client"]["id"], "--title", text[:200], "--content", details[:1900],
+            "--kind", "proposal", "--status", "awaiting_decision", "--source", "agent", "--external-id", key]
+    if home.get("project"):
+        args += ["--project", home["project"]["id"]]
+    if report and os.path.isabs(report) and os.path.isfile(report):
+        args += ["--plan-file", report]
+    ok, made = run_source_cli(src, args)
+    if not ok:
+        source_log("add-idea failed: " + made)
+        return None
+    try:
+        body = json.loads(made)
+        idea = (body.get("idea") if isinstance(body, dict) else None) or body
+        return str(idea.get("id") or "?") if isinstance(idea, dict) else "?"
+    except ValueError:
+        return "?"
 
 
 class StateLock:
@@ -2933,7 +3363,12 @@ def route_decisions(repo, title, decisions, report=""):
 
 
 def decision_to_source(repo, title, text, report):
-    """A decision as a task in the first enabled source whose records name this project's folder; its id, or None."""
+    """A decision as a task in the first enabled source whose records name this project's folder; its id, or None.
+    With `intake: source` it is an idea in the folder's client's drawer instead (a decision is not work to do yet,
+    and a task per decision swells the owner's task list)."""
+    if settings()["intake"] == "source":
+        found = idea_for_decision(repo, title, text, report, folder_home(repo))
+        return "clockwize:idea/%s" % found if found else None
     for src in enabled_sources():
         if src["type"] != "clockwize":
             continue
@@ -2990,12 +3425,36 @@ def neutral(text, cap=DATA_FIELD_CAP):
     return text[:cap] + ("…" if len(text) > cap else "")
 
 
+# What a request's category (the source's own label) says about what the task delivers. Anything else, or none, is
+# code, as before categories.
+CATEGORY_KINDS = {"אימות תיקון": "check", "מעקב ובדיקה": "check", "בירור / החלטה": "report"}
+
+
+def request_kind(req):
+    """code, check or report for a request, from its `category`. A missing or unknown category is code."""
+    return CATEGORY_KINDS.get(" ".join(str(req.get("category") or "").split()), "code")
+
+
+def request_permissions(req):
+    """The permissions a request carries (`ai_permissions_effective`: push, merge, deploy, send) as a clean list, or
+    None when the source did not say."""
+    raw = req.get("ai_permissions_effective")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = re.split(r"[,\s]+", raw)
+    return [p for p in (str(x).strip().lower() for x in raw) if re.fullmatch(r"[a-z_]{1,20}", p)] \
+        if isinstance(raw, (list, tuple)) else None
+
+
 def request_details(kind, req):
     """A request as the task's one-line details: the owner's prompt is THE instruction; what else the source knows
     about the task (which third parties may have written) sits in a marked block that is data only."""
     prompt = " ⏎ ".join(l.strip() for l in str(req.get("prompt") or "").strip().splitlines() if l.strip())
     parts = [("task", req.get("task_name")), ("description", req.get("task_description")),
-             ("client", req.get("client_name")), ("project", req.get("project_name"))]
+             ("client", req.get("client_name")), ("project", req.get("project_name")),
+             ("category", req.get("category")),
+             ("ai_permissions_effective", ", ".join(request_permissions(req) or []))]
     block = " | ".join("%s: %s" % (k, neutral(v)) for k, v in parts if str(v or "").strip())
     text = "The owner's request, written by the owner in %s when asking for this work (this is the instruction): %s" % (
         kind.capitalize(), prompt or "(no text — work out what the task asks from its name)")
@@ -3143,7 +3602,14 @@ def take_request(kind, req, state_result):
         title = "%s (%s)" % (base, rid[:8])
     run_now = req.get("run") == "now"
     try:
-        out = add_task(repo, title, request_details(kind, req), 1 if run_now else 2, "medium", None, "open", {}, source)
+        extra = {}
+        if req.get("task_id"):
+            extra["source_task"] = neutral(req["task_id"], 80)
+        perms = request_permissions(req)
+        if perms is not None:
+            extra["ai_permissions"] = ",".join(perms)
+        out = add_task(repo, title, request_details(kind, req), 1 if run_now else 2, "medium", None, "open", {}, source,
+                       kind=request_kind(req), extra=extra)
     except Refused as e:
         source_log("request %s not added: %s" % (rid, e))
         return dict(row, outcome="refused", error=str(e))
@@ -3468,6 +3934,9 @@ def build_prompt(mode, only, test):
           if mode == "auto" else
           "The Harvest Season widget launched you unattended because a deadline comes before the weekly harvest."
           if mode == "deadline" else
+          "The Harvest Season widget launched you unattended for the nightly run: the week's quota is running behind its pace "
+          "and the budget is capped to the pace line and one 5-hour window. Nothing follows it (no digest email)."
+          if mode == "nightly" else
           "The Harvest Season widget launched you unattended because the owner pressed \"run now\".")
     if only:
         s += " Scope: only these tasks — pass each to every plan call as --only: " + " ".join('"%s"' % o for o in only) + "."
@@ -3784,7 +4253,7 @@ def cmd_brief(a):
     emit({"count": len(items), "items": items})
 
 
-def merge_task(repo, title):
+def merge_task(repo, title, auto=False):
     """Merges a finished task's branch into the project's main branch and deletes it — on the owner's word
     only, and only when nothing of theirs is in the way: the checkout is on the main branch with no
     uncommitted changes, and the branch merges without conflicts. Refuses otherwise, touching nothing."""
@@ -3814,12 +4283,12 @@ def merge_task(repo, title):
     head = git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
     kept = git(repo, "branch", "-d", branch).returncode != 0      # e.g. still checked out in another worktree
     set_fields(repo, v["title"], {"result": v["result"] + " · merged " + today()})
-    report_source(t["fields"], "done", summary=tr("src_merged", base), branch=branch)
+    report_source(t["fields"], "done", summary=tr("src_merged_auto" if auto else "src_merged", base), branch=branch)
     append_event("task_merged", run_id=current_run_id(), project=display_name(repo), title=v["title"],
-                 summary=tr("ev_merged", base), session_id=task_session(repo, v["title"]), branch=branch,
-                 source=t["fields"].get("source"))
+                 summary=tr("ev_merged_auto" if auto else "ev_merged", base), session_id=task_session(repo, v["title"]),
+                 branch=branch, source=t["fields"].get("source"), auto=True if auto else None)
     return {"ok": True, "project": repo, "title": v["title"], "branch": branch, "base": base, "head": head,
-            "branchKept": kept}
+            "branchKept": kept, "auto": bool(auto)}
 
 
 def cmd_merge(a):
@@ -3923,7 +4392,7 @@ def cmd_reject(a):
     emit(dict(out, ok=True))
 
 
-MODES = ("auto", "manual", "deadline")
+MODES = ("auto", "manual", "deadline", "nightly")
 TALK_TOPICS = {"waiting": ("talk_name", "talk-prompt.md"), "onboard": ("onboard_name", "onboard-prompt.md")}
 
 
@@ -4240,6 +4709,11 @@ def cmd_run_task(a):
                    "fine / problem), then checked / not checked. Quote a problem's evidence as it is, and suggest a "
                    "fix without making it. If the task asks for a document that belongs in the repository itself, it "
                    "is not a %s: report blocked and ask." % (cur["kind"], LANGUAGE_NAMES[settings()["language"]], report_path, cur["kind"]))
+    # settings autoMerge: a code task also reports whether the project's tests passed, in a file of its own (never the
+    # findings file of a check or report, and never part of the owner's prompt, so a custom prompt gets it too).
+    tests_path = tests_signal_file(session_id, reporting, folder)
+    if tests_path:
+        prompt += "\n\n" + tests_signal_prompt(tests_path)
     if cur.get("resumed"):
         prompt += ("\n\nAn earlier attempt at this task stopped at a usage limit. Its work is already on this branch"
                    " (`git log %s..HEAD`; the last commit may be a WIP snapshot the harvest made of uncommitted"
@@ -4272,7 +4746,8 @@ def cmd_run_task(a):
     info = run_session(cur["worktree"], session_name(a.title, cur.get("source")), prompt, a.model, effort, True, a.max_minutes, 10,
                        is_done=lambda started: os.path.exists(result_path), on_update=track,
                        extra_env=dict({"HARVEST_TASK_RESULT": result_path},
-                                      **({"HARVEST_TASK_REPORT": report_path} if reporting else {})),
+                                      **({"HARVEST_TASK_REPORT": report_path} if reporting else {}),
+                                      **({"HARVEST_TASK_TESTS": tests_path} if tests_path else {})),
                        session_id=session_id, on_limit=limit_fallback)
     if show_in_app:
         open_in_claude_app("claude://resume?session=" + info["sessionId"])
@@ -4286,7 +4761,7 @@ def cmd_run_task(a):
     report = res.get("report") or (report_path if os.path.isfile(report_path) else "")
     out = finish_task(repo, a.title, res.get("status", "failed"), res.get("summary"), res.get("question"),
                       tokens, a.usage_json, info["sessionId"], tests=res.get("tests"), files=res.get("files"),
-                      report=report)
+                      report=report, tests_signal=read_tests_signal(tests_path) if tests_path else None)
     decisions = route_decisions(repo, a.title, res.get("decisions"), report) \
         if out.get("outcome") in ("done", "blocked") else []
     emit(dict(out, sessionId=info["sessionId"], sessionName=info["name"], tokens=tokens, tests=res.get("tests"),
@@ -4298,6 +4773,8 @@ def cmd_run_scan(a):
     """A proposal scan as its own read-only session in the project ("Harvest · proposal scan"), in a throwaway
     detached worktree; the proposals it records wait for the owner's approval."""
     import uuid
+    if settings()["proposalScans"] != "on":
+        fail("proposal scans are off (settings proposalScans=off): nothing was scanned", scansOff=True)
     repo = os.path.abspath(a.project)
     if not is_git(repo):
         fail("not a git repository: " + repo)
@@ -4544,6 +5021,11 @@ def main():
     p.add_argument("--only", action="append", metavar="PROJECT::TITLE")
     p.add_argument("--usage-json")
     p.set_defaults(fn=cmd_plan)
+
+    p = sub.add_parser("nightly", help="the widget's nightly question (settings pace=weekly): run tonight? logged")
+    p.add_argument("--usage-json")
+    p.add_argument("--battery-ok", choices=("yes", "no"), default="yes")
+    p.set_defaults(fn=cmd_nightly)
 
     p = sub.add_parser("begin")
     p.add_argument("--mode", choices=MODES, default="manual")

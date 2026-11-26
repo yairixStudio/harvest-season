@@ -1,6 +1,6 @@
 # Scan session prompt
 
-`claude-harvest run-scan` fills `<project path>` and starts the scan as its own read-only session, named "Harvest · proposal scan" in the owner's language, in a throwaway worktree of the project (it appears under the project in the Claude app). It is used for registered git projects with no open and no proposed tasks; the proposals wait for the owner's approval in the widget.
+`claude-harvest run-scan` fills `<project path>` and starts the scan as its own read-only session, named "Harvest · proposal scan" in the owner's language, in a throwaway worktree of the project (it appears under the project in the Claude app). It is used for registered git projects with no open and no proposed tasks; the proposals wait for the owner's approval in the widget. The engine never plans or runs a scan when the owner set `proposalScans` to `off`, so this prompt is not used then.
 
 ```
 You are looking for small, safe improvement tasks in this project, read-only. You do not change code. Your working directory is a throwaway copy of the project; the project itself is <project path>.

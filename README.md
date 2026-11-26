@@ -70,6 +70,18 @@ Anything it replaces is backed up first. At the end it offers a short getting-st
 - **Harvest** (bottom) — the countdown to the next automatic run, **Run now**, and the schedule.
 - ⋯ → **Settings…** — five tabs: **General** (language, start at login, menu bar or floating, your details), **Harvest** (automatic runs, pulses, how much of each limit is kept free for you, how many days before a recommended date a task may run), **Models** (a model per task size, when and to what to switch), **Projects** (which may get proposals) and **Texts** (every instruction the harvest gives its agents, editable, with the default a click away). ⋯ → **Help** explains every part of the panel.
 
+## Optional settings
+
+A few behaviours are off by default and switched on from the command line, one at a time (`claude-harvest settings --set key=value`). Each default is today's behaviour; the full table is in `SPEC.md` ("Engine settings with no window of their own").
+
+| setting | default | what it does |
+|---|---|---|
+| `proposalScans` | `on` | `off` stops the proposal scans of projects with no work. |
+| `intake` | `backlog` | `source` records what an agent finds in a Clockwize-mapped folder in Clockwize (as an idea or an AI task) instead of BACKLOG.md; reinstall afterwards so the instructions change too. |
+| `autoMerge`, `autoMergeProjects` | `off`, `[]` | `low-risk` merges a finished branch by itself, only in the listed projects, only when it changes tests, `.md` files and lint settings, the tests passed and the merge is clean. |
+| `reviewBacklogMax` | `0` | with N, a project with N finished code tasks waiting for you gets no new code task. |
+| `pace`, `nightHour` | `reset`, `1` | `weekly` adds a nightly run when the week's usage is behind its pace. |
+
 ## How it works
 
 - The widget is a single Swift file (`HarvestSeason.swift`, AppKit + SwiftUI, no dependencies). It reads the usage from Anthropic's API with your Claude Code sign-in, every 5 minutes at most.

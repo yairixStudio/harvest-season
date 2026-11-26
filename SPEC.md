@@ -551,6 +551,33 @@ toolbar-like row of symbols in SwiftUI (so they follow the app's language and di
 (`NSHostingController`, `.preferredContentSize`). `--snapshot-settings <png> [--tab
 general|harvest|models|projects|texts] [--demo] [--he|--en] [--light]` renders one tab.
 
+### Engine settings with no window of their own
+
+Seven settings are changed on the command line only (`claude-harvest settings --set key=value`; the owner only, never an
+unattended run). Each default keeps the behaviour from before the setting existed; a value that isn't one of the choices
+reads as the default.
+
+| setting | default | other values | what it does |
+|---|---|---|---|
+| `proposalScans` | `on` | `off` | `off`: `plan` never plans a proposal scan, and `run-scan` refuses (`scansOff`). Tasks already recorded still run. |
+| `intake` | `backlog` | `source` | `source`: a folder that belongs to a client in the outside task app is recorded there, not in BACKLOG.md. The engine asks `clockwize whereami <folder>` (only the Clockwize source the owner switched on is asked; the answer is kept for 6 hours in `whereami.json`, per folder; a folder with no home, an unreachable tool or a bad answer means "no home" and BACKLOG.md keeps working). `add` in such a folder refuses and names the client. Pulled requests are unaffected. A decision a task found becomes an idea in that client's drawer (`add-idea`: kind `proposal`, status `awaiting_decision`, source `agent`, a stable external id) instead of a "Decision: …" task; a folder with no home keeps the BACKLOG proposal (an idea needs a client). With a source task that reaches `waiting_review` with a branch, the engine also adds a step "review and merge: <branch>" to the task in the source (`add-step`, on the next Sunday–Thursday), once per request and branch (`sources.json`, `reviewSteps`), never fatal. The installer picks `instructions/{claude,codex}.source.md` for the "Backlog" block: change the setting, then reinstall. |
+| `autoMerge` | `off` | `low-risk` | `low-risk`: a finished code task merges by itself — through the same `merge_task` as the owner's merge, so a dirty checkout, another branch or a conflict still leave it waiting — only when all of these hold: its project is in `autoMergeProjects`; every changed file (renames count both names) is a test, a `.md` file or a lint setting (`low_risk_file`; not `package.json`, a lockfile, `pyproject.toml`, `.txt`, a script or `.github/`); the task session wrote `TESTS: passed <command>` to its tests file (`$HARVEST_TASK_TESTS`, asked for by an engine paragraph only when `autoMerge` is on); and, for a request from the source, the permissions the engine stored at pull time (`ai_permissions`, from the request's `ai_permissions_effective`, never from its text) include `merge`. The `task_merged` event carries `auto`, the source is told "merged automatically", no `task_waiting_review` event or review step is made. |
+| `autoMergeProjects` | `[]` | a JSON list of absolute paths | The only projects `autoMerge` applies to (compared by real path). |
+| `reviewBacklogMax` | `0` (off) | 1–50 | A project with this many `code` tasks waiting for the owner (`awaits_owner`: a branch to merge, or a blocked question) gets no new `code` task: `plan` defers it (`why: review-backlog`, `plan.reviewBacklog`) and, when that is all that is left, stops with `review-backlog`. `check` and `report` tasks, and tasks named with `--only` ("run now"), are exempt. |
+| `pace` | `reset` | `weekly` | `weekly`: besides the run before the weekly reset, the widget asks once a night whether to run (below). |
+| `nightHour` | `1` | 0–23 | The hour the nightly question may be asked; the widget asks within three hours after it, once a night (`HarvestLastNightly`). |
+
+A request's `category` sets the task's kind when it is pulled: "אימות תיקון" and "מעקב ובדיקה" → `check`, "בירור / החלטה" → `report`,
+anything else or none → `code`. The owner's prompt stays the instruction; the category and the permissions are added to the external data block.
+
+**The nightly run.** With `pace` = `weekly`, `nightlyTick` asks the engine (`claude-harvest nightly --battery-ok yes|no`) and the engine
+decides: it runs when the queue isn't empty, no run is active, the reset-anchored run hasn't begun (more than `leadHours` before the
+reset), the battery guard allows it, the 5-hour window is under 20 %, and the week's usage is at least 10 points under the pace line
+(the share of the 168-hour week that has passed). Every answer, run or skip, is one line with its numbers in `nightly.log` in the
+harvest folder. A run goes out as `launch --mode nightly`: `plan --mode nightly` skips the too-early check, caps the budget to the room
+under the pace line and to one 5-hour window, and is always final; no email. A nightly run never starts follow-ups or retries. The
+runs before the reset are unchanged.
+
 ### Setup
 
 The harvest is optional. `WidgetModel.harvestInstalled` = the engine file exists

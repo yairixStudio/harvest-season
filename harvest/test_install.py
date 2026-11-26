@@ -104,6 +104,34 @@ class Install(unittest.TestCase):
         self.assertTrue(os.path.exists(self.h(".claude", "harvest", "projects.md")), "state stays without --purge")
         self.assertFalse(self.inst("status")["installed"])
 
+    def test_the_source_block_is_installed_only_when_the_settings_say_intake_source(self):
+        os.makedirs(self.h(".codex"))
+        p = self.inst("plan", "--language", "en")
+        self.assertTrue(all("the home is Clockwize" not in b["block"] for b in p["blocks"]))
+        self.assertTrue(all("claude-harvest add" in b["block"] for b in p["blocks"]))
+        self.inst("install", "--language", "en")
+        self.assertNotIn("the home is Clockwize", self.read(".claude", "CLAUDE.md"))
+        # the owner switches the setting, then reinstalls: both blocks are replaced by the Clockwize text
+        self.engine("settings", "--set", "intake=source")
+        p = self.inst("plan", "--language", "en")
+        self.assertEqual([b["change"] for b in p["blocks"]], ["replace", "replace"])
+        self.assertTrue(self.inst("install", "--language", "en")["ok"])
+        for path in ((".claude", "CLAUDE.md"), (".codex", "AGENTS.md")):
+            text = self.read(*path)
+            self.assertIn("the home is Clockwize", text)
+            self.assertIn("where_am_i" if path[0] == ".claude" else "clockwize whereami", text)
+            self.assertIn("add-idea", text)
+            self.assertIn("assigned to AI", text)
+            self.assertIn("BACKLOG.md", text)
+            self.assertEqual(text.count(MARK), 1, "one managed block, replaced in place")
+        self.assertEqual(self.inst("status")["modified"], [])
+        # back to the classic text
+        self.engine("settings", "--set", "intake=backlog")
+        self.inst("install", "--language", "en")
+        self.assertNotIn("the home is Clockwize", self.read(".claude", "CLAUDE.md"))
+        self.assertIn("claude-harvest add", self.read(".claude", "CLAUDE.md"))
+        self.assertIn("`intake`", self.read(".claude", "skills", "backlog", "SKILL.md"))
+
     def test_codex_gets_the_block_when_codex_is_there(self):
         os.makedirs(self.h(".codex"))
         self.inst("install", "--language", "he")
