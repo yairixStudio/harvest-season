@@ -133,8 +133,12 @@ def owned_files(language):
     return files
 
 
-def block_text(which):
-    body = read(os.path.join(SRC, "instructions", which + ".md")).strip("\n")
+def block_text(which, intake="backlog"):
+    """The "Backlog" block for ~/.claude/CLAUDE.md (`claude`) or ~/.codex/AGENTS.md (`codex`). With the setting
+    `intake: source` the block says that Clockwize is where things are recorded (<which>.source.md); any other value
+    keeps the classic text. Change the setting, then reinstall: the block is a copy."""
+    name = which + (".source" if intake == "source" else "")
+    body = read(os.path.join(SRC, "instructions", name + ".md")).strip("\n")
     return "%s\n%s\n%s" % (BEGIN, body, END)
 
 
@@ -206,10 +210,11 @@ def plan(a):
         if which == "codex" and not os.path.isdir(os.path.dirname(path)):
             continue
         before = read(path)
-        after, change = with_block(before, block_text(which))
+        text = block_text(which, settings.get("intake"))
+        after, change = with_block(before, text)
         if change == "replace-legacy" and not (a.replace_existing or a.force):
             conflicts.append({"path": path, "why": "has a Backlog section written by hand; --replace-existing turns it into the managed block"})
-        blocks.append({"path": path, "change": change, "block": block_text(which)})
+        blocks.append({"path": path, "change": change, "block": text})
     link = os.path.realpath(LINK) if os.path.lexists(LINK) else None
     engine = os.path.join(HARVEST, "bin", "harvest.py")
     link_action = "keep" if link == os.path.realpath(engine) else ("create" if link is None else "replace")
