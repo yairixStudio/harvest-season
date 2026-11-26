@@ -2651,7 +2651,8 @@ class Stage3(unittest.TestCase):
             self.assertTrue(h.low_risk_file(ok), ok)
         for bad in ("package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "pyproject.toml", "requirements.txt",
                     "docs/notes.txt", ".github/workflows/ci.yml", ".github/tests/x.py", "src/app.py", "Makefile", "../tests/a.py",
-                    "/tests/a.py", "setup.py", "scripts/build.sh"):
+                    "/tests/a.py", "setup.py", "scripts/build.sh", "tests/package.json", "tests/yarn.lock", "tests/Cargo.lock",
+                    "CLAUDE.md", "docs/CLAUDE.md", "AGENTS.md", "BACKLOG.md", ".claude/agents/x.md", ".codex/notes.md"):
             self.assertFalse(h.low_risk_file(bad), bad)
 
     def test_the_tests_line_is_asked_for_only_when_auto_merge_is_on(self):
@@ -2782,6 +2783,19 @@ class Stage3(unittest.TestCase):
         self.assertFalse(out["harvest"])
         self.assertTrue(out["final"])
         self.assertEqual(out["next"], None)
+
+    def test_a_nightly_run_stops_when_the_5_hour_window_it_began_in_has_reset(self):
+        self.add("Small task", tokens=60000)
+        self.usage(five=3, weekly=30, reset_in_h=84, session_reset_in_h=3)
+        self.run_engine("begin", "--mode", "nightly")
+        self.assertTrue(self.run_engine("plan", "--mode", "nightly")["harvest"])
+        self.usage(five=3, weekly=30, reset_in_h=84, session_reset_in_h=3.2)       # jitter only
+        self.assertTrue(self.run_engine("plan", "--mode", "nightly")["harvest"])
+        self.usage(five=3, weekly=30, reset_in_h=84, session_reset_in_h=8)         # a new window began
+        plan = self.run_engine("plan", "--mode", "nightly")
+        self.assertFalse(plan["harvest"])
+        self.assertEqual((plan["reason"], plan["final"]), ("5h-full", True))
+        self.assertTrue(self.run_engine("plan", "--mode", "manual")["harvest"], "only the nightly mode is limited to one window")
 
     def test_a_nightly_run_is_a_mode_the_launcher_and_the_prompt_know(self):
         h = self.engine()

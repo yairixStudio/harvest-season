@@ -2025,6 +2025,14 @@ def plan_result(mode, only_keys, usage_json):
         weekly_room = min(weekly_room, 0)
     if limit_active(st, "five"):
         five_room = min(five_room, 0)
+    # The nightly run spends one 5-hour window: once the window it began in has reset, it is over.
+    window_moved = False
+    if mode == "nightly":
+        began = parse_iso(((st.get("usageAtStart") or {}).get("session") or {}).get("resetsAt"))
+        now_reset = parse_iso(u["session"].get("resetsAt"))
+        window_moved = bool(began and now_reset and now_reset - began > timedelta(minutes=30))
+        if window_moved:
+            five_room = min(five_room, 0)
     weekly_budget = max(0, weekly_room) * r["weekly"]
     five_budget = max(0, five_room) * r["five"]
     budget = min(weekly_budget, five_budget)
@@ -2126,6 +2134,8 @@ def plan_result(mode, only_keys, usage_json):
         res["reason"] = "review-backlog"
     else:
         res["reason"] = "cutoff-near"
+    if window_moved and res["reason"] in ("weekly-full", "5h-full", "cutoff-near"):
+        res["reason"] = "5h-full"
     session_reset = parse_iso(u["session"].get("resetsAt"))
     if limit_active(st, "five"):
         session_reset = parse_iso(st["limits"]["five"].get("until"))
@@ -2387,7 +2397,11 @@ LINT_FILE_RE = re.compile(r"^(\.eslintrc(\..+)?|eslint\.config\.(js|mjs|cjs|ts)|
                           r"prettier\.config\.(js|mjs|cjs|ts)|\.prettierignore|\.editorconfig|\.flake8|\.pylintrc|"
                           r"\.?ruff\.toml|\.stylelintrc(\..+)?|\.markdownlint(\..+)?|\.swiftlint\.yml|"
                           r"\.golangci\.ya?ml|rustfmt\.toml|\.rustfmt\.toml|\.rubocop\.yml)$")
-NEVER_LOW_RISK = (".github/", ".gitlab", ".circleci/", ".husky/")
+# Never low-risk, wherever they sit (not even inside a test folder): what a build installs, and what steers the
+# agents of every later run (the project's instructions, its backlog, the agent settings folders).
+NEVER_LOW_RISK_NAMES = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "go.sum",
+                        "claude.md", "claude.local.md", "agents.md", "backlog.md"}
+NEVER_LOW_RISK = (".github/", ".gitlab", ".circleci/", ".husky/", ".claude/", ".codex/")
 
 
 def low_risk_file(path):
@@ -2397,6 +2411,8 @@ def low_risk_file(path):
         return False
     parts = p.split("/")
     name = parts[-1]
+    if name.lower() in NEVER_LOW_RISK_NAMES or name.lower().endswith(".lock"):
+        return False
     return (name.lower().endswith(".md") or any(x in TEST_DIRS for x in parts[:-1]) or bool(TEST_FILE_RE.search(name))
             or bool(LINT_FILE_RE.match(name)))
 
